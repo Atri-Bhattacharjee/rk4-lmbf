@@ -5,11 +5,8 @@
 #include <iostream>
 #include "datatypes.h"
 #include "models.h"
-#include "linear_propagator.h"
-#include "simple_sensor_model.h"
 #include "adaptive_birth_model.h"
 #include "smc_lmb_tracker.h"
-#include "sgp4_propagator.h"
 #include "in_orbit_sensor_model.h"
 #include "assignment.h"
 #include "metrics.h"
@@ -36,7 +33,15 @@ PYBIND11_MODULE(lmb_engine, m) {
         .def_readwrite("value_", &Measurement::value_)
         .def_readwrite("covariance_", &Measurement::covariance_)
         .def_readwrite("sensor_id_", &Measurement::sensor_id_)
-        .def_readwrite("sensor_state_", &Measurement::sensor_state_);
+        .def_readwrite("sensor_state_", &Measurement::sensor_state_)
+        .def_static("cartesianToMeasurement", &Measurement::cartesianToMeasurement, 
+                   pybind11::arg("cartesian_state"), 
+                   pybind11::arg("sensor_state"),
+                   "Convert Cartesian state to measurement space (range, range rate, azimuth, elevation)")
+        .def_static("measurementToCartesian", &Measurement::measurementToCartesian,
+                   pybind11::arg("measurement"),
+                   pybind11::arg("sensor_state"),
+                   "Convert measurement space to Cartesian state");
     
     pybind11::class_<Track>(m, "Track")
         .def(pybind11::init<>())
@@ -60,15 +65,7 @@ PYBIND11_MODULE(lmb_engine, m) {
     pybind11::class_<ISensorModel, std::shared_ptr<ISensorModel>>(m, "ISensorModel");
     pybind11::class_<IBirthModel, std::shared_ptr<IBirthModel>>(m, "IBirthModel");
     
-    // Bind concrete model implementations
-    pybind11::class_<LinearPropagator, IOrbitPropagator, std::shared_ptr<LinearPropagator>>(m, "LinearPropagator")
-        .def(pybind11::init<>(), "Default constructor for LinearPropagator")
-        .def("propagate", &LinearPropagator::propagate);
-    
-    pybind11::class_<SimpleSensorModel, ISensorModel, std::shared_ptr<SimpleSensorModel>>(m, "SimpleSensorModel")
-        .def(pybind11::init<>(), "Default constructor for SimpleSensorModel")
-        .def("calculate_likelihood", &SimpleSensorModel::calculate_likelihood);
-    
+    // Bind concrete model implementations    
     pybind11::class_<AdaptiveBirthModel, IBirthModel, std::shared_ptr<AdaptiveBirthModel>>(m, "AdaptiveBirthModel")
         .def(pybind11::init<int, double, const Eigen::MatrixXd&>(),
              pybind11::arg("particles_per_track"),
@@ -76,18 +73,21 @@ PYBIND11_MODULE(lmb_engine, m) {
              pybind11::arg("initial_covariance"),
              "Constructor for AdaptiveBirthModel")
         .def("generate_new_tracks", &AdaptiveBirthModel::generate_new_tracks);
-    
-    pybind11::class_<SGP4Propagator, IOrbitPropagator, std::shared_ptr<SGP4Propagator>>(m, "SGP4Propagator")
-        .def(pybind11::init<const Eigen::MatrixXd&>(), pybind11::arg("process_noise_covariance"))
-        .def("propagate", &SGP4Propagator::propagate);
 
     pybind11::class_<TwoBodyPropagator, IOrbitPropagator, std::shared_ptr<TwoBodyPropagator>>(m, "TwoBodyPropagator")
         .def(pybind11::init<const Eigen::MatrixXd&>(), pybind11::arg("process_noise_covariance"))
         .def("propagate", &TwoBodyPropagator::propagate);
     
     pybind11::class_<InOrbitSensorModel, ISensorModel, std::shared_ptr<InOrbitSensorModel>>(m, "InOrbitSensorModel")
-        .def(pybind11::init<>(), "Default constructor for InOrbitSensorModel")
-        .def("calculate_likelihood", &InOrbitSensorModel::calculate_likelihood);
+        .def(pybind11::init<>(), "Default constructor for InOrbitSensorModel with default noise parameters")
+        .def(pybind11::init<double, double, double, double>(), 
+             pybind11::arg("range_var"), 
+             pybind11::arg("range_rate_var"), 
+             pybind11::arg("azimuth_var"), 
+             pybind11::arg("elevation_var"),
+             "Constructor for InOrbitSensorModel with specified noise parameters")
+        .def("calculate_likelihood", &InOrbitSensorModel::calculate_likelihood)
+        .def("convertParticleToMeasurement", &InOrbitSensorModel::convertParticleToMeasurement);
     
     // Bind the main tracker class with direct constructor support
     pybind11::class_<SMC_LMB_Tracker, std::shared_ptr<SMC_LMB_Tracker>>(m, "SMC_LMB_Tracker")

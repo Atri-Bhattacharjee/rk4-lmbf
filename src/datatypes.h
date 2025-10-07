@@ -107,13 +107,85 @@ public:
  */
 struct Measurement {
     double timestamp_;                    //!< The epoch timestamp of the measurement
-    Eigen::VectorXd value_;              //!< The 6D measurement vector [x, y, z, vx, vy, vz]
-    Eigen::MatrixXd covariance_;         //!< The 6x6 measurement noise covariance matrix
+    Eigen::VectorXd value_;              //!< The 4D measurement vector [range, range_rate, azimuth, elevation]
+    Eigen::MatrixXd covariance_;         //!< The 4x4 measurement noise covariance matrix
     std::string sensor_id_;              //!< Identifier for the sensor that produced the measurement
-    Eigen::VectorXd sensor_state_;           //!< The 6D ECI state of the sensor satellite
+    Eigen::VectorXd sensor_state_;       //!< The 6D ECI state of the sensor satellite [x, y, z, vx, vy, vz]
 
     Measurement()
-        : timestamp_(0.0), value_(Eigen::VectorXd::Zero(6)), covariance_(Eigen::MatrixXd::Zero(6,6)), sensor_id_(), sensor_state_(Eigen::VectorXd::Zero(6)) {}
+        : timestamp_(0.0), value_(Eigen::VectorXd::Zero(4)), covariance_(Eigen::MatrixXd::Zero(4,4)), sensor_id_(), sensor_state_(Eigen::VectorXd::Zero(6)) {}
+        
+    /**
+     * @brief Convert Cartesian state to measurement space
+     * 
+     * Converts a 6D Cartesian state [x, y, z, vx, vy, vz] to a 4D measurement space
+     * [range, range_rate, azimuth, elevation] relative to the sensor state.
+     * 
+     * @param cartesian_state 6D Cartesian state vector [x, y, z, vx, vy, vz]
+     * @param sensor_state 6D Cartesian state vector of sensor [x, y, z, vx, vy, vz]
+     * @return Eigen::VectorXd 4D measurement vector [range, range_rate, azimuth, elevation]
+     */
+    static Eigen::VectorXd cartesianToMeasurement(const Eigen::VectorXd& cartesian_state, const Eigen::VectorXd& sensor_state) {
+        // Relative position and velocity
+        Eigen::Vector3d rel_pos = cartesian_state.head(3) - sensor_state.head(3);
+        Eigen::Vector3d rel_vel = cartesian_state.tail(3) - sensor_state.tail(3);
+        
+        // Calculate range
+        double range = rel_pos.norm();
+        
+        // Calculate range rate (dot product of unit vector and relative velocity)
+        double range_rate = 0.0;
+        if (range > 1e-10) {
+            Eigen::Vector3d unit_vector = rel_pos / range;
+            range_rate = rel_vel.dot(unit_vector);
+        }
+        
+        // Calculate azimuth and elevation
+        double azimuth = std::atan2(rel_pos(1), rel_pos(0));
+        double elevation = std::asin(rel_pos(2) / range);
+        
+        Eigen::VectorXd measurement(4);
+        measurement << range, range_rate, azimuth, elevation;
+        
+        return measurement;
+    }
+    
+    /**
+     * @brief Convert measurement space to Cartesian state
+     * 
+     * Converts a 4D measurement [range, range_rate, azimuth, elevation] to a 6D Cartesian state
+     * [x, y, z, vx, vy, vz] relative to the sensor state.
+     * 
+     * @param measurement 4D measurement vector [range, range_rate, azimuth, elevation]
+     * @param sensor_state 6D Cartesian state vector of sensor [x, y, z, vx, vy, vz]
+     * @return Eigen::VectorXd 6D Cartesian state vector [x, y, z, vx, vy, vz]
+     */
+    static Eigen::VectorXd measurementToCartesian(const Eigen::VectorXd& measurement, const Eigen::VectorXd& sensor_state) {
+        double range = measurement(0);
+        double range_rate = measurement(1);
+        double azimuth = measurement(2);
+        double elevation = measurement(3);
+        
+        // Convert from spherical to Cartesian coordinates
+        double cos_el = std::cos(elevation);
+        Eigen::Vector3d rel_pos;
+        rel_pos << range * cos_el * std::cos(azimuth),
+                   range * cos_el * std::sin(azimuth),
+                   range * std::sin(elevation);
+                   
+        // Convert range_rate to Cartesian velocity (simplified model)
+        // This is a simplification - we only have the radial component
+        // A more accurate model would need additional info or assumptions
+        Eigen::Vector3d unit_vector = rel_pos.normalized();
+        Eigen::Vector3d rel_vel = unit_vector * range_rate;
+        
+        // Convert to absolute coordinates
+        Eigen::VectorXd cartesian_state(6);
+        cartesian_state.head(3) = rel_pos + sensor_state.head(3);
+        cartesian_state.tail(3) = rel_vel + sensor_state.tail(3);
+        
+        return cartesian_state;
+    }
 };
 
 /**
