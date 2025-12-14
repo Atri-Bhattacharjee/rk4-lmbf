@@ -30,12 +30,15 @@ private:
     std::shared_ptr<ISensorModel> sensor_model_;       //!< Shared pointer to the sensor model
     std::shared_ptr<IBirthModel> birth_model_;         //!< Shared pointer to the birth model
     double survival_probability_;                       //!< Configuration parameter for track survival probability
+    int k_best_;                                        //!< Number of K-best assignment hypotheses
+    double prune_threshold_;                            //!< Existence probability threshold for track pruning
+    double clutter_intensity_;                          //!< Clutter intensity (false alarms per unit measurement volume)
 
 public:
     /**
      * @brief Default constructor
      */
-    SMC_LMB_Tracker() : current_state_(0.0, std::vector<Track>{}), propagator_(nullptr), sensor_model_(nullptr), birth_model_(nullptr), survival_probability_(0.0) {}
+    SMC_LMB_Tracker() : current_state_(0.0, std::vector<Track>{}), propagator_(nullptr), sensor_model_(nullptr), birth_model_(nullptr), survival_probability_(0.0), k_best_(100), prune_threshold_(0.01), clutter_intensity_(1.0e-6) {}
 
     /**
      * @brief Construct a new SMC_LMB_Tracker object
@@ -44,11 +47,17 @@ public:
      * @param sensor_model Unique pointer to sensor model
      * @param birth_model Unique pointer to birth model
      * @param survival_probability Probability of a track surviving a time step
+     * @param k_best Number of K-best assignment hypotheses to generate
+     * @param prune_threshold Existence probability threshold for track pruning
+     * @param clutter_intensity Clutter intensity (false alarms per unit measurement volume)
      */
     SMC_LMB_Tracker(std::shared_ptr<IOrbitPropagator> propagator,
                    std::shared_ptr<ISensorModel> sensor_model,
                    std::shared_ptr<IBirthModel> birth_model,
-                   double survival_probability);
+                   double survival_probability,
+                   int k_best,
+                   double prune_threshold,
+                   double clutter_intensity);
 
     /**
      * @brief Run the predict step of the filter

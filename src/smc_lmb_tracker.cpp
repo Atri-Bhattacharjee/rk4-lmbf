@@ -5,12 +5,18 @@
 SMC_LMB_Tracker::SMC_LMB_Tracker(std::shared_ptr<IOrbitPropagator> propagator,
                                                                  std::shared_ptr<ISensorModel> sensor_model,
                                                                  std::shared_ptr<IBirthModel> birth_model,
-                                                                 double survival_probability)
+                                                                 double survival_probability,
+                                                                 int k_best,
+                                                                 double prune_threshold,
+                                                                 double clutter_intensity)
         : current_state_(0.0, std::vector<Track>{}),
             propagator_(std::move(propagator)),
             sensor_model_(std::move(sensor_model)),
             birth_model_(std::move(birth_model)),
-            survival_probability_(survival_probability) {
+            survival_probability_(survival_probability),
+            k_best_(k_best),
+            prune_threshold_(prune_threshold),
+            clutter_intensity_(clutter_intensity) {
 }
 
 void SMC_LMB_Tracker::predict(double dt) {
@@ -47,16 +53,9 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
         return;
     }
 
-    // Step 1: Build a square cost matrix for tracks and measurements
-    // This assumes num_tracks == num_meas, which is true in our zero-clutter test.
-    // A more robust implementation would handle rectangular cases by adding dummy rows/cols.
-    if (num_tracks != num_meas) {
-        // For now, handle this edge case by skipping the update.
-        // This prevents a crash and highlights the simplification.
-        std::cerr << "Warning: Number of tracks (" << num_tracks 
-                << ") does not match number of measurements (" << num_meas
-                << "). Skipping update step." << std::endl;
-        return; 
+    // Handle the case of no measurements - nothing to update
+    if (num_meas == 0) {
+        return;
     }
 
     // Step 2: Create all hypothetical updated particle sets for each track-measurement pair
@@ -83,14 +82,15 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
             for (size_t p = 0; p < num_particles; ++p) {
                 const auto& current_particle = current_particles[p];
                 
-                // Create an updated particle with Kalman update
+                // Create an updated particle (Bootstrap/SIR update)
                 Particle updated_particle;
                 
                 updated_particle.state_vector = current_particle.state_vector;
                 
-                // Calculate likelihood and update weight
+                // Calculate likelihood ratio (likelihood / clutter intensity) and update weight
                 double particle_likelihood = sensor_model_->calculate_likelihood(current_particle, measurement);
-                updated_particle.weight = current_particle.weight * particle_likelihood;
+                double likelihood_ratio = particle_likelihood / clutter_intensity_;
+                updated_particle.weight = current_particle.weight * likelihood_ratio;
                 total_likelihood += updated_particle.weight;
                 
                 // Add to hypothetical set
@@ -127,7 +127,7 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
     }
     
     // Step 4: Solve assignment (K-best)
-    std::vector<Hypothesis> hypotheses = solve_assignment(cost_matrix, 100);
+    std::vector<Hypothesis> hypotheses = solve_assignment(cost_matrix, k_best_);
     
     // Normalize hypothesis weights (log-sum-exp)
     std::vector<double> log_weights;
@@ -215,21 +215,62 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
             updated_tracks.push_back(final_track);
     }
     
-    // Step 6: Handle birth (disabled in this simplified model)
-    std::vector<Track> born_tracks; // Always empty in the simplified model
-    
-    // We assume perfect 1-to-1 matching, so no unused measurements in this model
-    
     // Track pruning: remove tracks with low existence probability
-    const double prune_threshold = 0.01; // configurable
     std::vector<Track> pruned_tracks;
     for (const auto& track : updated_tracks) {
-        if (track.existence_probability() >= prune_threshold) {
+        if (track.existence_probability() >= prune_threshold_) {
             pruned_tracks.push_back(track);
         }
     }
     
-    // Update the current state with the new tracks
+    // Step 6: Adaptive Birth - Create new tracks from unused measurements
+    // 
+    // Algorithm:
+    // 1. Identify which measurements were used by the best hypothesis
+    // 2. Collect measurements that were NOT used (unassociated)
+    // 3. Pass unused measurements to birth model to create new track hypotheses
+    
+    std::vector<Track> born_tracks;
+    
+    if (!hypotheses.empty() && birth_model_) {
+        // Step 6a: Create a flag vector to track which measurements were used
+        std::vector<bool> measurement_used(num_meas, false);
+        
+        // Step 6b: The best hypothesis is at index 0 (solve_assignment returns sorted by cost)
+        const Hypothesis& best_hypothesis = hypotheses[0];
+        
+        // Step 6c: Mark measurements that are associated with tracks in the best hypothesis
+        for (size_t track_idx = 0; track_idx < best_hypothesis.associations.size(); ++track_idx) {
+            int meas_idx = best_hypothesis.associations[track_idx];
+            // Valid measurement index means this measurement was used
+            if (meas_idx >= 0 && static_cast<size_t>(meas_idx) < num_meas) {
+                measurement_used[meas_idx] = true;
+            }
+        }
+        
+        // Step 6d: Collect unused measurements
+        std::vector<Measurement> unused_measurements;
+        unused_measurements.reserve(num_meas);
+        for (size_t i = 0; i < num_meas; ++i) {
+            if (!measurement_used[i]) {
+                unused_measurements.push_back(measurements[i]);
+            }
+        }
+        
+        // Step 6e: Generate new tracks from unused measurements
+        if (!unused_measurements.empty()) {
+            born_tracks = birth_model_->generate_new_tracks(
+                unused_measurements, 
+                current_state_.timestamp());
+        }
+    }
+    
+    // Combine pruned existing tracks with newly born tracks
+    for (auto& new_track : born_tracks) {
+        pruned_tracks.push_back(std::move(new_track));
+    }
+    
+    // Update the current state with the combined tracks
     current_state_.tracks().swap(pruned_tracks);
 }
 

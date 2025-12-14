@@ -71,7 +71,15 @@ PYBIND11_MODULE(lmb_engine, m) {
              pybind11::arg("particles_per_track"),
              pybind11::arg("initial_existence_probability"),
              pybind11::arg("initial_covariance"),
-             "Constructor for AdaptiveBirthModel")
+             "Create adaptive birth model with physics-based tangent fan velocity sampling.\n\n"
+             "For each unassociated measurement, generates particles with:\n"
+             "  - Position computed from range/azimuth/elevation\n"
+             "  - Radial velocity fixed from range-rate measurement\n"
+             "  - Tangent velocity sampled uniformly in direction, with magnitude\n"
+             "    computed from circular orbital velocity at target altitude\n"
+             "  - Gaussian noise from initial_covariance added to all components\n\n"
+             "The covariance matrix should have velocity components sized to capture\n"
+             "expected eccentricity variation (e.g., 500 m/s std for moderate eccentricity).")
         .def("generate_new_tracks", &AdaptiveBirthModel::generate_new_tracks);
 
     pybind11::class_<TwoBodyPropagator, IOrbitPropagator, std::shared_ptr<TwoBodyPropagator>>(m, "TwoBodyPropagator")
@@ -92,12 +100,15 @@ PYBIND11_MODULE(lmb_engine, m) {
     // Bind the main tracker class with direct constructor support
     pybind11::class_<SMC_LMB_Tracker, std::shared_ptr<SMC_LMB_Tracker>>(m, "SMC_LMB_Tracker")
         .def(pybind11::init<>(), "Default constructor for SMC_LMB_Tracker")
-        .def(pybind11::init<std::shared_ptr<IOrbitPropagator>, std::shared_ptr<ISensorModel>, std::shared_ptr<IBirthModel>, double>(),
+        .def(pybind11::init<std::shared_ptr<IOrbitPropagator>, std::shared_ptr<ISensorModel>, std::shared_ptr<IBirthModel>, double, int, double, double>(),
              pybind11::arg("propagator"),
              pybind11::arg("sensor_model"),
              pybind11::arg("birth_model"),
              pybind11::arg("survival_probability"),
-             "Constructor for SMC_LMB_Tracker with model dependencies (simplified version with no detection probability)")
+             pybind11::arg("k_best") = 100,
+             pybind11::arg("prune_threshold") = 0.01,
+             pybind11::arg("clutter_intensity") = 1.0e-6,
+             "Constructor for SMC_LMB_Tracker with model dependencies")
         .def("predict", &SMC_LMB_Tracker::predict, "Runs the predict step for a given time delta")
         .def("update", &SMC_LMB_Tracker::update, "Runs the update step with measurements")
         .def("get_tracks", &SMC_LMB_Tracker::get_tracks, "Gets the current list of tracks", pybind11::return_value_policy::reference_internal)

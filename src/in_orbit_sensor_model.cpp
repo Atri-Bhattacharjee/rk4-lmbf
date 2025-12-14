@@ -4,8 +4,8 @@
 InOrbitSensorModel::InOrbitSensorModel()
     : range_var_(50.0 * 50.0),           // 50m standard deviation
       range_rate_var_(1.0 * 1.0),        // 1m/s standard deviation
-      azimuth_var_(0.0),                 // No azimuth error initially
-      elevation_var_(0.0) {              // No elevation error initially
+      azimuth_var_(1.0e-9),              // Small epsilon for numerical stability during inversion
+      elevation_var_(1.0e-9) {           // Small epsilon for numerical stability during inversion
 }
 
 InOrbitSensorModel::InOrbitSensorModel(double range_var, double range_rate_var, 
