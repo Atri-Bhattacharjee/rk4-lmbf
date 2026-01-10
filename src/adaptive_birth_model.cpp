@@ -1,7 +1,15 @@
 #include "adaptive_birth_model.h"
 #include <random>
 #include <vector>
+
+// Define _USE_MATH_DEFINES before cmath to get M_PI on MSVC
+#define _USE_MATH_DEFINES
 #include <cmath>
+
+// Fallback definition if M_PI is still not defined
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 AdaptiveBirthModel::AdaptiveBirthModel(int particles_per_track, 
                                      double initial_existence_probability, 
@@ -116,7 +124,7 @@ std::vector<Track> AdaptiveBirthModel::generate_new_tracks(const std::vector<Mea
         for (int particle_idx = 0; particle_idx < particles_per_track_; ++particle_idx) {
             // Sample random direction in tangent plane (circular fan)
             // theta is uniformly distributed in [0, 2π)
-            double theta = angle_dist(gen);
+            double theta = (2.0 * M_PI * particle_idx) / particles_per_track_;
             
             // Tangent velocity: fixed magnitude (circular velocity), random direction
             Eigen::Vector3d v_tangent = v_circular * 

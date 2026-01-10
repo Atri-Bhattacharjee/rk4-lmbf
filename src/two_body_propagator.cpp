@@ -19,7 +19,7 @@ Eigen::VectorXd calculate_state_derivative(const Eigen::VectorXd& state_6d) {
 TwoBodyPropagator::TwoBodyPropagator(const Eigen::MatrixXd& process_noise_covariance)
     : process_noise_covariance_(process_noise_covariance) {}
 
-Particle TwoBodyPropagator::propagate(const Particle& particle, double dt, double current_time) const {
+Particle TwoBodyPropagator::propagate(const Particle& particle, double dt, double current_time, double noise_scale) const {
     // Extract initial 6D state
     Eigen::VectorXd y0 = particle.state_vector.head(6);
     // RK4 integration
@@ -31,15 +31,18 @@ Particle TwoBodyPropagator::propagate(const Particle& particle, double dt, doubl
     // Create propagated particle
     Particle propagated_particle = particle;
     propagated_particle.state_vector.head(6) = y1;
-    // Add process noise
-    if (process_noise_covariance_.rows() == 6 && process_noise_covariance_.cols() == 6) {
+    // Add process noise with adaptive scaling
+    // noise_scale affects variance (Q), so we apply sqrt(noise_scale) to std dev (L)
+    if (process_noise_covariance_.rows() == 6 && process_noise_covariance_.cols() == 6 && noise_scale > 1e-12) {
         static thread_local std::mt19937 gen(std::random_device{}());
         std::normal_distribution<> dist(0.0, 1.0);
         Eigen::VectorXd noise_vec(6);
         for (int i = 0; i < 6; ++i) noise_vec(i) = dist(gen);
         Eigen::LLT<Eigen::MatrixXd> llt(process_noise_covariance_);
         Eigen::MatrixXd L = llt.matrixL();
-        propagated_particle.state_vector += L * noise_vec;
+        // Scale standard deviation by sqrt(noise_scale) since L represents std dev
+        double std_dev_scale = std::sqrt(noise_scale);
+        propagated_particle.state_vector += L * noise_vec * std_dev_scale;
     }
     return propagated_particle;
 }

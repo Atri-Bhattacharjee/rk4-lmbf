@@ -33,12 +33,15 @@ private:
     int k_best_;                                        //!< Number of K-best assignment hypotheses
     double prune_threshold_;                            //!< Existence probability threshold for track pruning
     double clutter_intensity_;                          //!< Clutter intensity (false alarms per unit measurement volume)
+    double p_detection_;                                //!< Detection probability (P_D) per Reuter LMB formulation
+    double noise_decay_rate_;                           //!< Process noise annealing decay rate (lambda)
+    double noise_min_scale_;                            //!< Process noise annealing minimum scale factor (alpha_min)
 
 public:
     /**
      * @brief Default constructor
      */
-    SMC_LMB_Tracker() : current_state_(0.0, std::vector<Track>{}), propagator_(nullptr), sensor_model_(nullptr), birth_model_(nullptr), survival_probability_(0.0), k_best_(100), prune_threshold_(0.01), clutter_intensity_(1.0e-6) {}
+    SMC_LMB_Tracker() : current_state_(0.0, std::vector<Track>{}), propagator_(nullptr), sensor_model_(nullptr), birth_model_(nullptr), survival_probability_(0.0), k_best_(100), prune_threshold_(0.01), clutter_intensity_(1.0e-6), p_detection_(0.99), noise_decay_rate_(0.0), noise_min_scale_(1.0) {}
 
     /**
      * @brief Construct a new SMC_LMB_Tracker object
@@ -50,6 +53,9 @@ public:
      * @param k_best Number of K-best assignment hypotheses to generate
      * @param prune_threshold Existence probability threshold for track pruning
      * @param clutter_intensity Clutter intensity (false alarms per unit measurement volume)
+     * @param p_detection Detection probability (P_D) for the sensor model
+     * @param noise_decay_rate Process noise annealing decay rate (lambda, per second)
+     * @param noise_min_scale Process noise annealing minimum scale factor (alpha_min)
      */
     SMC_LMB_Tracker(std::shared_ptr<IOrbitPropagator> propagator,
                    std::shared_ptr<ISensorModel> sensor_model,
@@ -57,7 +63,10 @@ public:
                    double survival_probability,
                    int k_best,
                    double prune_threshold,
-                   double clutter_intensity);
+                   double clutter_intensity,
+                   double p_detection,
+                   double noise_decay_rate,
+                   double noise_min_scale);
 
     /**
      * @brief Run the predict step of the filter

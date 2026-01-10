@@ -84,7 +84,11 @@ PYBIND11_MODULE(lmb_engine, m) {
 
     pybind11::class_<TwoBodyPropagator, IOrbitPropagator, std::shared_ptr<TwoBodyPropagator>>(m, "TwoBodyPropagator")
         .def(pybind11::init<const Eigen::MatrixXd&>(), pybind11::arg("process_noise_covariance"))
-        .def("propagate", &TwoBodyPropagator::propagate);
+        .def("propagate", &TwoBodyPropagator::propagate,
+             pybind11::arg("particle"),
+             pybind11::arg("dt"),
+             pybind11::arg("current_time"),
+             pybind11::arg("noise_scale") = 1.0);
     
     pybind11::class_<InOrbitSensorModel, ISensorModel, std::shared_ptr<InOrbitSensorModel>>(m, "InOrbitSensorModel")
         .def(pybind11::init<>(), "Default constructor for InOrbitSensorModel with default noise parameters")
@@ -100,7 +104,7 @@ PYBIND11_MODULE(lmb_engine, m) {
     // Bind the main tracker class with direct constructor support
     pybind11::class_<SMC_LMB_Tracker, std::shared_ptr<SMC_LMB_Tracker>>(m, "SMC_LMB_Tracker")
         .def(pybind11::init<>(), "Default constructor for SMC_LMB_Tracker")
-        .def(pybind11::init<std::shared_ptr<IOrbitPropagator>, std::shared_ptr<ISensorModel>, std::shared_ptr<IBirthModel>, double, int, double, double>(),
+        .def(pybind11::init<std::shared_ptr<IOrbitPropagator>, std::shared_ptr<ISensorModel>, std::shared_ptr<IBirthModel>, double, int, double, double, double, double, double>(),
              pybind11::arg("propagator"),
              pybind11::arg("sensor_model"),
              pybind11::arg("birth_model"),
@@ -108,6 +112,9 @@ PYBIND11_MODULE(lmb_engine, m) {
              pybind11::arg("k_best") = 100,
              pybind11::arg("prune_threshold") = 0.01,
              pybind11::arg("clutter_intensity") = 1.0e-6,
+             pybind11::arg("p_detection") = 0.99,
+             pybind11::arg("noise_decay_rate") = 0.0,
+             pybind11::arg("noise_min_scale") = 1.0,
              "Constructor for SMC_LMB_Tracker with model dependencies")
         .def("predict", &SMC_LMB_Tracker::predict, "Runs the predict step for a given time delta")
         .def("update", &SMC_LMB_Tracker::update, "Runs the update step with measurements")
