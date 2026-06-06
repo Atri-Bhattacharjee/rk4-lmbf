@@ -202,12 +202,15 @@ Install Eigen3 for your platform (see [Platform-specific native dependencies](#p
 
 ### `Could NOT find pybind11`
 
-Install pybind11 in the active virtual environment, then re-run CMake:
+Install pybind11 in the active virtual environment, then re-run CMake using the venv Python:
 
 ```bash
 pip install -r requirements.txt
-cmake --preset release
+mapfile -t CMAKE_VENV_ARGS < <(./scripts/cmake-venv-args.sh)
+cmake --preset release "${CMAKE_VENV_ARGS[@]}"
 ```
+
+On CI or when `actions/setup-python` is used, CMake may otherwise pick the hosted Python instead of your venv unless `Python_EXECUTABLE` and `pybind11_DIR` are set explicitly (the helper scripts above do this automatically).
 
 ### Wrong Python version / import fails after rebuild
 

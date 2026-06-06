@@ -69,7 +69,8 @@ jobs:
           source venv/bin/activate
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          cmake --preset release
+          mapfile -t CMAKE_VENV_ARGS < <(./scripts/cmake-venv-args.sh)
+          cmake --preset release "${CMAKE_VENV_ARGS[@]}"
           cmake --build --preset release
 
       - name: Build (macOS)
@@ -80,7 +81,8 @@ jobs:
           source venv/bin/activate
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          cmake --preset release
+          mapfile -t CMAKE_VENV_ARGS < <(./scripts/cmake-venv-args.sh)
+          cmake --preset release "${CMAKE_VENV_ARGS[@]}"
           cmake --build --preset release
 
       - name: Build (Windows)
@@ -91,7 +93,8 @@ jobs:
           .\venv\Scripts\Activate.ps1
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          cmake --preset release `
+          $cmakeVenvArgs = & .\scripts\cmake-venv-args.ps1
+          cmake --preset release @cmakeVenvArgs `
             -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
           cmake --build --preset release
 

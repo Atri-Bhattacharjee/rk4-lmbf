@@ -12,7 +12,8 @@ if (-not (Test-Path "venv")) {
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 
-cmake --preset release
+$CmakeVenvArgs = & "$Root\scripts\cmake-venv-args.ps1"
+cmake --preset release @CmakeVenvArgs
 cmake --build --preset release
 
 Write-Host ""

@@ -14,7 +14,8 @@ source venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 
-cmake --preset release
+mapfile -t CMAKE_VENV_ARGS < <("$ROOT/scripts/cmake-venv-args.sh")
+cmake --preset release "${CMAKE_VENV_ARGS[@]}"
 cmake --build --preset release
 
 echo ""
