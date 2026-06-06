@@ -17,10 +17,10 @@ def assert_test(condition, message):
     global tests_passed, tests_failed
     if condition:
         tests_passed += 1
-        print(f"✓ PASS: {message}")
+        print(f"PASS: {message}")
     else:
         tests_failed += 1
-        print(f"✗ FAIL: {message}")
+        print(f"FAIL: {message}")
 
 def calculate_assignment_cost(cost_matrix, assignment):
     """Calculate the total cost of an assignment"""
@@ -258,10 +258,10 @@ def run_all_tests():
     print(f"Total tests: {tests_passed + tests_failed}")
     
     if tests_failed == 0:
-        print("🎉 All tests passed!")
+        print("All tests passed!")
         return True
     else:
-        print(f"❌ {tests_failed} tests failed.")
+        print(f"{tests_failed} tests failed.")
         return False
 
 def main():

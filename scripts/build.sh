@@ -14,8 +14,11 @@ source venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 
-mapfile -t CMAKE_VENV_ARGS < <("$ROOT/scripts/cmake-venv-args.sh")
-cmake --preset release "${CMAKE_VENV_ARGS[@]}"
+# shellcheck disable=SC1091
+source "$ROOT/scripts/cmake-venv-args.sh"
+cmake --preset release \
+  -DPython_EXECUTABLE="$CMAKE_VENV_PYTHON" \
+  -Dpybind11_DIR="$CMAKE_PYBIND11_DIR"
 cmake --build --preset release
 
 echo ""

@@ -206,8 +206,10 @@ Install pybind11 in the active virtual environment, then re-run CMake using the 
 
 ```bash
 pip install -r requirements.txt
-mapfile -t CMAKE_VENV_ARGS < <(./scripts/cmake-venv-args.sh)
-cmake --preset release "${CMAKE_VENV_ARGS[@]}"
+source ./scripts/cmake-venv-args.sh
+cmake --preset release \
+  -DPython_EXECUTABLE="$CMAKE_VENV_PYTHON" \
+  -Dpybind11_DIR="$CMAKE_PYBIND11_DIR"
 ```
 
 On CI or when `actions/setup-python` is used, CMake may otherwise pick the hosted Python instead of your venv unless `Python_EXECUTABLE` and `pybind11_DIR` are set explicitly (the helper scripts above do this automatically).
