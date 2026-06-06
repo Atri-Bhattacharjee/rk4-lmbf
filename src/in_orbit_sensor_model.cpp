@@ -38,19 +38,19 @@ double InOrbitSensorModel::calculate_likelihood(const Particle& particle, const 
     // Residual
     Eigen::VectorXd residual = meas_value - particle_meas;
     
-    constexpr double M_PI = 3.14159265358979323846;
+    constexpr double pi_val = 3.14159265358979323846;
     // Normalize angle differences for azimuth and elevation to handle wrap-around
-    while (residual(2) > M_PI) residual(2) -= 2.0 * M_PI;
-    while (residual(2) < -M_PI) residual(2) += 2.0 * M_PI;
-    while (residual(3) > M_PI) residual(3) -= 2.0 * M_PI;
-    while (residual(3) < -M_PI) residual(3) += 2.0 * M_PI;
+    while (residual(2) > pi_val) residual(2) -= 2.0 * pi_val;
+    while (residual(2) < -pi_val) residual(2) += 2.0 * pi_val;
+    while (residual(3) > pi_val) residual(3) -= 2.0 * pi_val;
+    while (residual(3) < -pi_val) residual(3) += 2.0 * pi_val;
     
     // Mahalanobis distance squared
     double mahalanobis_sq = residual.transpose() * cov.inverse() * residual;
     
     // Normalization factor for 4D Gaussian
 
-    double norm_factor = std::pow(2.0 * M_PI, -2.0) * std::pow(cov.determinant(), -0.5);
+    double norm_factor = std::pow(2.0 * pi_val, -2.0) * std::pow(cov.determinant(), -0.5);
     
     return norm_factor * std::exp(-0.5 * mahalanobis_sq);
 }
