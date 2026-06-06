@@ -68,6 +68,13 @@ public:
      * @return double The likelihood value (probability density)
      */
     virtual double calculate_likelihood(const Particle& particle, const Measurement& measurement) const = 0;
+
+    /**
+     * @brief Calculate likelihood using precomputed measurement covariance cache
+     */
+    virtual double calculate_likelihood(const Particle& particle,
+                                          const Measurement& measurement,
+                                          const MeasurementLikelihoodCache& cache) const = 0;
 };
 
 /**

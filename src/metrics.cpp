@@ -4,62 +4,53 @@
 #include <algorithm>
 
 // Helper: Compute mean ECI state (position+velocity) of a track
-static Eigen::VectorXd mean_state(const Track& track) {
+static StateVector mean_state(const Track& track) {
     const auto& particles = track.particles();
-    if (particles.empty()) return Eigen::VectorXd::Zero(6);
-    Eigen::VectorXd sum = Eigen::VectorXd::Zero(6);
+    if (particles.empty()) return StateVector::Zero();
+    StateVector sum = StateVector::Zero();
     double total_weight = 0.0;
     for (const auto& p : particles) {
-        sum += p.state_vector.head(6) * p.weight;
+        sum += p.state_vector * p.weight;
         total_weight += p.weight;
     }
-    if (total_weight == 0.0) return Eigen::VectorXd::Zero(6);
+    if (total_weight == 0.0) return StateVector::Zero();
     return sum / total_weight;
 }
 
-// Helper: Compute mean state of a track's particles (returns 7D, but for metrics use only first 6)
-Eigen::VectorXd mean_state6d(const std::vector<Particle>& particles) {
-    if (particles.empty()) return Eigen::VectorXd();
-    int dim = particles[0].state_vector.size();
-    Eigen::VectorXd mean = Eigen::VectorXd::Zero(dim);
+// Helper: Compute mean state of a track's particles (returns first 6 elements)
+static StateVector mean_state6d(const std::vector<Particle>& particles) {
+    if (particles.empty()) return StateVector::Zero();
+    StateVector mean = StateVector::Zero();
     double total_weight = 0.0;
     for (const auto& p : particles) {
-        if (p.state_vector.size() != dim) {
-            return Eigen::VectorXd();
-        }
         mean += p.state_vector * p.weight;
         total_weight += p.weight;
     }
     if (total_weight > 0.0) mean /= total_weight;
-    // Truncate to first 6 elements for metric comparison
-    return mean.head(6);
+    return mean;
 }
 
 double calculate_ospa_distance(const std::vector<Track>& tracks,
                                const std::vector<Eigen::VectorXd>& ground_truths,
                                double cutoff) {
-    // Check shapes
     for (const auto& t : tracks) {
-        Eigen::VectorXd mean6d = mean_state6d(t.particles());
-        if (mean6d.size() == 0) {
-            return cutoff;
-        }
+        StateVector mean6d = mean_state6d(t.particles());
         if (!ground_truths.empty() && mean6d.size() != ground_truths[0].size()) {
             return cutoff;
         }
     }
     size_t m = tracks.size();
     size_t n = ground_truths.size();
-    if (m == 0 && n == 0) return 0.0; // Handle the no-error case
-    if (n == 0) return cutoff; // If there are tracks but no truths, error is cutoff
-    if (m == 0) return cutoff; // If there are truths but no tracks, error is cutoff
+    if (m == 0 && n == 0) return 0.0;
+    if (n == 0) return cutoff;
+    if (m == 0) return cutoff;
     bool tracks_are_smaller = m <= n;
     size_t rows = tracks_are_smaller ? m : n;
     size_t cols = tracks_are_smaller ? n : m;
     Eigen::MatrixXd dist_matrix(rows, cols);
     if (tracks_are_smaller) {
         for (size_t i = 0; i < m; ++i) {
-            Eigen::VectorXd track_state = mean_state(tracks[i]);
+            StateVector track_state = mean_state(tracks[i]);
             for (size_t j = 0; j < n; ++j) {
                 dist_matrix(i, j) = std::min((track_state - ground_truths[j]).norm(), cutoff);
             }

@@ -2,6 +2,30 @@
 #include "validation.h"
 #include <cmath>
 
+namespace {
+
+constexpr double kPi = 3.14159265358979323846;
+
+void wrapAngleResidual(MeasVector& residual) {
+    while (residual(2) > kPi) residual(2) -= 2.0 * kPi;
+    while (residual(2) < -kPi) residual(2) += 2.0 * kPi;
+    while (residual(3) > kPi) residual(3) -= 2.0 * kPi;
+    while (residual(3) < -kPi) residual(3) += 2.0 * kPi;
+}
+
+bool isDiagonalCovariance(const MeasCovariance& cov, double tolerance = 1e-12) {
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            if (row != col && std::abs(cov(row, col)) > tolerance) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
 InOrbitSensorModel::InOrbitSensorModel()
     : range_var_(50.0 * 50.0),           // 50m standard deviation
       range_rate_var_(1.0 * 1.0),        // 1m/s standard deviation
@@ -17,44 +41,52 @@ InOrbitSensorModel::InOrbitSensorModel(double range_var, double range_rate_var,
       elevation_var_(elevation_var) {
 }
 
-Eigen::VectorXd InOrbitSensorModel::convertParticleToMeasurement(
-    const Particle& particle, const Eigen::VectorXd& sensor_state) const {
+MeasVector InOrbitSensorModel::convertParticleToMeasurement(
+    const Particle& particle, const StateVector& sensor_state) const {
     return Measurement::cartesianToMeasurement(particle.state_vector, sensor_state);
 }
 
+MeasurementLikelihoodCache InOrbitSensorModel::buildCache(const Measurement& measurement) {
+    MeasurementLikelihoodCache cache;
+    const MeasCovariance& cov = measurement.covariance_;
+    constexpr int dim = 4;
+
+    if (isDiagonalCovariance(cov)) {
+        cache.is_diagonal = true;
+        cache.inv_var = cov.diagonal().cwiseInverse();
+        cache.log_norm_factor = -0.5 * dim * std::log(2.0 * kPi);
+        for (int i = 0; i < dim; ++i) {
+            cache.log_norm_factor -= 0.5 * std::log(cov(i, i));
+        }
+    } else {
+        cache.is_diagonal = false;
+        cache.cov_inv = cov.inverse();
+        cache.log_norm_factor = -0.5 * dim * std::log(2.0 * kPi) - 0.5 * std::log(cov.determinant());
+    }
+
+    return cache;
+}
+
 double InOrbitSensorModel::calculate_likelihood(const Particle& particle, const Measurement& measurement) const {
+    return calculate_likelihood(particle, measurement, buildCache(measurement));
+}
+
+double InOrbitSensorModel::calculate_likelihood(const Particle& particle,
+                                                const Measurement& measurement,
+                                                const MeasurementLikelihoodCache& cache) const {
     validation::require_state_vector(particle.state_vector, "particle.state_vector");
     validation::require_measurement(measurement);
 
-    // Check dimensions
-    if (measurement.value_.size() != 4) {
-        return 0.0;
-    }
-    if (measurement.covariance_.rows() != 4 || measurement.covariance_.cols() != 4) {
-        return 0.0;
-    }
-    
-    // Convert particle state to measurement space
-    Eigen::VectorXd particle_meas = convertParticleToMeasurement(particle, measurement.sensor_state_);
-    Eigen::VectorXd meas_value = measurement.value_;
-    Eigen::MatrixXd cov = measurement.covariance_;
-    
-    // Residual
-    Eigen::VectorXd residual = meas_value - particle_meas;
-    
-    constexpr double pi_val = 3.14159265358979323846;
-    // Normalize angle differences for azimuth and elevation to handle wrap-around
-    while (residual(2) > pi_val) residual(2) -= 2.0 * pi_val;
-    while (residual(2) < -pi_val) residual(2) += 2.0 * pi_val;
-    while (residual(3) > pi_val) residual(3) -= 2.0 * pi_val;
-    while (residual(3) < -pi_val) residual(3) += 2.0 * pi_val;
-    
-    // Mahalanobis distance squared
-    double mahalanobis_sq = residual.transpose() * cov.inverse() * residual;
-    
-    // Normalization factor for 4D Gaussian
+    const MeasVector particle_meas = convertParticleToMeasurement(particle, measurement.sensor_state_);
+    MeasVector residual = measurement.value_ - particle_meas;
+    wrapAngleResidual(residual);
 
-    double norm_factor = std::pow(2.0 * pi_val, -2.0) * std::pow(cov.determinant(), -0.5);
-    
-    return norm_factor * std::exp(-0.5 * mahalanobis_sq);
+    double mahalanobis_sq = 0.0;
+    if (cache.is_diagonal) {
+        mahalanobis_sq = residual.cwiseProduct(cache.inv_var).cwiseProduct(residual).sum();
+    } else {
+        mahalanobis_sq = residual.transpose() * cache.cov_inv * residual;
+    }
+
+    return std::exp(cache.log_norm_factor - 0.5 * mahalanobis_sq);
 }

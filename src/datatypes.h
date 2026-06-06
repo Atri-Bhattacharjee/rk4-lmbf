@@ -17,6 +17,18 @@
 #include <Eigen/Dense>
 #include <iostream>
 
+using StateVector = Eigen::Matrix<double, 6, 1>;
+using MeasVector = Eigen::Matrix<double, 4, 1>;
+using MeasCovariance = Eigen::Matrix<double, 4, 4>;
+using ProcessNoiseCov = Eigen::Matrix<double, 6, 6>;
+
+struct MeasurementLikelihoodCache {
+    MeasCovariance cov_inv;
+    double log_norm_factor = 0.0;
+    bool is_diagonal = false;
+    MeasVector inv_var;
+};
+
 /**
  * @brief A simple POD structure for creating unique, persistent track identities
  * 
@@ -36,9 +48,9 @@ struct TrackLabel {
  */
 struct Particle {
     //! [x, y, z, vx, vy, vz] where position is ECI in m, velocity is ECI in m/s
-    Eigen::VectorXd state_vector;
+    StateVector state_vector;
     double weight;  //!< The probability weight of this particle
-    Particle() : state_vector(6), weight(0.0) {}
+    Particle() : state_vector(StateVector::Zero()), weight(0.0) {}
 };
 
 /**
@@ -108,13 +120,13 @@ public:
  */
 struct Measurement {
     double timestamp_;                    //!< The epoch timestamp of the measurement
-    Eigen::VectorXd value_;              //!< The 4D measurement vector [range, range_rate, azimuth, elevation]
-    Eigen::MatrixXd covariance_;         //!< The 4x4 measurement noise covariance matrix
+    MeasVector value_;              //!< The 4D measurement vector [range, range_rate, azimuth, elevation]
+    MeasCovariance covariance_;         //!< The 4x4 measurement noise covariance matrix
     std::string sensor_id_;              //!< Identifier for the sensor that produced the measurement
-    Eigen::VectorXd sensor_state_;       //!< The 6D ECI state of the sensor satellite [x, y, z, vx, vy, vz]
+    StateVector sensor_state_;       //!< The 6D ECI state of the sensor satellite [x, y, z, vx, vy, vz]
 
     Measurement()
-        : timestamp_(0.0), value_(Eigen::VectorXd::Zero(4)), covariance_(Eigen::MatrixXd::Zero(4,4)), sensor_id_(), sensor_state_(Eigen::VectorXd::Zero(6)) {}
+        : timestamp_(0.0), value_(MeasVector::Zero()), covariance_(MeasCovariance::Zero()), sensor_id_(), sensor_state_(StateVector::Zero()) {}
         
     /**
      * @brief Convert Cartesian state to measurement space
@@ -124,9 +136,9 @@ struct Measurement {
      * 
      * @param cartesian_state 6D Cartesian state vector [x, y, z, vx, vy, vz]
      * @param sensor_state 6D Cartesian state vector of sensor [x, y, z, vx, vy, vz]
-     * @return Eigen::VectorXd 4D measurement vector [range, range_rate, azimuth, elevation]
+     * @return MeasVector 4D measurement vector [range, range_rate, azimuth, elevation]
      */
-    static Eigen::VectorXd cartesianToMeasurement(const Eigen::VectorXd& cartesian_state, const Eigen::VectorXd& sensor_state) {
+    static MeasVector cartesianToMeasurement(const StateVector& cartesian_state, const StateVector& sensor_state) {
         constexpr double range_epsilon = 1e-10;
 
         // Relative position and velocity
@@ -151,7 +163,7 @@ struct Measurement {
             elevation = std::asin(sin_elevation);
         }
         
-        Eigen::VectorXd measurement(4);
+        MeasVector measurement;
         measurement << range, range_rate, azimuth, elevation;
         
         return measurement;
@@ -165,9 +177,9 @@ struct Measurement {
      * 
      * @param measurement 4D measurement vector [range, range_rate, azimuth, elevation]
      * @param sensor_state 6D Cartesian state vector of sensor [x, y, z, vx, vy, vz]
-     * @return Eigen::VectorXd 6D Cartesian state vector [x, y, z, vx, vy, vz]
+     * @return StateVector 6D Cartesian state vector [x, y, z, vx, vy, vz]
      */
-    static Eigen::VectorXd measurementToCartesian(const Eigen::VectorXd& measurement, const Eigen::VectorXd& sensor_state) {
+    static StateVector measurementToCartesian(const MeasVector& measurement, const StateVector& sensor_state) {
         double range = measurement(0);
         double range_rate = measurement(1);
         double azimuth = measurement(2);
@@ -193,7 +205,7 @@ struct Measurement {
         Eigen::Vector3d rel_vel = unit_vector * range_rate;
         
         // Convert to absolute coordinates
-        Eigen::VectorXd cartesian_state(6);
+        StateVector cartesian_state;
         cartesian_state.head(3) = rel_pos + sensor_state.head(3);
         cartesian_state.tail(3) = rel_vel + sensor_state.tail(3);
         

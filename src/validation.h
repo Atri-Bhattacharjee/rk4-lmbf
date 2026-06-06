@@ -13,6 +13,14 @@ constexpr int STATE_DIM = 6;
 constexpr int MEAS_DIM = 4;
 constexpr double RANGE_EPSILON = 1e-10;
 
+inline void require_state_vector(const StateVector& vector, const char* context) {
+    if (vector.size() != STATE_DIM) {
+        throw std::invalid_argument(
+            std::string(context) + ": state vector must have size " +
+            std::to_string(STATE_DIM) + ", got " + std::to_string(vector.size()));
+    }
+}
+
 inline void require_state_vector(const Eigen::VectorXd& vector, const char* context) {
     if (vector.size() != STATE_DIM) {
         throw std::invalid_argument(
@@ -34,6 +42,14 @@ inline void require_measurement(const Measurement& measurement) {
 }
 
 inline void require_covariance_6x6(const Eigen::MatrixXd& covariance, const char* context) {
+    if (covariance.rows() != STATE_DIM || covariance.cols() != STATE_DIM) {
+        throw std::invalid_argument(
+            std::string(context) + ": covariance must be 6x6, got " +
+            std::to_string(covariance.rows()) + "x" + std::to_string(covariance.cols()));
+    }
+}
+
+inline void require_covariance_6x6(const ProcessNoiseCov& covariance, const char* context) {
     if (covariance.rows() != STATE_DIM || covariance.cols() != STATE_DIM) {
         throw std::invalid_argument(
             std::string(context) + ": covariance must be 6x6, got " +

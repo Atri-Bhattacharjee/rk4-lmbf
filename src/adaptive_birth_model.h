@@ -33,7 +33,8 @@ class AdaptiveBirthModel : public IBirthModel {
 private:
     int particles_per_track_;                    //!< The number of particles to generate for each new track
     double initial_existence_probability_;       //!< The low probability assigned to a brand new track
-    Eigen::MatrixXd initial_covariance_;         //!< A 6x6 covariance matrix defining the initial uncertainty
+    ProcessNoiseCov initial_covariance_;         //!< A 6x6 covariance matrix defining the initial uncertainty
+    ProcessNoiseCov birth_noise_L_;              //!< Precomputed Cholesky factor of initial covariance
     
     // Physical constants for orbital mechanics
     static constexpr double MU_EARTH = 3.986004418e14;   //!< Earth gravitational parameter (m³/s²)

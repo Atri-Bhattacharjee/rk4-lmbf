@@ -17,22 +17,26 @@
 
 namespace {
 
-Eigen::VectorXd cartesian_to_measurement_validated(const Eigen::VectorXd& cartesian_state,
-                                                   const Eigen::VectorXd& sensor_state) {
+MeasVector cartesian_to_measurement_validated(const Eigen::VectorXd& cartesian_state,
+                                              const Eigen::VectorXd& sensor_state) {
     validation::require_state_vector(cartesian_state, "cartesian_state");
     validation::require_state_vector(sensor_state, "sensor_state");
-    return Measurement::cartesianToMeasurement(cartesian_state, sensor_state);
+    StateVector cartesian_fixed = cartesian_state;
+    StateVector sensor_fixed = sensor_state;
+    return Measurement::cartesianToMeasurement(cartesian_fixed, sensor_fixed);
 }
 
-Eigen::VectorXd measurement_to_cartesian_validated(const Eigen::VectorXd& measurement,
-                                                   const Eigen::VectorXd& sensor_state) {
+StateVector measurement_to_cartesian_validated(const Eigen::VectorXd& measurement,
+                                               const Eigen::VectorXd& sensor_state) {
     if (measurement.size() != validation::MEAS_DIM) {
         throw std::invalid_argument(
             "measurement: expected size " + std::to_string(validation::MEAS_DIM) +
             ", got " + std::to_string(measurement.size()));
     }
     validation::require_state_vector(sensor_state, "sensor_state");
-    return Measurement::measurementToCartesian(measurement, sensor_state);
+    MeasVector measurement_fixed = measurement;
+    StateVector sensor_fixed = sensor_state;
+    return Measurement::measurementToCartesian(measurement_fixed, sensor_fixed);
 }
 
 std::shared_ptr<AdaptiveBirthModel> make_adaptive_birth_model(int particles_per_track,
@@ -66,12 +70,13 @@ double calculate_likelihood_validated(const InOrbitSensorModel& sensor_model,
     return sensor_model.calculate_likelihood(particle, measurement);
 }
 
-Eigen::VectorXd convert_particle_to_measurement_validated(const InOrbitSensorModel& sensor_model,
-                                                          const Particle& particle,
-                                                          const Eigen::VectorXd& sensor_state) {
+MeasVector convert_particle_to_measurement_validated(const InOrbitSensorModel& sensor_model,
+                                                     const Particle& particle,
+                                                     const Eigen::VectorXd& sensor_state) {
     validation::require_state_vector(particle.state_vector, "particle.state_vector");
     validation::require_state_vector(sensor_state, "sensor_state");
-    return sensor_model.convertParticleToMeasurement(particle, sensor_state);
+    StateVector sensor_fixed = sensor_state;
+    return sensor_model.convertParticleToMeasurement(particle, sensor_fixed);
 }
 
 std::shared_ptr<SMC_LMB_Tracker> make_smc_lmb_tracker(

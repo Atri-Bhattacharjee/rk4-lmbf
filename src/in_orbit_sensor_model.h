@@ -10,15 +10,20 @@ public:
     InOrbitSensorModel(double range_var, double range_rate_var, double azimuth_var, double elevation_var);
     
     double calculate_likelihood(const Particle& particle, const Measurement& measurement) const override;
+    double calculate_likelihood(const Particle& particle,
+                                const Measurement& measurement,
+                                const MeasurementLikelihoodCache& cache) const override;
+
+    static MeasurementLikelihoodCache buildCache(const Measurement& measurement);
     
     /**
      * @brief Convert particle state to measurement space
      * 
      * @param particle The particle with state to convert
      * @param sensor_state The sensor state to use as reference
-     * @return Eigen::VectorXd The measurement space representation [range, range_rate, azimuth, elevation]
+     * @return MeasVector The measurement space representation [range, range_rate, azimuth, elevation]
      */
-    Eigen::VectorXd convertParticleToMeasurement(const Particle& particle, const Eigen::VectorXd& sensor_state) const;
+    MeasVector convertParticleToMeasurement(const Particle& particle, const StateVector& sensor_state) const;
     
 private:
     // Default measurement noise parameters
