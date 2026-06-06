@@ -37,6 +37,8 @@ private:
     double noise_decay_rate_;                           //!< Process noise annealing decay rate (lambda)
     double noise_min_scale_;                            //!< Process noise annealing minimum scale factor (alpha_min)
 
+    void ensure_models_configured() const;
+
 public:
     /**
      * @brief Default constructor

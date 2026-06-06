@@ -1,10 +1,12 @@
-import numpy as np
 import sys
-import os
+from pathlib import Path
 
-# Ensure lmb_engine.pyd is found in the build output directory
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../python/lmb_engine/Debug')))
-import lmb_engine
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
+from lmb_engine_loader import import_lmb_engine
+
+lmb_engine = import_lmb_engine()
 
 # Global test counters
 tests_passed = 0

@@ -1,4 +1,5 @@
 #include "in_orbit_sensor_model.h"
+#include "validation.h"
 #include <cmath>
 
 InOrbitSensorModel::InOrbitSensorModel()
@@ -22,6 +23,9 @@ Eigen::VectorXd InOrbitSensorModel::convertParticleToMeasurement(
 }
 
 double InOrbitSensorModel::calculate_likelihood(const Particle& particle, const Measurement& measurement) const {
+    validation::require_state_vector(particle.state_vector, "particle.state_vector");
+    validation::require_measurement(measurement);
+
     // Check dimensions
     if (measurement.value_.size() != 4) {
         return 0.0;

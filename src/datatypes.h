@@ -13,6 +13,7 @@
 #include <vector>
 #include <cstdint>
 #include <string>
+#include <algorithm>
 #include <Eigen/Dense>
 #include <iostream>
 
@@ -126,6 +127,8 @@ struct Measurement {
      * @return Eigen::VectorXd 4D measurement vector [range, range_rate, azimuth, elevation]
      */
     static Eigen::VectorXd cartesianToMeasurement(const Eigen::VectorXd& cartesian_state, const Eigen::VectorXd& sensor_state) {
+        constexpr double range_epsilon = 1e-10;
+
         // Relative position and velocity
         Eigen::Vector3d rel_pos = cartesian_state.head(3) - sensor_state.head(3);
         Eigen::Vector3d rel_vel = cartesian_state.tail(3) - sensor_state.tail(3);
@@ -135,14 +138,18 @@ struct Measurement {
         
         // Calculate range rate (dot product of unit vector and relative velocity)
         double range_rate = 0.0;
-        if (range > 1e-10) {
+        if (range > range_epsilon) {
             Eigen::Vector3d unit_vector = rel_pos / range;
             range_rate = rel_vel.dot(unit_vector);
         }
         
         // Calculate azimuth and elevation
         double azimuth = std::atan2(rel_pos(1), rel_pos(0));
-        double elevation = std::asin(rel_pos(2) / range);
+        double elevation = 0.0;
+        if (range > range_epsilon) {
+            const double sin_elevation = std::clamp(rel_pos(2) / range, -1.0, 1.0);
+            elevation = std::asin(sin_elevation);
+        }
         
         Eigen::VectorXd measurement(4);
         measurement << range, range_rate, azimuth, elevation;
@@ -176,7 +183,13 @@ struct Measurement {
         // Convert range_rate to Cartesian velocity (simplified model)
         // This is a simplification - we only have the radial component
         // A more accurate model would need additional info or assumptions
-        Eigen::Vector3d unit_vector = rel_pos.normalized();
+        constexpr double range_epsilon = 1e-10;
+        Eigen::Vector3d unit_vector;
+        if (range > range_epsilon) {
+            unit_vector = rel_pos.normalized();
+        } else {
+            unit_vector = Eigen::Vector3d::UnitX();
+        }
         Eigen::Vector3d rel_vel = unit_vector * range_rate;
         
         // Convert to absolute coordinates

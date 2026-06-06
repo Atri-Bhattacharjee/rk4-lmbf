@@ -1,6 +1,12 @@
 #include "smc_lmb_tracker.h"
 #include "assignment.h"
+#include "validation.h"
 #include <iostream>
+#include <stdexcept>
+
+void SMC_LMB_Tracker::ensure_models_configured() const {
+    validation::require_models(propagator_, sensor_model_, birth_model_);
+}
 
 SMC_LMB_Tracker::SMC_LMB_Tracker(std::shared_ptr<IOrbitPropagator> propagator,
                                                                  std::shared_ptr<ISensorModel> sensor_model,
@@ -23,9 +29,13 @@ SMC_LMB_Tracker::SMC_LMB_Tracker(std::shared_ptr<IOrbitPropagator> propagator,
             p_detection_(p_detection),
             noise_decay_rate_(noise_decay_rate),
             noise_min_scale_(noise_min_scale) {
+    validation::require_models(propagator_, sensor_model_, birth_model_);
+    validation::require_k_best(k_best_);
+    validation::require_clutter_intensity(clutter_intensity_);
 }
 
 void SMC_LMB_Tracker::predict(double dt) {
+    ensure_models_configured();
     // Projects the filter state forward in time by operating in-place.
     const double previous_time = current_state_.timestamp();
     const double new_time = current_state_.timestamp() + dt;
@@ -62,6 +72,12 @@ void SMC_LMB_Tracker::predict(double dt) {
 }
 
 void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
+    ensure_models_configured();
+
+    for (const auto& measurement : measurements) {
+        validation::require_measurement(measurement);
+    }
+
     std::vector<Track>& tracks = current_state_.tracks();
     size_t num_tracks = tracks.size();
     size_t num_meas = measurements.size();
@@ -165,6 +181,10 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
     
     // Step 4: Solve assignment (K-best)
     std::vector<Hypothesis> hypotheses = solve_assignment(cost_matrix, k_best_);
+
+    if (hypotheses.empty()) {
+        return;
+    }
     
     // Normalize hypothesis weights (log-sum-exp)
     std::vector<double> log_weights;
@@ -173,6 +193,9 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
     std::vector<double> norm_weights;
     double sum_exp = 0.0;
     for (double lw : log_weights) sum_exp += std::exp(lw - max_logw);
+    if (sum_exp <= 0.0) {
+        return;
+    }
     for (double lw : log_weights) norm_weights.push_back(std::exp(lw - max_logw) / sum_exp);
     
     // Step 5: Combine, update and resample
@@ -198,8 +221,9 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
                         mixed_particle.weight = particle.weight * hyp_weight * p_detection_ * likelihood_ratio;
                         mixed_particles.push_back(mixed_particle);
                     }
-                } else if (static_cast<size_t>(assoc_idx) >= num_meas && 
-                           static_cast<size_t>(assoc_idx) < num_meas + num_tracks) {
+                } else if (assoc_idx == -1 ||
+                           (static_cast<size_t>(assoc_idx) >= num_meas &&
+                            static_cast<size_t>(assoc_idx) < num_meas + num_tracks)) {
                     // MISSED DETECTION CASE: Use predicted particles scaled by (1 - P_D)
                     const auto& predicted_particles = tracks[i].particles();
                     for (const auto& particle : predicted_particles) {
@@ -244,7 +268,14 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
             std::vector<Particle> resampled_particles;
             resampled_particles.reserve(num_particles);
 
-            double u = ((double)rand() / RAND_MAX) / num_particles;
+            if (mixed_particles.empty() || num_particles == 0) {
+                Track final_track = tracks[i];
+                final_track.set_existence_probability(r_new);
+                updated_tracks.push_back(final_track);
+                continue;
+            }
+
+            double u = ((double)rand() / RAND_MAX) / static_cast<double>(num_particles);
             double cumsum = 0.0;
             size_t idx = 0;
 
@@ -335,6 +366,9 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
 // Helper: average likelihood over all particles
 
 double SMC_LMB_Tracker::compute_association_likelihood(const Track& track, const Measurement& measurement) const {
+    ensure_models_configured();
+    validation::require_measurement(measurement);
+
     double total_likelihood = 0.0;
     const auto& particles = track.particles();
     for (size_t i = 0; i < particles.size(); ++i) {

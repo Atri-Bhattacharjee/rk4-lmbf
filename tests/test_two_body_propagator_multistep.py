@@ -1,14 +1,18 @@
-import numpy as np
-import os
 import sys
-sys.path.append('python/lmb_engine/Debug')
-import lmb_engine
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
+from lmb_engine_loader import import_lmb_engine
+
+lmb_engine = import_lmb_engine()
 
 def test_two_body_multistep():
     print("Test: TwoBodyPropagator multistep propagation")
-    # Initial state: [x, y, z, vx, vy, vz, bstar]
-    state = np.array([7000e3, 0, 0, 0, 7.546e3, 0, 1e-4], dtype=float)
-    process_noise = np.diag([0.0]*7)
+    # Initial state: [x, y, z, vx, vy, vz]
+    state = np.array([7000e3, 0, 0, 0, 7.546e3, 0], dtype=float)
+    process_noise = np.diag([0.0] * 6)
     propagator = lmb_engine.TwoBodyPropagator(process_noise)
     p = lmb_engine.Particle()
     p.state_vector = state.copy()

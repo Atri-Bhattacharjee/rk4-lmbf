@@ -13,16 +13,13 @@ The simulation uses a "dual-noise" strategy:
 - Truth generation uses low noise (high precision sensor)
 - Filter model uses inflated noise (wide acceptance gate for birth convergence)
 """
-import sys
 import os
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Import the C++ engine
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'lmb_engine', 'Release')))
-import lmb_engine
-print(f"LOADED MODULE FROM: {lmb_engine.__file__}")
-print(f"FILE CREATED AT: {os.path.getmtime(lmb_engine.__file__)}")
+from lmb_engine_loader import import_lmb_engine
+
+lmb_engine = import_lmb_engine(verbose=os.environ.get("LMB_ENGINE_VERBOSE") == "1")
 
 # =============================================================================
 # CONFIGURATION CONSTANTS

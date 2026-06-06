@@ -1,6 +1,8 @@
 #include "adaptive_birth_model.h"
+#include "validation.h"
 #include <random>
 #include <vector>
+#include <stdexcept>
 
 // Define _USE_MATH_DEFINES before cmath to get M_PI on MSVC
 #define _USE_MATH_DEFINES
@@ -17,6 +19,8 @@ AdaptiveBirthModel::AdaptiveBirthModel(int particles_per_track,
     : particles_per_track_(particles_per_track),
       initial_existence_probability_(initial_existence_probability),
       initial_covariance_(initial_covariance) {
+    validation::require_particles_per_track(particles_per_track_);
+    validation::require_positive_definite(initial_covariance_, "initial_covariance");
 }
 
 double AdaptiveBirthModel::computeCircularVelocity(double radius) const {
@@ -38,11 +42,15 @@ std::vector<Track> AdaptiveBirthModel::generate_new_tracks(const std::vector<Mea
     // Pre-calculate Cholesky decomposition of the initial covariance matrix
     // This is used to add correlated Gaussian noise to capture eccentricity variation
     Eigen::LLT<Eigen::MatrixXd> llt(initial_covariance_);
+    if (llt.info() != Eigen::Success) {
+        throw std::runtime_error("AdaptiveBirthModel: initial_covariance is not positive definite");
+    }
     Eigen::MatrixXd L = llt.matrixL();
     
     // Loop through each unused measurement
     for (size_t measurement_idx = 0; measurement_idx < unused_measurements.size(); ++measurement_idx) {
         const auto& measurement = unused_measurements[measurement_idx];
+        validation::require_measurement(measurement);
         
         // =================================================================
         // Step 1: Extract measurement components
