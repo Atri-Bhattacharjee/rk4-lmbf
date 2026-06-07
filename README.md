@@ -18,7 +18,7 @@ Native and Python dependencies:
 - **Eigen3** — linear algebra (install via your OS package manager)
 - **pybind11, numpy, matplotlib** — installed via pip (see below)
 
-> **Note:** The bundled `external/vcpkg` submodule is **not** used for the default build. Native dependencies are installed with your system package manager (Option A).
+> **Note:** The bundled `external/vcpkg` submodule is **not** used for the default build. Install native dependencies with your system package manager (Linux/macOS) or a standalone vcpkg install (Windows).
 
 ## Quick start
 
@@ -26,23 +26,26 @@ Native and Python dependencies:
 git clone https://github.com/Atri-Bhattacharjee/rk4-lmbf.git
 cd rk4-lmbf
 
+./scripts/build.sh                # Linux / macOS — creates venv, installs deps, builds
+# .\scripts\build.ps1             # Windows PowerShell
+
+source venv/bin/activate          # Windows: venv\Scripts\activate
+python python/run_once.py         # fast single-run smoke test
+python python/run.py              # full Monte Carlo analysis (slow)
+```
+
+Manual build (same steps as the helper scripts):
+
+```bash
 python3 -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 
-cmake --preset release
+source ./scripts/cmake-venv-args.sh   # Windows: see scripts/cmake-venv-args.ps1
+cmake --preset release \
+  -DPython_EXECUTABLE="$CMAKE_VENV_PYTHON" \
+  -Dpybind11_DIR="$CMAKE_PYBIND11_DIR"
 cmake --build --preset release
-
-python python/run.py
-```
-
-Or use the helper script:
-
-```bash
-./scripts/build.sh                # Linux / macOS
-# scripts\build.ps1               # Windows PowerShell
-source venv/bin/activate
-python python/run.py
 ```
 
 ## Platform-specific native dependencies
@@ -75,10 +78,12 @@ brew install cmake eigen
    C:\vcpkg\vcpkg install eigen3:x64-windows
    ```
 
-4. Configure with the vcpkg toolchain (adjust paths as needed):
+4. Configure with the vcpkg toolchain and venv Python (adjust paths as needed):
 
    ```powershell
-   cmake --preset release `
+   .\venv\Scripts\Activate.ps1
+   $cmakeVenvArgs = & .\scripts\cmake-venv-args.ps1
+   cmake --preset release @cmakeVenvArgs `
      -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
    cmake --build --preset release
    ```
@@ -95,10 +100,15 @@ brew install cmake eigen
 | `debug` | Debugging with symbols |
 
 ```bash
-cmake --preset release
+source ./scripts/cmake-venv-args.sh   # Windows: see scripts/cmake-venv-args.ps1
+cmake --preset release \
+  -DPython_EXECUTABLE="$CMAKE_VENV_PYTHON" \
+  -Dpybind11_DIR="$CMAKE_PYBIND11_DIR"
 cmake --build --preset release
 
-cmake --preset debug
+cmake --preset debug \
+  -DPython_EXECUTABLE="$CMAKE_VENV_PYTHON" \
+  -Dpybind11_DIR="$CMAKE_PYBIND11_DIR"
 cmake --build --preset debug
 ```
 
@@ -106,6 +116,12 @@ Built extensions are written to:
 
 - `python/lmb_engine/Release/` — recommended
 - `python/lmb_engine/Debug/`
+
+Optional CMake flag:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LMB_ENGINE_ENABLE_VALIDATION` | `OFF` | Keep hot-path validation checks in Release builds |
 
 ### Manual CMake (without presets)
 
@@ -122,6 +138,17 @@ The extension is tied to the Python version used during CMake configure (e.g. `l
 
 ## Running
 
+All simulation scripts must be run from the repo root with the same `venv` used at build time. They import the C++ extension via `python/lmb_engine_loader.py`.
+
+### Single run (fast)
+
+```bash
+source venv/bin/activate
+python python/run_once.py
+```
+
+Writes `python/figure_ospa_single_run.png`.
+
 ### Monte Carlo simulation
 
 ```bash
@@ -129,16 +156,20 @@ source venv/bin/activate
 python python/run.py
 ```
 
-This writes PNG figures under `python/`:
+Runs 20 Monte Carlo trials and writes PNG figures under `python/`:
 
 - `figure_1_individual_runs.png`
 - `figure_2_average_performance.png`
 - `figure_3_component_error.png`
 
-Optional verbose import logging:
+### Paper reproduction
+
+`python/2026_ieee_aerospace.py` is the IEEE Aerospace 2026 configuration (same harness as `run.py` with `K_BEST=100`). It produces the same three figure outputs as the Monte Carlo script.
+
+Optional verbose import logging (works with any simulation script):
 
 ```bash
-LMB_ENGINE_VERBOSE=1 python python/run.py
+LMB_ENGINE_VERBOSE=1 python python/run_once.py
 ```
 
 ### Tests
@@ -169,21 +200,54 @@ python -c "import sys; sys.path.insert(0, 'python'); from lmb_engine_loader impo
 
 ```
 rk4-lmbf/
-├── CMakeLists.txt          # C++ extension build
-├── CMakePresets.json       # release / debug presets
-├── requirements.txt        # Python dependencies
-├── scripts/build.sh        # Linux/macOS build helper
-├── scripts/build.ps1       # Windows build helper
-├── scripts/ci-test.sh      # Linux/macOS CI validation suite
-├── scripts/ci-test.ps1     # Windows CI validation suite
-├── .github/workflows/ci.yml
-├── src/                    # C++ source
+├── CMakeLists.txt              # pybind11 extension target (lmb_engine)
+├── CMakePresets.json           # release / debug configure & build presets
+├── pyproject.toml              # setuptools package metadata
+├── setup.py                    # setuptools entry point
+├── requirements.txt            # Python dependencies (pybind11, numpy, matplotlib)
+├── LICENSE
+├── .gitmodules                 # optional external/ submodules
+├── .github/
+│   └── workflows/
+│       └── ci.yml              # Linux, macOS, Windows build + test
+├── scripts/
+│   ├── build.sh                # Linux/macOS: venv + configure + build
+│   ├── build.ps1               # Windows build helper
+│   ├── cmake-venv-args.sh      # resolve venv Python & pybind11 for CMake
+│   ├── cmake-venv-args.ps1     # Windows variant
+│   ├── ci-test.sh              # Linux/macOS CI validation suite
+│   └── ci-test.ps1             # Windows CI validation suite
+├── src/                        # C++ SMC-LMB filter engine
+│   ├── main.cpp                # pybind11 module bindings
+│   ├── smc_lmb_tracker.{h,cpp} # core LMB filter
+│   ├── adaptive_birth_model.{h,cpp}
+│   ├── in_orbit_sensor_model.{h,cpp}
+│   ├── two_body_propagator.{h,cpp}
+│   ├── assignment.{h,cpp}      # K-best data association (Munkres LAP)
+│   ├── metrics.{h,cpp}
+│   ├── munkres.{h,cpp}         # linear assignment (header-included)
+│   ├── matrix.{h,cpp}          # matrix utilities (header-included)
+│   ├── datatypes.h
+│   ├── models.h
+│   └── validation.h
 ├── python/
-│   ├── lmb_engine_loader.py
-│   ├── run.py              # simulation harness
-│   └── lmb_engine/Release/ # built extension (after build)
-└── tests/                  # Python validation scripts
+│   ├── lmb_engine_loader.py    # locates & imports compiled extension
+│   ├── run_once.py             # single-run simulation + OSPA plot
+│   ├── run.py                  # Monte Carlo simulation (20 runs)
+│   ├── 2026_ieee_aerospace.py  # paper config (K_BEST=100)
+│   └── lmb_engine/             # built extension output (.so / .pyd)
+│       ├── Release/            # recommended built extension
+│       └── Debug/
+├── tests/
+│   ├── test_two_body_propagator_multistep.py
+│   └── assignments.py
+└── external/                   # optional git submodules (not required for default build)
+    ├── astro/                  # openastro propagation library
+    ├── sgp4/                   # SGP4 propagator
+    └── vcpkg/                  # vendored vcpkg (Windows CI only)
 ```
+
+Build artifacts also land in `build/` (CMake binary dir) and `venv/` (local Python environment); both are gitignored.
 
 ## Troubleshooting
 
@@ -192,9 +256,11 @@ rk4-lmbf/
 Build the project first:
 
 ```bash
-cmake --preset release
-cmake --build --preset release
+./scripts/build.sh                # Linux / macOS
+# .\scripts\build.ps1             # Windows
 ```
+
+Or configure manually with the venv Python (see [Quick start](#quick-start)).
 
 ### `Could NOT find Eigen3`
 
@@ -224,7 +290,7 @@ Ensure you built **Release** (or **Debug** if using that preset). The loader che
 
 ## Continuous Integration
 
-CI runs on every push and pull request to `main` on **Linux**, **macOS**, and **Windows**. Each job:
+CI runs on every push and pull request to `main` on **Linux**, **macOS**, and **Windows** (Python 3.12). Each job:
 
 1. Installs native dependencies (Eigen via apt/brew/vcpkg)
 2. Builds the Release extension with CMake presets
