@@ -74,8 +74,7 @@ double InOrbitSensorModel::calculate_likelihood(const Particle& particle, const 
 double InOrbitSensorModel::calculate_likelihood(const Particle& particle,
                                                 const Measurement& measurement,
                                                 const MeasurementLikelihoodCache& cache) const {
-    validation::require_state_vector(particle.state_vector, "particle.state_vector");
-    validation::require_measurement(measurement);
+    LMB_VALIDATION_ONLY(validation::require_state_vector(particle.state_vector, "particle.state_vector"));
 
     const MeasVector particle_meas = convertParticleToMeasurement(particle, measurement.sensor_state_);
     MeasVector residual = measurement.value_ - particle_meas;

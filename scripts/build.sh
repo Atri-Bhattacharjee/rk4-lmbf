@@ -19,7 +19,7 @@ source "$ROOT/scripts/cmake-venv-args.sh"
 cmake --preset release \
   -DPython_EXECUTABLE="$CMAKE_VENV_PYTHON" \
   -Dpybind11_DIR="$CMAKE_PYBIND11_DIR"
-cmake --build --preset release
+cmake --build --preset release --parallel "$(nproc)"
 
 echo ""
 echo "Build complete. Run the simulation with:"

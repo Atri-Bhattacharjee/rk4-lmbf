@@ -15,6 +15,9 @@ find_package(pybind11 CONFIG REQUIRED)
 
 # --- Project Dependencies ---
 find_package(Eigen3 REQUIRED)
+find_package(OpenMP)
+
+option(LMB_ENGINE_ENABLE_VALIDATION "Keep hot-path validation checks in Release builds" OFF)
 
 # --- Python Module Target ---
 pybind11_add_module(lmb_engine
@@ -32,6 +35,17 @@ target_include_directories(lmb_engine PUBLIC src)
 
 # --- Link Libraries ---
 target_link_libraries(lmb_engine PRIVATE Eigen3::Eigen)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(lmb_engine PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+target_compile_definitions(lmb_engine PRIVATE
+  $<$<CONFIG:Release>:EIGEN_NO_DEBUG>
+  $<$<CONFIG:Release>:EIGEN_DONT_PARALLELIZE>
+  $<$<BOOL:${LMB_ENGINE_ENABLE_VALIDATION}>:LMB_ENGINE_ENABLE_VALIDATION>
+)
+
+set_property(TARGET lmb_engine PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 
 # --- Set Output Directory for Python Package ---
 set_target_properties(lmb_engine PROPERTIES

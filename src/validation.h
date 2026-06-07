@@ -7,6 +7,12 @@
 #include <stdexcept>
 #include <string>
 
+#if defined(LMB_ENGINE_ENABLE_VALIDATION) || !defined(NDEBUG)
+#define LMB_VALIDATION_ONLY(expr) (expr)
+#else
+#define LMB_VALIDATION_ONLY(expr) ((void)0)
+#endif
+
 namespace validation {
 
 constexpr int STATE_DIM = 6;

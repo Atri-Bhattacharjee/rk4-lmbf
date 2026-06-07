@@ -39,12 +39,12 @@ double AdaptiveBirthModel::computeCircularVelocity(double radius) const {
 std::vector<Track> AdaptiveBirthModel::generate_new_tracks(const std::vector<Measurement>& unused_measurements, double current_time) const {
     std::vector<Track> new_tracks;
     
-    std::mt19937 gen(std::random_device{}());
+    static thread_local std::mt19937 gen(std::random_device{}());
     std::normal_distribution<double> std_normal(0.0, 1.0);
     
     for (size_t measurement_idx = 0; measurement_idx < unused_measurements.size(); ++measurement_idx) {
         const auto& measurement = unused_measurements[measurement_idx];
-        validation::require_measurement(measurement);
+        LMB_VALIDATION_ONLY(validation::require_measurement(measurement));
         
         double range = measurement.value_(0);
         double range_rate = measurement.value_(1);

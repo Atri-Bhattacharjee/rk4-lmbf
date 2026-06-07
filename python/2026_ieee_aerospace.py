@@ -36,7 +36,7 @@ P_SURVIVAL = 0.999999999        # Probability of track survival per step
 P_BIRTH = 0.9            # Initial existence probability for new tracks
 CLUTTER_INTENSITY = 1e-15 # False alarm rate per unit measurement volume
 PRUNE_THRESHOLD = 0.001  # Existence probability threshold for track pruning
-K_BEST = 2             # Number of K-best assignment hypotheses
+K_BEST = 100             # Number of K-best assignment hypotheses
 
 # --- Process Noise Annealing ---
 # Exponential decay of process noise as tracks mature

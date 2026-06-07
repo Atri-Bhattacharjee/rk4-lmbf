@@ -6,6 +6,15 @@
 #include <random>
 #include <stdexcept>
 
+namespace {
+
+struct MixedEntry {
+    size_t particle_index;
+    double weight;
+};
+
+}  // namespace
+
 void SMC_LMB_Tracker::ensure_models_configured() const {
     validation::require_models(propagator_, sensor_model_, birth_model_);
 }
@@ -197,40 +206,39 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
     // Step 5: Combine, update and resample
     std::vector<Track> updated_tracks;
     for (size_t i = 0; i < num_tracks; ++i) {
-        std::vector<Particle> mixed_particles;
-        mixed_particles.reserve(hypotheses.size() * tracks[i].particles().size());
+        const auto& predicted_particles = tracks[i].particles();
+        std::vector<MixedEntry> mixed_entries;
+        mixed_entries.reserve(hypotheses.size() * predicted_particles.size());
 
         for (size_t h = 0; h < hypotheses.size(); ++h) {
             int assoc_idx = hypotheses[h].associations[i];
             double hyp_weight = norm_weights[h];
             
             if (assoc_idx >= 0 && static_cast<size_t>(assoc_idx) < num_meas) {
-                const auto& predicted_particles = tracks[i].particles();
                 const auto& norm_weights_for_assoc = association_weights[i][assoc_idx];
                 const double likelihood_ratio = likelihood_matrix(i, assoc_idx);
 
                 for (size_t p = 0; p < predicted_particles.size(); ++p) {
-                    Particle mixed_particle;
-                    mixed_particle.state_vector = predicted_particles[p].state_vector;
-                    mixed_particle.weight = norm_weights_for_assoc[p] * hyp_weight * p_detection_ * likelihood_ratio;
-                    mixed_particles.push_back(mixed_particle);
+                    mixed_entries.push_back({
+                        p,
+                        norm_weights_for_assoc[p] * hyp_weight * p_detection_ * likelihood_ratio
+                    });
                 }
             } else if (assoc_idx == -1 ||
                        (static_cast<size_t>(assoc_idx) >= num_meas &&
                         static_cast<size_t>(assoc_idx) < num_meas + num_tracks)) {
-                const auto& predicted_particles = tracks[i].particles();
-                for (const auto& particle : predicted_particles) {
-                    Particle mixed_particle;
-                    mixed_particle.state_vector = particle.state_vector;
-                    mixed_particle.weight = particle.weight * hyp_weight * (1.0 - p_detection_);
-                    mixed_particles.push_back(mixed_particle);
+                for (size_t p = 0; p < predicted_particles.size(); ++p) {
+                    mixed_entries.push_back({
+                        p,
+                        predicted_particles[p].weight * hyp_weight * (1.0 - p_detection_)
+                    });
                 }
             }
         }
 
         double sum_weights = 0.0;
-        for (const auto& p : mixed_particles) {
-            sum_weights += p.weight;
+        for (const auto& entry : mixed_entries) {
+            sum_weights += entry.weight;
         }
 
         double r_legacy = tracks[i].existence_probability();
@@ -238,23 +246,23 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
 
         if (sum_weights > 1e-12) {
             const double inv_sum = 1.0 / sum_weights;
-            for (auto& p : mixed_particles) {
-                p.weight *= inv_sum;
+            for (auto& entry : mixed_entries) {
+                entry.weight *= inv_sum;
             }
         } else {
-            const double uniform_weight = mixed_particles.empty()
+            const double uniform_weight = mixed_entries.empty()
                 ? 0.0
-                : 1.0 / static_cast<double>(mixed_particles.size());
-            for (auto& p : mixed_particles) {
-                p.weight = uniform_weight;
+                : 1.0 / static_cast<double>(mixed_entries.size());
+            for (auto& entry : mixed_entries) {
+                entry.weight = uniform_weight;
             }
         }
 
-        size_t num_particles = tracks[i].particles().size();
+        size_t num_particles = predicted_particles.size();
         std::vector<Particle> resampled_particles;
         resampled_particles.reserve(num_particles);
 
-        if (mixed_particles.empty() || num_particles == 0) {
+        if (mixed_entries.empty() || num_particles == 0) {
             Track final_track = tracks[i];
             final_track.set_existence_probability(r_new);
             updated_tracks.push_back(final_track);
@@ -268,15 +276,17 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
         for (size_t p = 0; p < num_particles; ++p) {
             double threshold = u + static_cast<double>(p) / static_cast<double>(num_particles);
 
-            while (cumsum < threshold && idx < mixed_particles.size()) {
-                cumsum += mixed_particles[idx].weight;
+            while (cumsum < threshold && idx < mixed_entries.size()) {
+                cumsum += mixed_entries[idx].weight;
                 ++idx;
             }
 
-            const Particle& chosen_particle = (idx > 0) ? mixed_particles[idx - 1] : mixed_particles[0];
+            const size_t chosen_index = (idx > 0)
+                ? mixed_entries[idx - 1].particle_index
+                : mixed_entries[0].particle_index;
 
             Particle resampled;
-            resampled.state_vector = chosen_particle.state_vector;
+            resampled.state_vector = predicted_particles[chosen_index].state_vector;
             resampled.weight = 1.0 / static_cast<double>(num_particles);
             resampled_particles.push_back(resampled);
         }

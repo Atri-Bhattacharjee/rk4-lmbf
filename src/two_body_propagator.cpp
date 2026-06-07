@@ -45,7 +45,7 @@ TwoBodyPropagator::TwoBodyPropagator(const Eigen::MatrixXd& process_noise_covari
 
 Particle TwoBodyPropagator::propagate(const Particle& particle, double dt, double current_time, double noise_scale) const {
     (void)current_time;
-    validation::require_state_vector(particle.state_vector, "particle.state_vector");
+    LMB_VALIDATION_ONLY(validation::require_state_vector(particle.state_vector, "particle.state_vector"));
 
     const StateVector y0 = particle.state_vector;
     // RK4 integration

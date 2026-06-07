@@ -73,7 +73,7 @@ jobs:
           cmake --preset release \
             -DPython_EXECUTABLE="$CMAKE_VENV_PYTHON" \
             -Dpybind11_DIR="$CMAKE_PYBIND11_DIR"
-          cmake --build --preset release
+          cmake --build --preset release --parallel "$(nproc)"
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
@@ -87,7 +87,7 @@ jobs:
           cmake --preset release \
             -DPython_EXECUTABLE="$CMAKE_VENV_PYTHON" \
             -Dpybind11_DIR="$CMAKE_PYBIND11_DIR"
-          cmake --build --preset release
+          cmake --build --preset release --parallel "$(sysctl -n hw.ncpu)"
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
@@ -100,7 +100,7 @@ jobs:
           $cmakeVenvArgs = & .\scripts\cmake-venv-args.ps1
           cmake --preset release @cmakeVenvArgs `
             -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
-          cmake --build --preset release
+          cmake --build --preset release --parallel $env:NUMBER_OF_PROCESSORS
 
       - name: Test (Linux)
         if: runner.os == 'Linux'
