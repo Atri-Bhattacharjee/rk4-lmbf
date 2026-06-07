@@ -48,9 +48,9 @@ public:
     /**
      * @brief Construct a new SMC_LMB_Tracker object
      * 
-     * @param propagator Unique pointer to orbit propagation model
-     * @param sensor_model Unique pointer to sensor model
-     * @param birth_model Unique pointer to birth model
+     * @param propagator Shared pointer to orbit propagation model
+     * @param sensor_model Shared pointer to sensor model
+     * @param birth_model Shared pointer to birth model
      * @param survival_probability Probability of a track surviving a time step
      * @param k_best Number of K-best assignment hypotheses to generate
      * @param prune_threshold Existence probability threshold for track pruning
