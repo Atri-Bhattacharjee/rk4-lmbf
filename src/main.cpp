@@ -181,10 +181,9 @@ PYBIND11_MODULE(lmb_engine, m) {
              pybind11::arg("initial_covariance"),
              "Create adaptive birth model with physics-based tangent fan velocity sampling.\n\n"
              "For each unassociated measurement, generates particles with:\n"
-             "  - Position computed from range/azimuth/elevation\n"
-             "  - Radial velocity fixed from range-rate measurement\n"
-             "  - Tangent velocity sampled uniformly in direction, with magnitude\n"
-             "    computed from circular orbital velocity at target altitude\n"
+             "  - Position = sensor position + range × line-of-sight\n"
+             "  - Relative velocity = range-rate × LOS + circular-speed tangent fan\n"
+             "  - Absolute ECI velocity = sensor velocity + relative velocity\n"
              "  - Gaussian noise from initial_covariance added to all components\n\n"
              "The covariance matrix should have velocity components sized to capture\n"
              "expected eccentricity variation (e.g., 500 m/s std for moderate eccentricity).")

@@ -20,14 +20,14 @@
  * This class implements track birth by generating particles with physically
  * plausible orbital velocities. For each measurement:
  * 
- * - Position is computed from range/azimuth/elevation
- * - Radial velocity is fixed from the range-rate measurement (known)
- * - Tangent velocity magnitude is computed from circular orbital mechanics
- * - Tangent velocity direction is sampled uniformly around the tangent plane
+ * - Position = sensor position + range × line-of-sight
+ * - Relative velocity = range-rate × LOS + circular-speed tangent fan
+ * - Absolute ECI velocity = sensor velocity + relative velocity
  * - Gaussian noise from the birth covariance captures eccentricity variation
  * 
  * This approach ensures particles start with realistic orbital velocities
- * rather than assuming zero cross-range motion.
+ * rather than assuming zero cross-range motion, and remain consistent with
+ * the relative range-rate measurement model when the sensor is moving.
  */
 class AdaptiveBirthModel : public IBirthModel {
 private:
@@ -73,11 +73,12 @@ public:
      * For each unassociated measurement, creates a new track with particles sampled
      * using physics-based velocity initialization:
      * 
-     * 1. Position computed from sensor position + range * line-of-sight
-     * 2. Radial velocity fixed from range-rate measurement
-     * 3. Tangent velocity sampled uniformly in direction [0, 2π)
-     * 4. Tangent velocity magnitude = circular orbital velocity at target altitude
-     * 5. Gaussian noise from birth covariance added to capture eccentricity
+     * 1. Position = sensor position + range × line-of-sight
+     * 2. Relative velocity = range-rate × LOS + circular-speed tangent fan
+     *    (tangent direction sampled uniformly in [0, 2π); magnitude = circular
+     *    orbital velocity at target altitude)
+     * 3. Absolute ECI velocity = sensor velocity + relative velocity
+     * 4. Gaussian noise from birth covariance added to capture eccentricity
      * 
      * @param unused_measurements Vector of measurements not associated with existing tracks
      * @param current_time The current simulation time for track initialization

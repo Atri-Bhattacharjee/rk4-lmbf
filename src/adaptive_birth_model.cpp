@@ -52,6 +52,7 @@ std::vector<Track> AdaptiveBirthModel::generate_new_tracks(const std::vector<Mea
         double elevation = measurement.value_(3);
         
         Eigen::Vector3d sensor_pos = measurement.sensor_state_.head<3>();
+        Eigen::Vector3d sensor_vel = measurement.sensor_state_.tail<3>();
         
         Eigen::Vector3d u_radial;
         u_radial << std::cos(elevation) * std::cos(azimuth),
@@ -61,7 +62,8 @@ std::vector<Track> AdaptiveBirthModel::generate_new_tracks(const std::vector<Mea
         Eigen::Vector3d base_position = sensor_pos + range * u_radial;
         double target_radius = base_position.norm();
         double v_circular = computeCircularVelocity(target_radius);
-        Eigen::Vector3d v_radial = range_rate * u_radial;
+        // Relative radial velocity from measured range-rate (not absolute ECI)
+        Eigen::Vector3d v_rel_radial = range_rate * u_radial;
         
         Eigen::Vector3d u_tangent1, u_tangent2;
         
@@ -91,7 +93,8 @@ std::vector<Track> AdaptiveBirthModel::generate_new_tracks(const std::vector<Mea
             
             StateVector base_state;
             base_state.head<3>() = base_position;
-            base_state.tail<3>() = v_radial + v_tangent;
+            // Absolute ECI velocity = sensor velocity + relative (radial + tangent fan)
+            base_state.tail<3>() = sensor_vel + v_rel_radial + v_tangent;
             
             StateVector noise;
             for (int i = 0; i < 6; ++i) {
