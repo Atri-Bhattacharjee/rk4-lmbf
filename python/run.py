@@ -78,8 +78,8 @@ Q_BIRTH = np.diag([
 ])
 
 # --- Sensor Configuration ---
-# Sensor at Earth's center (for mathematical testing)
-SENSOR_STATE = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+# Sensor in a simple circular orbit around earth
+SENSOR_STATE = np.array([ORBIT_RADIUS, 0.0, 0.0, 0.0, V_CIRCULAR, 0.0]) # [x, y, z, vx, vy, vz] in meters and m/s
 
 # =============================================================================
 # SCENARIO DEFINITION
@@ -357,6 +357,9 @@ def run_single_simulation(verbose=False):
     # Active ground truth objects: list of (object_id, state_vector)
     active_ground_truths = []
     
+    # Observing satellite ECI state (propagated each timestep)
+    sensor_state = SENSOR_STATE.copy()
+    
     # Results storage
     ospa_results = []
     track_error_history = []  # 6D error vectors for Object 1 (for Figure 3)
@@ -380,6 +383,7 @@ def run_single_simulation(verbose=False):
                 obj_id, state = active_ground_truths[i]
                 new_state = propagate_truth_state(truth_propagator, state, DT)
                 active_ground_truths[i] = (obj_id, new_state)
+            sensor_state = propagate_truth_state(truth_propagator, sensor_state, DT)
         
         # ---------------------------------------------------------------------
         # B. BIRTH CHECK (add new objects at their t=current_time position)
@@ -395,7 +399,7 @@ def run_single_simulation(verbose=False):
         # ---------------------------------------------------------------------
         measurements = generate_measurements(
             active_ground_truths, 
-            SENSOR_STATE, 
+            sensor_state, 
             current_time
         )
         
