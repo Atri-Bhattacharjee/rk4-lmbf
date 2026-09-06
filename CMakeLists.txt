@@ -39,6 +39,10 @@ if(OpenMP_CXX_FOUND)
   target_link_libraries(lmb_engine PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(lmb_engine PRIVATE -Wall -Wextra)
+endif()
+
 target_compile_definitions(lmb_engine PRIVATE
   $<$<CONFIG:Release>:EIGEN_NO_DEBUG>
   $<$<CONFIG:Release>:EIGEN_DONT_PARALLELIZE>

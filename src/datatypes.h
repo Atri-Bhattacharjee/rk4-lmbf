@@ -17,16 +17,20 @@
 #include <Eigen/Dense>
 #include <iostream>
 
+#include "los_geometry.h"
+
 using StateVector = Eigen::Matrix<double, 6, 1>;
-using MeasVector = Eigen::Matrix<double, 4, 1>;
-using MeasCovariance = Eigen::Matrix<double, 4, 4>;
+//! Local tangent-frame measurement perturbation/residual [d_range, d_range_rate, d_theta1, d_theta2, d_omega1, d_omega2]
+using LocalMeasVector = Eigen::Matrix<double, 6, 1>;
+//! 6x6 covariance in the local tangent frame of the measured direction (same ordering as LocalMeasVector)
+using MeasCovariance = Eigen::Matrix<double, 6, 6>;
 using ProcessNoiseCov = Eigen::Matrix<double, 6, 6>;
 
 struct MeasurementLikelihoodCache {
     MeasCovariance cov_inv;
     double log_norm_factor = 0.0;
     bool is_diagonal = false;
-    MeasVector inv_var;
+    LocalMeasVector inv_var;
 };
 
 /**
@@ -113,103 +117,100 @@ public:
 };
 
 /**
- * @brief A POD structure for a single sensor detection
- * 
- * Contains all information about a measurement from a sensor,
- * including the measurement values, uncertainty, and source.
+ * @brief A single sensor detection of an object: range, range rate, line-of-sight direction and
+ *        line-of-sight angular rate, with a 6x6 noise covariance.
+ *
+ * Representation (see los_geometry.h):
+ *   range_      rho     [m]      |r_target - r_sensor|
+ *   range_rate_ rhodot  [m/s]    u . (v_target - v_sensor)
+ *   los_        u       [unit]   ECI unit vector from the sensor to the object
+ *   los_rate_   udot    [rad/s]  time derivative of u (always orthogonal to u)
+ *
+ * Covariance frame convention: covariance_ is expressed in the local tangent frame at los_,
+ * with the deterministic basis (e1, e2) = los::tangentBasis(los_), and ordered as
+ *   [ d_range (m), d_range_rate (m/s), d_theta1 (rad), d_theta2 (rad), d_omega1 (rad/s), d_omega2 (rad/s) ]
+ * where d_theta = e_k . log_u(u') is the angular offset of a direction u' and d_omega = e_k . (udot' - udot)
+ * is the angular-rate offset (after parallel transport into the tangent plane at los_). Residuals
+ * produced by los::localResidual and perturbations consumed by perturbed() use the same frame and
+ * ordering. The representation has no azimuth/elevation singularity anywhere on the sphere.
  */
 struct Measurement {
-    double timestamp_;                    //!< The epoch timestamp of the measurement
-    MeasVector value_;              //!< The 4D measurement vector [range, range_rate, azimuth, elevation]
-    MeasCovariance covariance_;         //!< The 4x4 measurement noise covariance matrix
-    std::string sensor_id_;              //!< Identifier for the sensor that produced the measurement
-    StateVector sensor_state_;       //!< The 6D ECI state of the sensor satellite [x, y, z, vx, vy, vz]
+    double timestamp_ = 0.0;                                     //!< Epoch timestamp of the measurement [s]
+    double range_ = 0.0;                                         //!< Range [m]
+    double range_rate_ = 0.0;                                    //!< Range rate [m/s]
+    Eigen::Vector3d los_ = Eigen::Vector3d::UnitX();             //!< Unit line-of-sight direction (ECI)
+    Eigen::Vector3d los_rate_ = Eigen::Vector3d::Zero();         //!< Line-of-sight angular rate [rad/s] (ECI, orthogonal to los_)
+    MeasCovariance covariance_ = MeasCovariance::Zero();         //!< 6x6 noise covariance in the local tangent frame at los_
+    std::string sensor_id_;                                      //!< Identifier for the sensor that produced the measurement
+    StateVector sensor_state_ = StateVector::Zero();             //!< 6D ECI state of the sensor [x, y, z, vx, vy, vz]
 
-    Measurement()
-        : timestamp_(0.0), value_(MeasVector::Zero()), covariance_(MeasCovariance::Zero()), sensor_id_(), sensor_state_(StateVector::Zero()) {}
-        
+    Measurement() = default;
+
+    //! The geometric part of the measurement as a LosObservation.
+    los::LosObservation observation() const {
+        los::LosObservation obs;
+        obs.range = range_;
+        obs.range_rate = range_rate_;
+        obs.los = los_;
+        obs.los_rate = los_rate_;
+        return obs;
+    }
+
+    //! Overwrite the geometric part from a LosObservation (covariance, sensor and timestamp unchanged).
+    void setObservation(const los::LosObservation& obs) {
+        range_ = obs.range;
+        range_rate_ = obs.range_rate;
+        los_ = obs.los;
+        los_rate_ = obs.los_rate;
+    }
+
     /**
-     * @brief Convert Cartesian state to measurement space
-     * 
-     * Converts a 6D Cartesian state [x, y, z, vx, vy, vz] to a 4D measurement space
-     * [range, range_rate, azimuth, elevation] relative to the sensor state.
-     * 
-     * @param cartesian_state 6D Cartesian state vector [x, y, z, vx, vy, vz]
-     * @param sensor_state 6D Cartesian state vector of sensor [x, y, z, vx, vy, vz]
-     * @return MeasVector 4D measurement vector [range, range_rate, azimuth, elevation]
+     * @brief Noise-free measurement of a 6D ECI target state as seen from a 6D ECI sensor state.
+     *
+     * covariance_ is left at zero and sensor_id_ empty; sensor_state_ is stored.
      */
-    static MeasVector cartesianToMeasurement(const StateVector& cartesian_state, const StateVector& sensor_state) {
-        constexpr double range_epsilon = 1e-10;
-
-        // Relative position and velocity
-        Eigen::Vector3d rel_pos = cartesian_state.head(3) - sensor_state.head(3);
-        Eigen::Vector3d rel_vel = cartesian_state.tail(3) - sensor_state.tail(3);
-        
-        // Calculate range
-        double range = rel_pos.norm();
-        
-        // Calculate range rate (dot product of unit vector and relative velocity)
-        double range_rate = 0.0;
-        if (range > range_epsilon) {
-            Eigen::Vector3d unit_vector = rel_pos / range;
-            range_rate = rel_vel.dot(unit_vector);
-        }
-        
-        // Calculate azimuth and elevation
-        double azimuth = std::atan2(rel_pos(1), rel_pos(0));
-        double elevation = 0.0;
-        if (range > range_epsilon) {
-            const double sin_elevation = std::clamp(rel_pos(2) / range, -1.0, 1.0);
-            elevation = std::asin(sin_elevation);
-        }
-        
-        MeasVector measurement;
-        measurement << range, range_rate, azimuth, elevation;
-        
+    static Measurement fromCartesian(const StateVector& target_state, const StateVector& sensor_state) {
+        Measurement measurement;
+        measurement.setObservation(los::observe(target_state, sensor_state));
+        measurement.sensor_state_ = sensor_state;
         return measurement;
     }
-    
+
     /**
-     * @brief Convert measurement space to Cartesian state
-     * 
-     * Converts a 4D measurement [range, range_rate, azimuth, elevation] to a 6D Cartesian state
-     * [x, y, z, vx, vy, vz] relative to the sensor state.
-     * 
-     * @param measurement 4D measurement vector [range, range_rate, azimuth, elevation]
-     * @param sensor_state 6D Cartesian state vector of sensor [x, y, z, vx, vy, vz]
-     * @return StateVector 6D Cartesian state vector [x, y, z, vx, vy, vz]
+     * @brief Measurement from ECI-axis spherical angles and their rates (display/interop convention).
+     *
+     * Angles are relative to the ECI axes: azimuth = atan2(u_y, u_x), elevation = asin(u_z).
+     * This convention is singular on the ECI z-axis and is offered for interoperability only.
      */
-    static StateVector measurementToCartesian(const MeasVector& measurement, const StateVector& sensor_state) {
-        double range = measurement(0);
-        double range_rate = measurement(1);
-        double azimuth = measurement(2);
-        double elevation = measurement(3);
-        
-        // Convert from spherical to Cartesian coordinates
-        double cos_el = std::cos(elevation);
-        Eigen::Vector3d rel_pos;
-        rel_pos << range * cos_el * std::cos(azimuth),
-                   range * cos_el * std::sin(azimuth),
-                   range * std::sin(elevation);
-                   
-        // Convert range_rate to Cartesian velocity (simplified model)
-        // This is a simplification - we only have the radial component
-        // A more accurate model would need additional info or assumptions
-        constexpr double range_epsilon = 1e-10;
-        Eigen::Vector3d unit_vector;
-        if (range > range_epsilon) {
-            unit_vector = rel_pos.normalized();
-        } else {
-            unit_vector = Eigen::Vector3d::UnitX();
-        }
-        Eigen::Vector3d rel_vel = unit_vector * range_rate;
-        
-        // Convert to absolute coordinates
-        StateVector cartesian_state;
-        cartesian_state.head(3) = rel_pos + sensor_state.head(3);
-        cartesian_state.tail(3) = rel_vel + sensor_state.tail(3);
-        
-        return cartesian_state;
+    static Measurement fromAnglesAndRates(double range, double range_rate,
+                                          double azimuth, double elevation,
+                                          double azimuth_rate, double elevation_rate,
+                                          const StateVector& sensor_state) {
+        Measurement measurement;
+        measurement.setObservation(los::fromAnglesAndRates(range, range_rate, azimuth, elevation,
+                                                           azimuth_rate, elevation_rate));
+        measurement.sensor_state_ = sensor_state;
+        return measurement;
+    }
+
+    //! Exact 6D ECI state implied by the measurement: r = r_s + rho u, v = v_s + rhodot u + rho udot.
+    StateVector toCartesian() const {
+        return los::toCartesian(observation(), sensor_state_);
+    }
+
+    /**
+     * @brief Copy of this measurement with a local tangent-frame perturbation applied to its geometry.
+     * @param eps [d_range, d_range_rate, d_theta1, d_theta2, d_omega1, d_omega2] in the frame at los_.
+     */
+    Measurement perturbed(const LocalMeasVector& eps) const {
+        Measurement result = *this;
+        result.setObservation(los::perturbed(observation(), eps));
+        return result;
+    }
+
+    //! Derived ECI-axis [azimuth, elevation, azimuth_rate, elevation_rate] (display/interop only).
+    Eigen::Vector4d angularCoordinates() const {
+        return los::angularCoordinates(observation());
     }
 };
 

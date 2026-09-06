@@ -1,115 +1,77 @@
 #include "adaptive_birth_model.h"
+#include "los_geometry.h"
 #include "validation.h"
 #include <random>
 #include <vector>
-#include <stdexcept>
 
-// Define _USE_MATH_DEFINES before cmath to get M_PI on MSVC
-#define _USE_MATH_DEFINES
-#include <cmath>
+namespace {
 
-// Fallback definition if M_PI is still not defined
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+constexpr int kMaxRangeRedraws = 100;
 
-AdaptiveBirthModel::AdaptiveBirthModel(int particles_per_track, 
-                                     double initial_existence_probability, 
-                                     const Eigen::MatrixXd& initial_covariance)
+}  // namespace
+
+AdaptiveBirthModel::AdaptiveBirthModel(int particles_per_track,
+                                       double initial_existence_probability,
+                                       const Eigen::MatrixXd& birth_covariance_local,
+                                       std::optional<uint64_t> seed)
     : particles_per_track_(particles_per_track),
       initial_existence_probability_(initial_existence_probability),
-      initial_covariance_(initial_covariance) {
+      birth_covariance_local_(MeasCovariance::Zero()),
+      birth_noise_L_(MeasCovariance::Zero()),
+      rng_(seed.has_value() ? *seed : std::mt19937_64::result_type(std::random_device{}())) {
     validation::require_particles_per_track(particles_per_track_);
-    validation::require_positive_definite(initial_covariance_, "initial_covariance");
-
-    Eigen::LLT<ProcessNoiseCov> llt(initial_covariance_);
-    if (llt.info() != Eigen::Success) {
-        throw std::runtime_error("AdaptiveBirthModel: initial_covariance is not positive definite");
-    }
+    validation::require_covariance_6x6_positive_definite(birth_covariance_local,
+                                                         "birth_covariance (local tangent frame)");
+    birth_covariance_local_ = birth_covariance_local;
+    Eigen::LLT<MeasCovariance> llt(birth_covariance_local_);
     birth_noise_L_ = llt.matrixL();
 }
 
-double AdaptiveBirthModel::computeCircularVelocity(double radius) const {
-    // Clamp radius to minimum safe altitude (100km above Earth surface)
-    // to avoid numerical issues for invalid measurements
-    double safe_radius = std::max(radius, R_EARTH + 100.0e3);
-    return std::sqrt(MU_EARTH / safe_radius);
-}
-
-std::vector<Track> AdaptiveBirthModel::generate_new_tracks(const std::vector<Measurement>& unused_measurements, double current_time) const {
+std::vector<Track> AdaptiveBirthModel::generate_new_tracks(const std::vector<Measurement>& unused_measurements,
+                                                           double current_time) const {
     std::vector<Track> new_tracks;
-    
-    static thread_local std::mt19937 gen(std::random_device{}());
+    new_tracks.reserve(unused_measurements.size());
     std::normal_distribution<double> std_normal(0.0, 1.0);
-    
+    const double weight = 1.0 / static_cast<double>(particles_per_track_);
+
     for (size_t measurement_idx = 0; measurement_idx < unused_measurements.size(); ++measurement_idx) {
-        const auto& measurement = unused_measurements[measurement_idx];
+        const Measurement& measurement = unused_measurements[measurement_idx];
         LMB_VALIDATION_ONLY(validation::require_measurement(measurement));
-        
-        double range = measurement.value_(0);
-        double range_rate = measurement.value_(1);
-        double azimuth = measurement.value_(2);
-        double elevation = measurement.value_(3);
-        
-        Eigen::Vector3d sensor_pos = measurement.sensor_state_.head<3>();
-        Eigen::Vector3d sensor_vel = measurement.sensor_state_.tail<3>();
-        
-        Eigen::Vector3d u_radial;
-        u_radial << std::cos(elevation) * std::cos(azimuth),
-                    std::cos(elevation) * std::sin(azimuth),
-                    std::sin(elevation);
-        
-        Eigen::Vector3d base_position = sensor_pos + range * u_radial;
-        double target_radius = base_position.norm();
-        double v_circular = computeCircularVelocity(target_radius);
-        // Relative radial velocity from measured range-rate (not absolute ECI)
-        Eigen::Vector3d v_rel_radial = range_rate * u_radial;
-        
-        Eigen::Vector3d u_tangent1, u_tangent2;
-        
-        if (std::abs(std::cos(elevation)) < 1e-9) {
-            u_tangent1 << 1.0, 0.0, 0.0;
-            u_tangent2 << 0.0, 1.0, 0.0;
-        } else {
-            u_tangent1 << -std::sin(azimuth),
-                           std::cos(azimuth),
-                           0.0;
-            u_tangent2 = u_radial.cross(u_tangent1);
-            u_tangent2.normalize();
-        }
-        
+
+        const los::LosObservation observed = measurement.observation();
+
         TrackLabel label;
         label.birth_time = static_cast<uint64_t>(current_time);
         label.index = static_cast<uint32_t>(measurement_idx);
-        
+
         std::vector<Particle> particles;
         particles.reserve(particles_per_track_);
-        
+
         for (int particle_idx = 0; particle_idx < particles_per_track_; ++particle_idx) {
-            double theta = (2.0 * M_PI * particle_idx) / particles_per_track_;
-            
-            Eigen::Vector3d v_tangent = v_circular * 
-                (std::cos(theta) * u_tangent1 + std::sin(theta) * u_tangent2);
-            
-            StateVector base_state;
-            base_state.head<3>() = base_position;
-            // Absolute ECI velocity = sensor velocity + relative (radial + tangent fan)
-            base_state.tail<3>() = sensor_vel + v_rel_radial + v_tangent;
-            
-            StateVector noise;
-            for (int i = 0; i < 6; ++i) {
-                noise(i) = std_normal(gen);
+            los::LosObservation sample;
+            for (int attempt = 0; attempt <= kMaxRangeRedraws; ++attempt) {
+                LocalMeasVector xi;
+                for (int i = 0; i < 6; ++i) {
+                    xi(i) = std_normal(rng_);
+                }
+                const LocalMeasVector eps = birth_noise_L_ * xi;
+                sample = los::perturbed(observed, eps);
+                if (sample.range > validation::RANGE_EPSILON) {
+                    break;
+                }
             }
-            
+            if (sample.range <= validation::RANGE_EPSILON) {
+                sample.range = validation::RANGE_EPSILON;
+            }
+
             Particle particle;
-            particle.state_vector = base_state + birth_noise_L_ * noise;
-            particle.weight = 1.0 / static_cast<double>(particles_per_track_);
+            particle.state_vector = los::toCartesian(sample, measurement.sensor_state_);
+            particle.weight = weight;
             particles.push_back(particle);
         }
-        
-        Track track(label, initial_existence_probability_, particles);
-        new_tracks.push_back(track);
+
+        new_tracks.emplace_back(label, initial_existence_probability_, particles);
     }
-    
+
     return new_tracks;
 }

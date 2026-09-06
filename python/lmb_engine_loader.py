@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.machinery
+import os
 import sys
 from pathlib import Path
 
@@ -33,7 +34,12 @@ def _has_extension_module(directory: Path) -> bool:
 
 
 def find_extension_dir(*, prefer: str = "Release") -> Path:
-    """Return the directory containing a built lmb_engine extension."""
+    """Return the directory containing a built lmb_engine extension.
+
+    The LMB_ENGINE_BUILD environment variable ("Release" or "Debug") overrides `prefer`
+    so a test suite can be pointed at a specific build configuration.
+    """
+    prefer = os.environ.get("LMB_ENGINE_BUILD", prefer)
     search_order = (prefer,) + tuple(build_dir for build_dir in _BUILD_DIRS if build_dir != prefer)
 
     for root in _module_search_roots():

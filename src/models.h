@@ -64,7 +64,8 @@ public:
      * This is a core component of the particle filter update step.
      * 
      * @param particle The particle representing a possible object state
-     * @param measurement The sensor measurement [azimuth, elevation, range] with covariance
+     * @param measurement The sensor measurement (range, range rate, line-of-sight direction and
+     *        angular rate) with its 6x6 local tangent-frame covariance; see Measurement
      * @return double The likelihood value (probability density)
      */
     virtual double calculate_likelihood(const Particle& particle, const Measurement& measurement) const = 0;

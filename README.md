@@ -172,6 +172,50 @@ Optional verbose import logging (works with any simulation script):
 LMB_ENGINE_VERBOSE=1 python python/run_once.py
 ```
 
+Both Monte Carlo scripts honour `LMB_NUM_RUNS` (e.g. `LMB_NUM_RUNS=1 python python/run.py` for a quick smoke run).
+
+## Measurement model
+
+A measurement is a line-of-sight observation, not an azimuth/elevation tuple:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `range_` | float | Sensor-to-object distance (m), > 0 |
+| `range_rate_` | float | Radial relative speed (m/s) |
+| `los_` | 3-vector | Unit line-of-sight direction in ECI |
+| `los_rate_` | 3-vector | Line-of-sight angular rate (rad/s), orthogonal to `los_` |
+| `covariance_` | 6x6 | Noise covariance in the **local tangent frame** of `los_` |
+| `sensor_state_` | 6-vector | Sensor ECI state `[x, y, z, vx, vy, vz]` |
+
+The exact conversion is `r = r_s + range * los`, `v = v_s + range_rate * los + range * los_rate`
+(`Measurement.fromCartesian` / `Measurement.toCartesian`), which is smooth everywhere on the sphere: there is
+no azimuth/elevation singularity, no angle wrapping and no `cos(el)` division anywhere in the filter.
+
+`covariance_` is authoritative for the likelihood. It is expressed in the deterministic tangent basis
+`(e1, e2) = tangent_basis(los_)` and ordered as
+
+```
+[d_range (m), d_range_rate (m/s), d_theta1 (rad), d_theta2 (rad), d_omega1 (rad/s), d_omega2 (rad/s)]
+```
+
+with variances in `[m^2, (m/s)^2, rad^2, rad^2, (rad/s)^2, (rad/s)^2]`. The same frame is used by every
+producer and consumer:
+
+- **Simulation** applies noise with `Measurement.perturbed(eps)` (sphere exponential map for the direction,
+  parallel transport for the rate), so an angular sigma of `1e-6 rad` is exactly that at every direction.
+- **Likelihood** (`InOrbitSensorModel`) forms the 6-D residual with `local_residual` (log map + parallel
+  transport) and evaluates a Gaussian with `covariance_`; the six constructor variances only define
+  `defaultCovariance()`.
+- **Birth** (`AdaptiveBirthModel`) samples `eps ~ N(0, birth_covariance_local)` in this frame and maps
+  each sample exactly to ECI, so new-track particles spread in range, angle and rate, never in ECI x/y/z.
+  The constructor takes an optional `seed` for reproducible particle streams.
+
+`Measurement.angularCoordinates()` / `Measurement.fromAnglesAndRates(...)` derive ECI-axis azimuth/elevation
+(and rates) for display or interoperability only; they are singular on the z-axis and are not used by the filter.
+
+The angular-rate sigmas in the simulation scripts (`TRUTH_SIGMA_ANGLE_RATE`, `FILTER_SIGMA_ANGLE_RATE`) are
+placeholders pending sensor characterisation.
+
 ### Tests
 
 Build the extension first, then:
@@ -188,7 +232,15 @@ Or run individual scripts:
 source venv/bin/activate
 python tests/test_two_body_propagator_multistep.py
 python tests/assignments.py
+python tests/test_los_geometry.py          # sphere geometry primitives vs independent references
+python tests/test_validation_dimensions.py # input validation and error messages
+python tests/test_sensor_likelihood.py     # likelihood vs NumPy reference, rotation invariance, chi-square
+python tests/test_adaptive_birth_model.py  # birth covariance recovery and spread statistics
+python tests/test_bindings_api.py          # Python API surface
+python tests/test_end_to_end.py            # short tracker runs, incl. a pole-aligned scene
 ```
+
+`LMB_ENGINE_BUILD=Debug` (or `Release`) forces the loader to pick a specific build directory.
 
 ### Smoke import
 
@@ -220,6 +272,7 @@ rk4-lmbf/
 ├── src/                        # C++ SMC-LMB filter engine
 │   ├── main.cpp                # pybind11 module bindings
 │   ├── smc_lmb_tracker.{h,cpp} # core LMB filter
+│   ├── los_geometry.h          # tangent basis, exp/log maps, transport, observe/toCartesian
 │   ├── adaptive_birth_model.{h,cpp}
 │   ├── in_orbit_sensor_model.{h,cpp}
 │   ├── two_body_propagator.{h,cpp}
@@ -240,7 +293,14 @@ rk4-lmbf/
 │       └── Debug/
 ├── tests/
 │   ├── test_two_body_propagator_multistep.py
-│   └── assignments.py
+│   ├── assignments.py
+│   ├── reference_geometry.py   # independent long-double/NumPy references used by the tests
+│   ├── test_los_geometry.py
+│   ├── test_validation_dimensions.py
+│   ├── test_sensor_likelihood.py
+│   ├── test_adaptive_birth_model.py
+│   ├── test_bindings_api.py
+│   └── test_end_to_end.py
 └── external/                   # optional git submodules (not required for default build)
     ├── astro/                  # openastro propagation library
     ├── sgp4/                   # SGP4 propagator
@@ -294,7 +354,7 @@ CI runs on every push and pull request to `main` on **Linux**, **macOS**, and **
 
 1. Installs native dependencies (Eigen via apt/brew/vcpkg)
 2. Builds the Release extension with CMake presets
-3. Runs `./scripts/ci-test.sh` (smoke import, propagator test, assignment tests)
+3. Runs `./scripts/ci-test.sh` (smoke import, propagator, assignment, geometry, validation, likelihood, birth, API and end-to-end tests)
 
 The full Monte Carlo simulation (`python/run.py`) is intentionally excluded from CI because it is too slow for routine checks.
 
