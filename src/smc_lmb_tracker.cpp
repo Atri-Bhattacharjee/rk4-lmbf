@@ -28,7 +28,8 @@ SMC_LMB_Tracker::SMC_LMB_Tracker(std::shared_ptr<IOrbitPropagator> propagator,
                                                                  double clutter_intensity,
                                                                  double p_detection,
                                                                  double noise_decay_rate,
-                                                                 double noise_min_scale)
+                                                                 double noise_min_scale,
+                                                                 std::optional<uint64_t> seed)
         : current_state_(0.0, std::vector<Track>{}),
             propagator_(std::move(propagator)),
             sensor_model_(std::move(sensor_model)),
@@ -39,7 +40,8 @@ SMC_LMB_Tracker::SMC_LMB_Tracker(std::shared_ptr<IOrbitPropagator> propagator,
             clutter_intensity_(clutter_intensity),
             p_detection_(p_detection),
             noise_decay_rate_(noise_decay_rate),
-            noise_min_scale_(noise_min_scale) {
+            noise_min_scale_(noise_min_scale),
+            resample_rng_(seed.has_value() ? *seed : std::mt19937_64::result_type(std::random_device{}())) {
     validation::require_models(propagator_, sensor_model_, birth_model_);
     validation::require_k_best(k_best_);
     validation::require_clutter_intensity(clutter_intensity_);
@@ -200,7 +202,6 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
     }
     for (double lw : log_weights) norm_weights.push_back(std::exp(lw - max_logw) / sum_exp);
     
-    static thread_local std::mt19937 resample_gen(std::random_device{}());
     std::uniform_real_distribution<double> unit_dist(0.0, 1.0);
 
     // Step 5: Combine, update and resample
@@ -269,7 +270,7 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
             continue;
         }
 
-        const double u = unit_dist(resample_gen) / static_cast<double>(num_particles);
+        const double u = unit_dist(resample_rng_) / static_cast<double>(num_particles);
         double cumsum = 0.0;
         size_t idx = 0;
 

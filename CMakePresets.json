@@ -32,9 +32,26 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug"
       }
+    },
+    {
+      "name": "asan",
+      "displayName": "Asan+Ubsan",
+      "description": "Instrumented build for scripts/asan-test.sh; outputs to python/lmb_engine/Asan",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-asan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "LMB_ENGINE_SANITIZE": "ON"
+      }
     }
   ],
   "buildPresets": [
+    {
+      "name": "asan",
+      "displayName": "Asan+Ubsan",
+      "configurePreset": "asan",
+      "configuration": "RelWithDebInfo"
+    },
     {
       "name": "release",
       "displayName": "Release",

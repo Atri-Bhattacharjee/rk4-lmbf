@@ -101,9 +101,10 @@ std::vector<Track> generate_new_tracks_validated(const AdaptiveBirthModel& birth
     return birth_model.generate_new_tracks(unused_measurements, current_time);
 }
 
-std::shared_ptr<TwoBodyPropagator> make_two_body_propagator(const Eigen::MatrixXd& process_noise_covariance) {
+std::shared_ptr<TwoBodyPropagator> make_two_body_propagator(const Eigen::MatrixXd& process_noise_covariance,
+                                                            std::optional<uint64_t> seed) {
     validation::require_covariance_6x6(process_noise_covariance, "process_noise_covariance");
-    return std::make_shared<TwoBodyPropagator>(process_noise_covariance);
+    return std::make_shared<TwoBodyPropagator>(process_noise_covariance, seed);
 }
 
 Particle propagate_validated(const TwoBodyPropagator& propagator,
@@ -140,7 +141,8 @@ std::shared_ptr<SMC_LMB_Tracker> make_smc_lmb_tracker(
     double clutter_intensity,
     double p_detection,
     double noise_decay_rate,
-    double noise_min_scale) {
+    double noise_min_scale,
+    std::optional<uint64_t> seed) {
     return std::make_shared<SMC_LMB_Tracker>(
         std::move(propagator),
         std::move(sensor_model),
@@ -151,7 +153,8 @@ std::shared_ptr<SMC_LMB_Tracker> make_smc_lmb_tracker(
         clutter_intensity,
         p_detection,
         noise_decay_rate,
-        noise_min_scale);
+        noise_min_scale,
+        seed);
 }
 
 std::vector<Track> get_tracks_copy(const SMC_LMB_Tracker& tracker) {
@@ -324,7 +327,11 @@ PYBIND11_MODULE(lmb_engine, m) {
              "The 6x6 birth covariance in the local tangent frame");
 
     pybind11::class_<TwoBodyPropagator, IOrbitPropagator, std::shared_ptr<TwoBodyPropagator>>(m, "TwoBodyPropagator")
-        .def(pybind11::init(&make_two_body_propagator), pybind11::arg("process_noise_covariance"))
+        .def(pybind11::init(&make_two_body_propagator),
+             pybind11::arg("process_noise_covariance"),
+             pybind11::arg("seed") = pybind11::none(),
+             "RK4 two-body propagator with optional additive Gaussian process noise.\n\n"
+             "seed: optional integer for a reproducible noise stream (default: std::random_device).")
         .def("propagate", &propagate_validated,
              pybind11::arg("particle"),
              pybind11::arg("dt"),
@@ -368,7 +375,9 @@ PYBIND11_MODULE(lmb_engine, m) {
              pybind11::arg("p_detection") = 0.99,
              pybind11::arg("noise_decay_rate") = 0.0,
              pybind11::arg("noise_min_scale") = 1.0,
-             "Constructor for SMC_LMB_Tracker with model dependencies")
+             pybind11::arg("seed") = pybind11::none(),
+             "Constructor for SMC_LMB_Tracker with model dependencies.\n\n"
+             "seed: optional integer for a reproducible resampler stream (default: std::random_device).")
         .def("predict", &SMC_LMB_Tracker::predict, "Runs the predict step for a given time delta")
         .def("update", &SMC_LMB_Tracker::update, "Runs the update step with measurements")
         .def("get_tracks", &get_tracks_copy, "Gets the current list of tracks")

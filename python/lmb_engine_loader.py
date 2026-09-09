@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-_BUILD_DIRS = ("Release", "Debug")
+_BUILD_DIRS = ("Release", "Debug", "Asan")
 _MODULE_NAME = "lmb_engine"
 
 
@@ -36,8 +36,8 @@ def _has_extension_module(directory: Path) -> bool:
 def find_extension_dir(*, prefer: str = "Release") -> Path:
     """Return the directory containing a built lmb_engine extension.
 
-    The LMB_ENGINE_BUILD environment variable ("Release" or "Debug") overrides `prefer`
-    so a test suite can be pointed at a specific build configuration.
+    The LMB_ENGINE_BUILD environment variable ("Release", "Debug" or "Asan") overrides
+    `prefer` so a test suite can be pointed at a specific build configuration.
     """
     prefer = os.environ.get("LMB_ENGINE_BUILD", prefer)
     search_order = (prefer,) + tuple(build_dir for build_dir in _BUILD_DIRS if build_dir != prefer)

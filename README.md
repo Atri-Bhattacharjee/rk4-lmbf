@@ -98,6 +98,7 @@ brew install cmake eigen
 |--------|----------|
 | `release` | Normal use (default) |
 | `debug` | Debugging with symbols |
+| `asan` | AddressSanitizer + UndefinedBehaviorSanitizer; drive it via `./scripts/asan-test.sh` |
 
 ```bash
 source ./scripts/cmake-venv-args.sh   # Windows: see scripts/cmake-venv-args.ps1
@@ -116,12 +117,14 @@ Built extensions are written to:
 
 - `python/lmb_engine/Release/` — recommended
 - `python/lmb_engine/Debug/`
+- `python/lmb_engine/Asan/` — sanitizer build, kept separate so it never shadows the others
 
-Optional CMake flag:
+Optional CMake flags:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LMB_ENGINE_ENABLE_VALIDATION` | `OFF` | Keep hot-path validation checks in Release builds |
+| `LMB_ENGINE_SANITIZE` | `OFF` | Instrument with ASan + UBSan. Only the extension is instrumented, so the ASan runtime must be `LD_PRELOAD`ed at run time; use `./scripts/asan-test.sh`, which handles that. |
 
 ### Manual CMake (without presets)
 
@@ -237,10 +240,36 @@ python tests/test_validation_dimensions.py # input validation and error messages
 python tests/test_sensor_likelihood.py     # likelihood vs NumPy reference, rotation invariance, chi-square
 python tests/test_adaptive_birth_model.py  # birth covariance recovery and spread statistics
 python tests/test_bindings_api.py          # Python API surface
+python tests/statistics_helpers.py         # self-test of the Welch/KS implementations
+python tests/test_invariants.py            # per-step structural invariants of a seeded run
+python tests/test_golden_invariance.py     # bitwise digest vs the committed fixture
 python tests/test_end_to_end.py            # short tracker runs, incl. a pole-aligned scene
 ```
 
-`LMB_ENGINE_BUILD=Debug` (or `Release`) forces the loader to pick a specific build directory.
+`LMB_ENGINE_BUILD=Debug` (or `Release`, or `Asan`) forces the loader to pick a specific build
+directory.
+
+### Determinism and regression harness
+
+`TwoBodyPropagator`, `AdaptiveBirthModel` and `SMC_LMB_Tracker` all take an optional `seed`. With
+those set plus `np.random.seed`, a whole simulation becomes a pure function of one integer, which
+is what the regression harness is built on. Debug, Release and the sanitizer build all produce
+bitwise-identical results.
+
+```bash
+python tests/test_golden_invariance.py               # bitwise comparison against tests/fixtures/
+python tests/test_golden_invariance.py --rtol 1e-9   # tolerant, for a deliberate FP-order change
+python tests/test_golden_invariance.py --write       # regenerate the fixtures
+python tests/test_statistical_equivalence.py         # 48 seeds/arm, Welch t + KS on mean OSPA
+python tests/bench_engine.py --json before.json      # record hot-path timings and peak RSS
+python tests/bench_engine.py --compare before.json   # diff against a recorded set
+./scripts/gate.sh                                    # Release + Debug suites, statistics, benchmark
+./scripts/asan-test.sh                               # ASan + UBSan build and suite
+```
+
+`test_statistical_equivalence.py` is not part of `ci-test.sh`: it costs about 20 s in Release and
+minutes in Debug, and it is only the right gate for a change that alters the RNG stream or
+floating-point summation order.
 
 ### Smoke import
 
@@ -263,6 +292,8 @@ rk4-lmbf/
 │   └── workflows/
 │       └── ci.yml              # Linux, macOS, Windows build + test
 ├── scripts/
+│   ├── gate.sh                 # full pre-commit gate: both builds, statistics, benchmark
+│   ├── asan-test.sh            # ASan + UBSan build and suite
 │   ├── build.sh                # Linux/macOS: venv + configure + build
 │   ├── build.ps1               # Windows build helper
 │   ├── cmake-venv-args.sh      # resolve venv Python & pybind11 for CMake
@@ -290,7 +321,8 @@ rk4-lmbf/
 │   ├── 2026_ieee_aerospace.py  # paper config (K_BEST=100)
 │   └── lmb_engine/             # built extension output (.so / .pyd)
 │       ├── Release/            # recommended built extension
-│       └── Debug/
+│       ├── Debug/
+│       └── Asan/               # sanitizer build (scripts/asan-test.sh)
 ├── tests/
 │   ├── test_two_body_propagator_multistep.py
 │   ├── assignments.py
@@ -300,7 +332,14 @@ rk4-lmbf/
 │   ├── test_sensor_likelihood.py
 │   ├── test_adaptive_birth_model.py
 │   ├── test_bindings_api.py
-│   └── test_end_to_end.py
+│   ├── test_end_to_end.py
+│   ├── harness_scenario.py     # fully-seeded scenario runner + digest, shared by the harnesses
+│   ├── statistics_helpers.py   # Welch t-test and two-sample KS, implemented on NumPy
+│   ├── test_invariants.py      # per-step structural invariants
+│   ├── test_golden_invariance.py       # bitwise/rtol digest regression
+│   ├── test_statistical_equivalence.py # distributional equivalence vs a committed baseline
+│   ├── bench_engine.py         # hot-path timings and peak RSS
+│   └── fixtures/               # committed golden digests, statistical baseline, bench baseline
 └── external/                   # optional git submodules (not required for default build)
     ├── astro/                  # openastro propagation library
     ├── sgp4/                   # SGP4 propagator

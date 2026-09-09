@@ -3,6 +3,7 @@
 # ===================================================================
 # Ignore the directory where CMake will place all build files.
 build/
+build-asan/
 
 # Ignore Visual Studio and MSVC specific files
 .sln
@@ -11,6 +12,7 @@ build/
 .user
 Debug/
 Release/
+Asan/
 x64/
 .vs/
 
