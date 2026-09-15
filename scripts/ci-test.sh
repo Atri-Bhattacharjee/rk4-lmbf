@@ -19,6 +19,7 @@ python tests/test_sensor_likelihood.py
 python tests/test_adaptive_birth_model.py
 python tests/test_bindings_api.py
 python tests/statistics_helpers.py
+python tests/test_particle_statistics.py
 python tests/test_invariants.py
 python tests/test_golden_invariance.py
 python tests/test_end_to_end.py

@@ -241,6 +241,7 @@ python tests/test_sensor_likelihood.py     # likelihood vs NumPy reference, rota
 python tests/test_adaptive_birth_model.py  # birth covariance recovery and spread statistics
 python tests/test_bindings_api.py          # Python API surface
 python tests/statistics_helpers.py         # self-test of the Welch/KS implementations
+python tests/test_particle_statistics.py   # cloud statistics vs NumPy, zero-copy view aliasing
 python tests/test_invariants.py            # per-step structural invariants of a seeded run
 python tests/test_golden_invariance.py     # bitwise digest vs the committed fixture
 python tests/test_end_to_end.py            # short tracker runs, incl. a pole-aligned scene
@@ -309,6 +310,7 @@ rk4-lmbf/
 │   ├── two_body_propagator.{h,cpp}
 │   ├── assignment.{h,cpp}      # K-best data association (Munkres LAP)
 │   ├── metrics.{h,cpp}
+│   ├── particle_statistics.h   # weighted mean/covariance of a particle cloud
 │   ├── munkres.{h,cpp}         # linear assignment (header-included)
 │   ├── matrix.{h,cpp}          # matrix utilities (header-included)
 │   ├── datatypes.h
@@ -335,6 +337,7 @@ rk4-lmbf/
 │   ├── test_end_to_end.py
 │   ├── harness_scenario.py     # fully-seeded scenario runner + digest, shared by the harnesses
 │   ├── statistics_helpers.py   # Welch t-test and two-sample KS, implemented on NumPy
+│   ├── test_particle_statistics.py     # cloud statistics and zero-copy view aliasing
 │   ├── test_invariants.py      # per-step structural invariants
 │   ├── test_golden_invariance.py       # bitwise/rtol digest regression
 │   ├── test_statistical_equivalence.py # distributional equivalence vs a committed baseline

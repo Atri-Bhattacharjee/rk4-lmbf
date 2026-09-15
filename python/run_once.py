@@ -262,30 +262,19 @@ def generate_measurements(active_truths, sensor_state, current_time):
 def compute_track_mean(track):
     """
     Compute the weighted mean state of a track's particles.
-    
+
+    Delegates to Track.mean_state(), which implements the same contract in C++: the weighted mean,
+    falling back to the unweighted mean when the total weight is at or below 1e-12, and zeros for an
+    empty cloud. The previous NumPy version cost ~13 ms per step for three 10,000-particle tracks,
+    almost all of it converting each particle into a Python object.
+
     Args:
         track: lmb_engine.Track object
-        
+
     Returns:
         numpy array: 6D mean state vector
     """
-    particles = track.particles()
-    if len(particles) == 0:
-        return np.zeros(6)
-    
-    states = np.array([p.state_vector for p in particles])
-    weights = np.array([p.weight for p in particles])
-    
-    # Normalize weights (should already sum to 1, but be robust)
-    weight_sum = np.sum(weights)
-    if weight_sum > 1e-12:
-        weights = weights / weight_sum
-    else:
-        weights = np.ones(len(particles)) / len(particles)
-    
-    # Weighted average
-    mean_state = np.average(states, weights=weights, axis=0)
-    return mean_state
+    return np.asarray(track.mean_state(), dtype=np.float64).reshape(6)
 
 
 # =============================================================================

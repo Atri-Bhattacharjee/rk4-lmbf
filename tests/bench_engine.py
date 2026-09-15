@@ -241,8 +241,14 @@ def run_benchmarks(config: BenchConfig) -> dict:
     median_ms, min_ms = time_operation(lambda: [t.particles() for t in updated], config)
     record("track.particles() copy", median_ms, min_ms, f"all {num_tracks} tracks")
 
+    median_ms, min_ms = time_operation(lambda: [t.particle_states() for t in updated], config)
+    record("track.particle_states() view", median_ms, min_ms, f"all {num_tracks} tracks")
+
     median_ms, min_ms = time_operation(lambda: [run_once.compute_track_mean(t) for t in updated], config)
     record("compute_track_mean (Python)", median_ms, min_ms, f"all {num_tracks} tracks")
+
+    median_ms, min_ms = time_operation(lambda: tracker.get_tracks(), config)
+    record("get_tracks()", median_ms, min_ms, f"{num_tracks} tracks across the binding")
 
     cost_matrix = build_cost_matrix(tracker, updated, measurements)
     median_ms, min_ms = time_operation(lambda: lmb.solve_assignment(cost_matrix, config.k_best), config)

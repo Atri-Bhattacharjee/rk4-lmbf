@@ -1,5 +1,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/eigen.h>
+#include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <Eigen/Dense>
 #include <cstdint>
@@ -15,6 +16,7 @@
 #include "in_orbit_sensor_model.h"
 #include "assignment.h"
 #include "metrics.h"
+#include "particle_statistics.h"
 
 #include "two_body_propagator.h"
 #include "validation.h"
@@ -169,6 +171,55 @@ std::vector<Particle> get_track_particles_copy(const Track& track) {
     return track.particles();
 }
 
+// A std::vector<Particle> is a contiguous array, so a NumPy array can address the state components
+// and the weights in place with a stride of sizeof(Particle). That replaces a per-particle pybind11
+// object conversion (measured at ~4.4 ms for three 10,000-particle clouds) with a pointer.
+//
+// The views are read-only and keep the owning Track alive through the array's base object. They are
+// still invalidated by anything that reallocates the cloud -- set_particles, or a further predict or
+// update on the tracker the track came from -- exactly like a C++ iterator would be.
+static_assert(sizeof(Particle) == 64,
+              "the zero-copy particle views assume a 64-byte Particle; re-check the strides below");
+static_assert(sizeof(StateVector) == 6 * sizeof(double),
+              "the zero-copy particle views assume six contiguous doubles per state vector");
+
+pybind11::array_t<double> make_readonly_view(const std::vector<pybind11::ssize_t>& shape,
+                                             const std::vector<pybind11::ssize_t>& strides,
+                                             const double* data,
+                                             pybind11::object owner) {
+    pybind11::array_t<double> view(shape, strides, data, std::move(owner));
+    pybind11::detail::array_proxy(view.ptr())->flags &=
+        ~pybind11::detail::npy_api::NPY_ARRAY_WRITEABLE_;
+    return view;
+}
+
+pybind11::array_t<double> get_track_particle_states(pybind11::object self) {
+    const std::vector<Particle>& particles = self.cast<const Track&>().particles();
+    const auto count = static_cast<pybind11::ssize_t>(particles.size());
+    if (count == 0) {
+        return pybind11::array_t<double>(std::vector<pybind11::ssize_t>{0, 6});
+    }
+    // Taken from a live object rather than offsetof, which is only conditionally supported for a
+    // type with an Eigen member.
+    return make_readonly_view({count, 6},
+                              {static_cast<pybind11::ssize_t>(sizeof(Particle)),
+                               static_cast<pybind11::ssize_t>(sizeof(double))},
+                              particles[0].state_vector.data(),
+                              std::move(self));
+}
+
+pybind11::array_t<double> get_track_particle_weights(pybind11::object self) {
+    const std::vector<Particle>& particles = self.cast<const Track&>().particles();
+    const auto count = static_cast<pybind11::ssize_t>(particles.size());
+    if (count == 0) {
+        return pybind11::array_t<double>(std::vector<pybind11::ssize_t>{0});
+    }
+    return make_readonly_view({count},
+                              {static_cast<pybind11::ssize_t>(sizeof(Particle))},
+                              &particles[0].weight,
+                              std::move(self));
+}
+
 std::vector<Track> get_filter_state_tracks_copy(const FilterState& state) {
     return state.tracks();
 }
@@ -289,6 +340,19 @@ PYBIND11_MODULE(lmb_engine, m) {
         .def("label", &get_track_label_copy)
         .def("existence_probability", &Track::existence_probability)
         .def("particles", &get_track_particles_copy)
+        .def("particle_states", &get_track_particle_states,
+             "Read-only (N, 6) view of the particle state vectors, aliasing the track's own memory.\n"
+             "Invalidated by anything that reallocates the cloud (set_particles, or a further\n"
+             "predict/update on the tracker this track came from).")
+        .def("particle_weights", &get_track_particle_weights,
+             "Read-only (N,) view of the particle weights, aliasing the track's own memory.\n"
+             "Same invalidation rules as particle_states().")
+        .def("mean_state", &particle_stats::mean_state,
+             "Weighted mean state. Falls back to the unweighted mean when the total weight is at or\n"
+             "below 1e-12, and returns zeros for an empty cloud.")
+        .def("covariance", &particle_stats::covariance,
+             "6x6 weighted covariance about mean_state(), normalized by the total weight.")
+        .def("weight_sum", &particle_stats::weight_sum, "Sum of the particle weights")
         .def("set_existence_probability", &Track::set_existence_probability)
         .def("set_particles", &Track::set_particles);
     
