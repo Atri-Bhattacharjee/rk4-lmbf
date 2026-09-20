@@ -25,4 +25,9 @@ private:
     ProcessNoiseCov noise_L_;
     bool has_process_noise_ = false;
     mutable std::mt19937_64 rng_;  //!< Seeded from the ctor argument or std::random_device
+    // Kept on the instance so the distribution object is not reconstructed every propagate().
+    // libstdc++ Box-Muller caches a spare Normal; with exactly six draws per call the spare is
+    // empty at return, so the stream matches constructing a fresh distribution each time on this
+    // toolchain. Treat any future change to the draw count as a stream change and re-gate.
+    mutable std::normal_distribution<> unit_normal_{0.0, 1.0};
 };

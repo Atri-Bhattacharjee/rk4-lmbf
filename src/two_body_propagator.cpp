@@ -10,8 +10,10 @@ static StateVector calculate_state_derivative(const StateVector& state_6d) {
     constexpr double mu = 3.986004418e14; // Earth's gravitational parameter (m^3/s^2)
     constexpr double min_radius = 6.371e6 + 100.0e3; // Earth radius + 100 km floor
 
-    Eigen::Vector3d pos = state_6d.head(3);
-    Eigen::Vector3d vel = state_6d.segment(3, 3);
+    // Fixed-size blocks: Eigen can emit three-wide loads/stores without a runtime size check.
+    // Bit-identical to the former dynamic head(3) / segment(3, 3) on the reference toolchain.
+    Eigen::Vector3d pos = state_6d.head<3>();
+    Eigen::Vector3d vel = state_6d.tail<3>();
     double r_norm = pos.norm();
     Eigen::Vector3d radial_unit;
     double r_safe;
@@ -24,8 +26,8 @@ static StateVector calculate_state_derivative(const StateVector& state_6d) {
     }
     Eigen::Vector3d acc = -mu * radial_unit / (r_safe * r_safe);
     StateVector dydt;
-    dydt.head(3) = vel;
-    dydt.tail(3) = acc;
+    dydt.head<3>() = vel;
+    dydt.tail<3>() = acc;
     return dydt;
 }
 
@@ -61,13 +63,13 @@ Particle TwoBodyPropagator::propagate(const Particle& particle, double dt, doubl
     propagated_particle.state_vector = y1;
 
     if (has_process_noise_ && noise_scale > 1e-12) {
-        std::normal_distribution<> dist(0.0, 1.0);
         StateVector noise_vec;
         for (int i = 0; i < 6; ++i) {
-            noise_vec(i) = dist(rng_);
+            noise_vec(i) = unit_normal_(rng_);
         }
         const double std_dev_scale = std::sqrt(noise_scale);
-        propagated_particle.state_vector += noise_L_ * noise_vec * std_dev_scale;
+        propagated_particle.state_vector +=
+            noise_L_.triangularView<Eigen::Lower>() * noise_vec * std_dev_scale;
     }
     return propagated_particle;
 }
