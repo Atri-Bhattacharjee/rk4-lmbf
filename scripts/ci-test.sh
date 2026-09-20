@@ -21,6 +21,7 @@ python tests/test_bindings_api.py
 python tests/statistics_helpers.py
 python tests/test_particle_statistics.py
 python tests/test_invariants.py
+python tests/test_mixture_grouping.py
 # Selects its own mode: bitwise against the committed fixtures on the platform that wrote them
 # (x86-64 Linux / libstdc++), portable everywhere else. See the PLATFORM GATING block in the test.
 python tests/test_golden_invariance.py

@@ -6,15 +6,6 @@
 #include <random>
 #include <stdexcept>
 
-namespace {
-
-struct MixedEntry {
-    size_t particle_index;
-    double weight;
-};
-
-}  // namespace
-
 void SMC_LMB_Tracker::ensure_models_configured() const {
     validation::require_models(propagator_, sensor_model_, birth_model_);
 }
@@ -113,19 +104,27 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
         meas_caches.push_back(InOrbitSensorModel::buildCache(measurement));
     }
 
-    // Step 2: Compute normalized association weights for each track-measurement pair
-    std::vector<std::vector<std::vector<double>>> association_weights(num_tracks);
+    // Step 2: Compute normalized association weights for each track-measurement pair.
+    //
+    // Storage is one flat buffer rather than a nested vector-of-vector-of-vector, which removes
+    // num_tracks * num_meas allocations per call. Particle counts are NOT assumed uniform across
+    // tracks -- adaptive, confidence-driven cloud sizing is expected -- so a track's block is
+    // located through a prefix-sum offset table instead of a fixed stride.
+    track_particle_offsets_.assign(num_tracks + 1, 0);
+    for (size_t i = 0; i < num_tracks; ++i) {
+        track_particle_offsets_[i + 1] = track_particle_offsets_[i] + tracks[i].particles().size();
+    }
+    association_weights_.assign(track_particle_offsets_[num_tracks] * num_meas, 0.0);
+
     Eigen::MatrixXd likelihood_matrix(num_tracks, num_meas);
 
     for (size_t i = 0; i < num_tracks; ++i) {
         const auto& current_particles = tracks[i].particles();
-        size_t num_particles = current_particles.size();
-
-        association_weights[i].resize(num_meas);
+        const size_t num_particles = current_particles.size();
 
         for (size_t j = 0; j < num_meas; ++j) {
             const auto& measurement = measurements[j];
-            association_weights[i][j].resize(num_particles);
+            double* assoc = association_weights_.data() + association_block_offset(i, j, num_meas);
 
             double total_likelihood = 0.0;
 
@@ -134,7 +133,7 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
                 const double particle_likelihood = sensor_model_->calculate_likelihood(
                     current_particle, measurement, meas_caches[j]);
                 const double updated_weight = current_particle.weight * (particle_likelihood / clutter_intensity_);
-                association_weights[i][j][p] = updated_weight;
+                assoc[p] = updated_weight;
                 total_likelihood += updated_weight;
             }
 
@@ -142,13 +141,13 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
 
             if (total_likelihood > 1e-12) {
                 const double inv_total = 1.0 / total_likelihood;
-                for (double& weight : association_weights[i][j]) {
-                    weight *= inv_total;
+                for (size_t p = 0; p < num_particles; ++p) {
+                    assoc[p] *= inv_total;
                 }
-            } else {
+            } else if (num_particles > 0) {
                 const double uniform_weight = 1.0 / static_cast<double>(num_particles);
-                for (double& weight : association_weights[i][j]) {
-                    weight = uniform_weight;
+                for (size_t p = 0; p < num_particles; ++p) {
+                    assoc[p] = uniform_weight;
                 }
             }
         }
@@ -204,87 +203,133 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
     
     std::uniform_real_distribution<double> unit_dist(0.0, 1.0);
 
-    // Step 5: Combine, update and resample
+    // Step 5: Combine, update and resample.
+    //
+    // The hypothesis mixture is grouped by association rather than enumerated. Every hypothesis
+    // that assigns track i to measurement j contributes the same per-particle vector
+    // association_weights_[i][j] scaled by a different scalar, and every miss column carries an
+    // identical formula, so at most num_meas + 1 distinct per-particle passes are needed no
+    // matter how large k_best_ is. Exchanging the order of the double sum
+    //     W[p] = sum_h e(h, p) = sum_j c[j] * nw[j][p] + c_miss * w[p]
+    // is exact; only the floating-point summation order and the granularity of the resampling
+    // list change, and the latter changes favorably (see the S <= 1e-12 note below and the
+    // systematic-resampling argument: the stratification guarantee now applies to each particle
+    // rather than to each of the k_best_ scattered fragments of that particle's mass).
     std::vector<Track> updated_tracks;
+    updated_tracks.reserve(num_tracks);
+
     for (size_t i = 0; i < num_tracks; ++i) {
         const auto& predicted_particles = tracks[i].particles();
-        std::vector<MixedEntry> mixed_entries;
-        mixed_entries.reserve(hypotheses.size() * predicted_particles.size());
+        const size_t num_particles = predicted_particles.size();
+
+        // Step 5a: collapse the hypotheses onto their distinct associations. O(k_best_); no
+        // particle is touched here.
+        assoc_coefficients_.assign(num_meas, 0.0);
+        assoc_used_.assign(num_meas, 0);
+        double miss_coefficient = 0.0;
+        bool miss_used = false;
+        size_t contributing_hypotheses = 0;
 
         for (size_t h = 0; h < hypotheses.size(); ++h) {
-            int assoc_idx = hypotheses[h].associations[i];
-            double hyp_weight = norm_weights[h];
-            
-            if (assoc_idx >= 0 && static_cast<size_t>(assoc_idx) < num_meas) {
-                const auto& norm_weights_for_assoc = association_weights[i][assoc_idx];
-                const double likelihood_ratio = likelihood_matrix(i, assoc_idx);
+            const int assoc_idx = hypotheses[h].associations[i];
+            const double hyp_weight = norm_weights[h];
 
-                for (size_t p = 0; p < predicted_particles.size(); ++p) {
-                    mixed_entries.push_back({
-                        p,
-                        norm_weights_for_assoc[p] * hyp_weight * p_detection_ * likelihood_ratio
-                    });
-                }
+            if (assoc_idx >= 0 && static_cast<size_t>(assoc_idx) < num_meas) {
+                assoc_coefficients_[static_cast<size_t>(assoc_idx)] += hyp_weight;
+                assoc_used_[static_cast<size_t>(assoc_idx)] = 1;
+                ++contributing_hypotheses;
             } else if (assoc_idx == -1 ||
                        (static_cast<size_t>(assoc_idx) >= num_meas &&
                         static_cast<size_t>(assoc_idx) < num_meas + num_tracks)) {
-                for (size_t p = 0; p < predicted_particles.size(); ++p) {
-                    mixed_entries.push_back({
-                        p,
-                        predicted_particles[p].weight * hyp_weight * (1.0 - p_detection_)
-                    });
-                }
+                // All miss columns in [num_meas, num_meas + num_tracks) share one formula, so
+                // they collapse into a single bucket. One bucket per miss column would break the
+                // num_meas + 1 bound for no benefit.
+                miss_coefficient += hyp_weight;
+                miss_used = true;
+                ++contributing_hypotheses;
+            }
+            // Any other assoc_idx falls through without contributing, as it did when this loop
+            // appended entries directly.
+        }
+
+        for (size_t j = 0; j < num_meas; ++j) {
+            assoc_coefficients_[j] *= p_detection_ * likelihood_matrix(i, j);
+        }
+        miss_coefficient *= (1.0 - p_detection_);
+
+        // Step 5b: one pass per used association. O(D * num_particles) with D <= num_meas + 1.
+        // Measurements ascending, then the miss term, so the summation order is fixed run to run.
+        mixture_weights_.assign(num_particles, 0.0);
+
+        for (size_t j = 0; j < num_meas; ++j) {
+            if (!assoc_used_[j]) {
+                continue;
+            }
+            const double coefficient = assoc_coefficients_[j];
+            const double* assoc = association_weights_.data() + association_block_offset(i, j, num_meas);
+            for (size_t p = 0; p < num_particles; ++p) {
+                mixture_weights_[p] += coefficient * assoc[p];
             }
         }
 
+        if (miss_used) {
+            for (size_t p = 0; p < num_particles; ++p) {
+                mixture_weights_[p] += miss_coefficient * predicted_particles[p].weight;
+            }
+        }
+
+        // Step 5c: totals, existence update and resampling, now over num_particles entries
+        // instead of hypotheses.size() * num_particles.
         double sum_weights = 0.0;
-        for (const auto& entry : mixed_entries) {
-            sum_weights += entry.weight;
+        for (size_t p = 0; p < num_particles; ++p) {
+            sum_weights += mixture_weights_[p];
         }
 
-        double r_legacy = tracks[i].existence_probability();
-        double r_new = (r_legacy * sum_weights) / (1.0 - r_legacy + r_legacy * sum_weights);
+        const double r_legacy = tracks[i].existence_probability();
+        const double r_new = (r_legacy * sum_weights) / (1.0 - r_legacy + r_legacy * sum_weights);
 
-        if (sum_weights > 1e-12) {
-            const double inv_sum = 1.0 / sum_weights;
-            for (auto& entry : mixed_entries) {
-                entry.weight *= inv_sum;
-            }
-        } else {
-            const double uniform_weight = mixed_entries.empty()
-                ? 0.0
-                : 1.0 / static_cast<double>(mixed_entries.size());
-            for (auto& entry : mixed_entries) {
-                entry.weight = uniform_weight;
-            }
-        }
-
-        size_t num_particles = predicted_particles.size();
-        std::vector<Particle> resampled_particles;
-        resampled_particles.reserve(num_particles);
-
-        if (mixed_entries.empty() || num_particles == 0) {
+        // Counts hypotheses that took a branch, not buckets that ended up non-zero: a hypothesis
+        // with weight exactly 0.0 still contributed, and previously produced a non-empty mixture.
+        if (contributing_hypotheses == 0 || num_particles == 0) {
             Track final_track = tracks[i];
             final_track.set_existence_probability(r_new);
             updated_tracks.push_back(final_track);
             continue;
         }
 
+        if (sum_weights > 1e-12) {
+            const double inv_sum = 1.0 / sum_weights;
+            for (size_t p = 0; p < num_particles; ++p) {
+                mixture_weights_[p] *= inv_sum;
+            }
+        } else {
+            // No information to go on. Equal slots make the systematic walk keep every particle
+            // exactly once, which is the sensible reading of that. This is a deliberate behavior
+            // change: spreading the same uniform weight across the old scattered list instead
+            // produced a strided permutation with duplicates.
+            const double uniform_weight = 1.0 / static_cast<double>(num_particles);
+            for (size_t p = 0; p < num_particles; ++p) {
+                mixture_weights_[p] = uniform_weight;
+            }
+        }
+
+        std::vector<Particle> resampled_particles;
+        resampled_particles.reserve(num_particles);
+
         const double u = unit_dist(resample_rng_) / static_cast<double>(num_particles);
         double cumsum = 0.0;
         size_t idx = 0;
 
         for (size_t p = 0; p < num_particles; ++p) {
-            double threshold = u + static_cast<double>(p) / static_cast<double>(num_particles);
+            const double threshold = u + static_cast<double>(p) / static_cast<double>(num_particles);
 
-            while (cumsum < threshold && idx < mixed_entries.size()) {
-                cumsum += mixed_entries[idx].weight;
+            while (cumsum < threshold && idx < num_particles) {
+                cumsum += mixture_weights_[idx];
                 ++idx;
             }
 
-            const size_t chosen_index = (idx > 0)
-                ? mixed_entries[idx - 1].particle_index
-                : mixed_entries[0].particle_index;
+            // The position in mixture_weights_ is the particle index, so no side table is needed.
+            const size_t chosen_index = (idx > 0) ? idx - 1 : 0;
 
             Particle resampled;
             resampled.state_vector = predicted_particles[chosen_index].state_vector;

@@ -64,6 +64,7 @@ if [[ ${#TESTS[@]} -eq 0 ]]; then
     tests/test_bindings_api.py
     tests/test_particle_statistics.py
     tests/test_invariants.py
+    tests/test_mixture_grouping.py
     tests/test_golden_invariance.py
   )
 fi
