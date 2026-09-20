@@ -22,6 +22,7 @@ python tests/test_invariants.py
 # Selects its own mode: bitwise against the committed fixtures on the platform that wrote them
 # (x86-64 Linux / libstdc++), portable here. See the PLATFORM GATING block in the test.
 python tests/test_golden_invariance.py
+python tests/test_run_once_api_surface.py
 python tests/test_end_to_end.py
 
 # test_statistical_equivalence.py replaces the bitwise gate here, since Windows is never the

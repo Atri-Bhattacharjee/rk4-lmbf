@@ -26,6 +26,7 @@ python tests/test_mixture_grouping.py
 # Selects its own mode: bitwise against the committed fixtures on the platform that wrote them
 # (x86-64 Linux / libstdc++), portable everywhere else. See the PLATFORM GATING block in the test.
 python tests/test_golden_invariance.py
+python tests/test_run_once_api_surface.py
 python tests/test_end_to_end.py
 
 # test_statistical_equivalence.py replaces the bitwise gate off the reference platform, where the
