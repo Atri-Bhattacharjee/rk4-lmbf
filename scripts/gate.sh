@@ -13,6 +13,10 @@
 # Usage:
 #   ./scripts/gate.sh                 # bitwise golden comparison (the default for most phases)
 #   ./scripts/gate.sh --rtol 1e-9     # tolerant golden comparison (Phase 2 only)
+#
+# The gate assumes the reference platform (x86-64 Linux / libstdc++), which is where the golden
+# fixtures are bitwise reproducible. Run with no arguments elsewhere and the golden step drops to its
+# portable mode on its own; step 3 is then the gate that is doing the numerical work.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

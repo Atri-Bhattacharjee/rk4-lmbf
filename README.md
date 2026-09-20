@@ -243,7 +243,7 @@ python tests/test_bindings_api.py          # Python API surface
 python tests/statistics_helpers.py         # self-test of the Welch/KS implementations
 python tests/test_particle_statistics.py   # cloud statistics vs NumPy, zero-copy view aliasing
 python tests/test_invariants.py            # per-step structural invariants of a seeded run
-python tests/test_golden_invariance.py     # bitwise digest vs the committed fixture
+python tests/test_golden_invariance.py     # digest vs the committed fixture (see below)
 python tests/test_end_to_end.py            # short tracker runs, incl. a pole-aligned scene
 ```
 
@@ -255,11 +255,13 @@ directory.
 `TwoBodyPropagator`, `AdaptiveBirthModel` and `SMC_LMB_Tracker` all take an optional `seed`. With
 those set plus `np.random.seed`, a whole simulation becomes a pure function of one integer, which
 is what the regression harness is built on. Debug, Release and the sanitizer build all produce
-bitwise-identical results.
+bitwise-identical results *on one toolchain*.
 
 ```bash
-python tests/test_golden_invariance.py               # bitwise comparison against tests/fixtures/
+python tests/test_golden_invariance.py               # comparison against tests/fixtures/
+python tests/test_golden_invariance.py --exact       # force bitwise
 python tests/test_golden_invariance.py --rtol 1e-9   # tolerant, for a deliberate FP-order change
+python tests/test_golden_invariance.py --portable    # force the platform-independent subset
 python tests/test_golden_invariance.py --write       # regenerate the fixtures
 python tests/test_statistical_equivalence.py         # 48 seeds/arm, Welch t + KS on mean OSPA
 python tests/bench_engine.py --json before.json      # record hot-path timings and peak RSS
@@ -268,9 +270,27 @@ python tests/bench_engine.py --compare before.json   # diff against a recorded s
 ./scripts/asan-test.sh                               # ASan + UBSan build and suite
 ```
 
-`test_statistical_equivalence.py` is not part of `ci-test.sh`: it costs about 20 s in Release and
-minutes in Debug, and it is only the right gate for a change that alters the RNG stream or
-floating-point summation order.
+#### Bitwise reproduction is per-platform
+
+The committed golden fixtures encode one toolchain's bit pattern, so the bitwise gate is limited to
+the platform they were written on (x86-64 Linux / libstdc++) and `test_golden_invariance.py` selects
+its mode accordingly: bitwise there, `--portable` everywhere else. Two things make the bit pattern a
+property of the toolchain rather than of the filter:
+
+* **The RNG stream.** `std::mt19937_64` is specified bit-for-bit, but `std::normal_distribution` and
+  `std::uniform_real_distribution` are not. libstdc++ and the MSVC STL agree; libc++ (macOS) draws a
+  different sequence from the same seed, and a run diverges on its first birth.
+* **Floating-point rounding.** Clang contracts `a * b + c` into a single-rounding `fma` wherever the
+  ISA has one (always, on arm64), Apple's libm is not bit-identical to glibc's, and Eigen reduces in
+  NEON lane order rather than SSE lane order.
+
+The first of those is a different draw from the same distribution, not a rounding difference, so no
+`--rtol` absorbs it. Portable mode therefore checks what holds anywhere — the NumPy-driven
+measurement counts, that the filter is still tracking, and run-to-run repeatability — and prints the
+observed drift for the log. The numerical gate off the reference platform is
+`test_statistical_equivalence.py`, which `ci-test.sh` and `ci-test.ps1` run there for exactly that
+reason (at `--alpha 1e-4`, since it runs on every PR). On the reference platform it stays out of
+`ci-test.sh`: the bitwise gate already covers it, and in Debug it costs minutes.
 
 ### Smoke import
 

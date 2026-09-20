@@ -21,9 +21,29 @@ python tests/test_bindings_api.py
 python tests/statistics_helpers.py
 python tests/test_particle_statistics.py
 python tests/test_invariants.py
+# Selects its own mode: bitwise against the committed fixtures on the platform that wrote them
+# (x86-64 Linux / libstdc++), portable everywhere else. See the PLATFORM GATING block in the test.
 python tests/test_golden_invariance.py
 python tests/test_end_to_end.py
 
-# test_statistical_equivalence.py is deliberately not run here. It costs ~20 s in Release and
-# several minutes in Debug, and it is only the right gate for phases that change the RNG stream or
-# floating-point summation order. Run it via ./scripts/gate.sh, or directly, for those phases.
+# test_statistical_equivalence.py replaces the bitwise gate off the reference platform, where the
+# STL's random distributions draw a different stream from the same seed and no tolerance on the
+# golden digest is meaningful. It compares mean-OSPA distributions over 48 independent scenarios per
+# arm, which is the right question for a stream difference. On the reference platform the bitwise
+# gate already covers it, so it is skipped there; in Debug it costs minutes, so it belongs against
+# Release.
+REFERENCE_PLATFORM=0
+case "$(uname -s)/$(uname -m)" in
+  Linux/x86_64 | Linux/amd64) REFERENCE_PLATFORM=1 ;;
+esac
+
+if [[ "$REFERENCE_PLATFORM" == "1" ]]; then
+  echo "test_statistical_equivalence.py: skipped, the bitwise golden gate covers this platform"
+elif [[ "${LMB_ENGINE_BUILD:-Release}" == "Debug" ]]; then
+  echo "test_statistical_equivalence.py: skipped, it costs minutes in Debug; run it against Release"
+else
+  # alpha 1e-4 rather than the default 0.01: this runs on every PR, and at 0.01 each of the three
+  # comparisons rejects a healthy platform 1% of the time. A port that is actually broken misses by
+  # many sigma and still fails.
+  python tests/test_statistical_equivalence.py --alpha 1e-4
+fi

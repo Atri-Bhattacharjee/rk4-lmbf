@@ -283,10 +283,20 @@ def run_scenario(
     )
 
 
-def compare_digests(reference: Digest, candidate: Digest, rtol: float, atol: float = 0.0) -> list[str]:
+def compare_digests(
+    reference: Digest,
+    candidate: Digest,
+    rtol: float,
+    atol: float = 0.0,
+    int_fields: tuple[str, ...] = INT_FIELDS,
+    float_fields: tuple[str, ...] = FLOAT_FIELDS,
+) -> list[str]:
     """Return a list of human-readable failures; empty means the digests agree.
 
-    Integer fields are always compared exactly regardless of ``rtol``.
+    Integer fields are always compared exactly regardless of ``rtol``. ``int_fields`` and
+    ``float_fields`` narrow the comparison to a subset, which
+    ``test_golden_invariance.py`` uses off the reference platform to compare only the fields that
+    are reproducible there.
     """
     failures: list[str] = []
 
@@ -299,7 +309,7 @@ def compare_digests(reference: Digest, candidate: Digest, rtol: float, atol: flo
         )
         return failures
 
-    for name in INT_FIELDS:
+    for name in int_fields:
         ref_values = getattr(reference, name)
         cand_values = getattr(candidate, name)
         if ref_values.shape != cand_values.shape:
@@ -313,7 +323,7 @@ def compare_digests(reference: Digest, candidate: Digest, rtol: float, atol: flo
                 f"(reference {ref_values.ravel()[first]}, candidate {cand_values.ravel()[first]})"
             )
 
-    for name in FLOAT_FIELDS:
+    for name in float_fields:
         ref_values = getattr(reference, name)
         cand_values = getattr(candidate, name)
         if ref_values.shape != cand_values.shape:

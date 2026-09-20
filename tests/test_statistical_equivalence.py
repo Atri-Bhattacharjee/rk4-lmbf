@@ -9,18 +9,27 @@ resulting mean-OSPA distributions.
 
 Three comparisons must all pass:
 
-1. Welch's t-test on per-run mean OSPA (location), ``p > 0.01``.
-2. Two-sample KS test on per-run mean OSPA (whole distribution, not just its mean), ``p > 0.01``.
+1. Welch's t-test on per-run mean OSPA (location), ``p > alpha`` (default 0.01).
+2. Two-sample KS test on per-run mean OSPA (whole distribution, not just its mean), ``p > alpha``.
 3. A per-step Welch test on the mean-OSPA curve, Bonferroni-corrected across steps. A phase that
    shifts only, say, the convergence transient would pass 1 and 2 while failing this.
 
 The baseline is generated once from the pre-change build and committed. Regenerating it discards
 the reference point, so only do it deliberately and say why in the commit message.
 
+This is also the numerical gate off the reference platform, where the golden digest cannot be
+compared bitwise because the STL's random distributions draw a different stream from the same seed
+(see the PLATFORM GATING block in test_golden_invariance.py). ``--alpha`` exists for that: each
+comparison rejects a true null ``alpha`` of the time, so the 0.01 that is right for a deliberate
+one-off phase check would fail a few percent of CI runs on a platform that is merely different.
+ci-test.sh and ci-test.ps1 pass a smaller value, which still fails a genuinely broken port by many
+orders of magnitude.
+
 Usage:
     python tests/test_statistical_equivalence.py            # compare against the fixture
     python tests/test_statistical_equivalence.py --write    # regenerate the baseline
     python tests/test_statistical_equivalence.py --seeds 96 # widen the sample (both arms must match)
+    python tests/test_statistical_equivalence.py --alpha 1e-4  # rejection level (default 0.01)
 """
 
 from __future__ import annotations
@@ -90,7 +99,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--write", action="store_true", help="regenerate the committed baseline")
     parser.add_argument("--seeds", type=int, default=NUM_SEEDS, help=f"runs per arm (default {NUM_SEEDS})")
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=ALPHA,
+        help=f"rejection level for all three comparisons (default {ALPHA:g})",
+    )
     args = parser.parse_args()
+
+    if not 0.0 < args.alpha < 1.0:
+        parser.error("--alpha must lie in (0, 1)")
+    alpha = args.alpha
 
     if args.seeds < 40:
         parser.error("the gate requires at least 40 runs per arm")
@@ -145,23 +164,23 @@ def main() -> int:
     print(f"  baseline   {baseline_mean.mean():9.1f} m  sd {baseline_mean.std(ddof=1):8.1f} m")
     print(f"  candidate  {candidate_mean.mean():9.1f} m  sd {candidate_mean.std(ddof=1):8.1f} m")
     print(f"  delta      {delta:9.1f} m  (Cohen's d {effect_size:+.3f})")
-    print(f"  Welch t = {t_statistic:+.4f}, df = {degrees_of_freedom:.1f}, p = {t_p:.4f} (need p > {ALPHA})")
-    print(f"  KS    D = {ks_statistic:.4f}, p = {ks_p:.4f} (need p > {ALPHA})")
+    print(f"  Welch t = {t_statistic:+.4f}, df = {degrees_of_freedom:.1f}, p = {t_p:.4f} (need p > {alpha:g})")
+    print(f"  KS    D = {ks_statistic:.4f}, p = {ks_p:.4f} (need p > {alpha:g})")
 
     checker.ok(
-        t_p > ALPHA,
+        t_p > alpha,
         f"Welch t-test rejects equality of mean OSPA: t={t_statistic:+.4f}, df={degrees_of_freedom:.1f}, "
-        f"p={t_p:.6f} <= {ALPHA} (delta {delta:.1f} m, Cohen's d {effect_size:+.3f})",
+        f"p={t_p:.6f} <= {alpha:g} (delta {delta:.1f} m, Cohen's d {effect_size:+.3f})",
     )
     checker.ok(
-        ks_p > ALPHA,
+        ks_p > alpha,
         f"KS test rejects equality of the mean-OSPA distribution: D={ks_statistic:.4f}, "
-        f"p={ks_p:.6f} <= {ALPHA}",
+        f"p={ks_p:.6f} <= {alpha:g}",
     )
 
     # Per-step curve comparison, Bonferroni-corrected: with 60 independent tests at alpha=0.01 you
     # would expect ~0.6 spurious rejections, so the uncorrected threshold would flag healthy runs.
-    step_threshold = ALPHA / STAT_CONFIG.num_steps
+    step_threshold = alpha / STAT_CONFIG.num_steps
     step_p_values = np.ones(STAT_CONFIG.num_steps, dtype=np.float64)
     for step in range(STAT_CONFIG.num_steps):
         step_p_values[step] = st.welch_t_test(baseline_curves[:, step], candidate_curves[:, step])[2]
