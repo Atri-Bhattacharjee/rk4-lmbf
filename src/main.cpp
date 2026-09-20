@@ -176,8 +176,10 @@ std::vector<Particle> get_track_particles_copy(const Track& track) {
 // object conversion (measured at ~4.4 ms for three 10,000-particle clouds) with a pointer.
 //
 // The views are read-only and keep the owning Track alive through the array's base object. They are
-// still invalidated by anything that reallocates the cloud -- set_particles, or a further predict or
-// update on the tracker the track came from -- exactly like a C++ iterator would be.
+// still invalidated by anything that reallocates the cloud -- set_particles (copy or move),
+// mutable_particles followed by a reallocation, or a further update that replaces the cloud on the
+// tracker the track came from -- exactly like a C++ iterator would be. predict currently overwrites
+// particles in place without reallocating, so addresses stay valid but the values change.
 static_assert(sizeof(Particle) == 64,
               "the zero-copy particle views assume a 64-byte Particle; re-check the strides below");
 static_assert(sizeof(StateVector) == 6 * sizeof(double),
@@ -351,8 +353,9 @@ PYBIND11_MODULE(lmb_engine, m) {
         .def("particles", &get_track_particles_copy)
         .def("particle_states", &get_track_particle_states,
              "Read-only (N, 6) view of the particle state vectors, aliasing the track's own memory.\n"
-             "Invalidated by anything that reallocates the cloud (set_particles, or a further\n"
-             "predict/update on the tracker this track came from).")
+             "Invalidated by anything that reallocates the cloud (set_particles, or an update that\n"
+             "replaces the cloud on the tracker this track came from). predict overwrites values in\n"
+             "place without reallocating, so addresses stay valid but observed values change.")
         .def("particle_weights", &get_track_particle_weights,
              "Read-only (N,) view of the particle weights, aliasing the track's own memory.\n"
              "Same invalidation rules as particle_states().")
@@ -363,7 +366,10 @@ PYBIND11_MODULE(lmb_engine, m) {
              "6x6 weighted covariance about mean_state(), normalized by the total weight.")
         .def("weight_sum", &particle_stats::weight_sum, "Sum of the particle weights")
         .def("set_existence_probability", &Track::set_existence_probability)
-        .def("set_particles", &Track::set_particles);
+        .def("set_particles",
+             static_cast<void (Track::*)(const std::vector<Particle>&)>(&Track::set_particles),
+             "Replace the particle cloud (copy). Reallocates and invalidates particle_states/\n"
+             "particle_weights views.");
     
     pybind11::class_<FilterState>(m, "FilterState")
         .def(pybind11::init<>())

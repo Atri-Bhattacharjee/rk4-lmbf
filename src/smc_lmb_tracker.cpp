@@ -2,9 +2,11 @@
 #include "assignment.h"
 #include "in_orbit_sensor_model.h"
 #include "validation.h"
+#include <algorithm>
 #include <iostream>
 #include <random>
 #include <stdexcept>
+#include <utility>
 
 void SMC_LMB_Tracker::ensure_models_configured() const {
     validation::require_models(propagator_, sensor_model_, birth_model_);
@@ -62,15 +64,14 @@ void SMC_LMB_Tracker::predict(double dt) {
             noise_scale = noise_min_scale_ + (1.0 - noise_min_scale_) * std::exp(-noise_decay_rate_ * age);
         }
         
-        // Propagate particles with adaptive noise scaling.
-        std::vector<Particle> propagated_particles;
-        propagated_particles.reserve(track.particles().size());
-        for (const Particle& particle : track.particles()) {
-            Particle new_particle = propagator_->propagate(particle, dt, previous_time, noise_scale);
-            propagated_particles.push_back(new_particle);
+        // Propagate each particle in place. Overwriting the existing cloud avoids allocating a
+        // second vector and the set_particles copy that used to follow it. Element-wise assignment
+        // does not reallocate, so external aliases of the storage remain address-stable; values
+        // change, as they would under any in-place rewrite.
+        std::vector<Particle>& particles = track.mutable_particles();
+        for (Particle& particle : particles) {
+            particle = propagator_->propagate(particle, dt, previous_time, noise_scale);
         }
-        // Replace the track's old particle cloud with the new one.
-        track.set_particles(propagated_particles);
     }
     // No need to call set_tracks(), as we have modified the state directly.
 }
@@ -215,9 +216,11 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
     // list change, and the latter changes favorably (see the S <= 1e-12 note below and the
     // systematic-resampling argument: the stratification guarantee now applies to each particle
     // rather than to each of the k_best_ scattered fragments of that particle's mass).
-    std::vector<Track> updated_tracks;
-    updated_tracks.reserve(num_tracks);
-
+    //
+    // Tracks are mutated in place: existence is written back onto tracks[i], and the resampled
+    // cloud is moved in. That removes the Track copy + set_particles copy + push_back copy that
+    // previously built a parallel updated_tracks vector. predicted_particles is only read until
+    // set_particles runs, so there is no use-after-move of the old cloud.
     for (size_t i = 0; i < num_tracks; ++i) {
         const auto& predicted_particles = tracks[i].particles();
         const size_t num_particles = predicted_particles.size();
@@ -287,13 +290,11 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
 
         const double r_legacy = tracks[i].existence_probability();
         const double r_new = (r_legacy * sum_weights) / (1.0 - r_legacy + r_legacy * sum_weights);
+        tracks[i].set_existence_probability(r_new);
 
         // Counts hypotheses that took a branch, not buckets that ended up non-zero: a hypothesis
         // with weight exactly 0.0 still contributed, and previously produced a non-empty mixture.
         if (contributing_hypotheses == 0 || num_particles == 0) {
-            Track final_track = tracks[i];
-            final_track.set_existence_probability(r_new);
-            updated_tracks.push_back(final_track);
             continue;
         }
 
@@ -337,34 +338,30 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
             resampled_particles.push_back(resampled);
         }
 
-        Track final_track = tracks[i];
-        final_track.set_existence_probability(r_new);
-        final_track.set_particles(resampled_particles);
-        updated_tracks.push_back(final_track);
+        // Move the resampled cloud into the track. This reallocates particles_ and invalidates
+        // any zero-copy NumPy views that still alias the previous storage.
+        tracks[i].set_particles(std::move(resampled_particles));
     }
-    
-    // Track pruning: remove tracks with low existence probability
-    std::vector<Track> pruned_tracks;
-    for (const auto& track : updated_tracks) {
-        if (track.existence_probability() >= prune_threshold_) {
-            pruned_tracks.push_back(track);
-        }
-    }
-    
+
+    // Track pruning: erase-remove in place instead of copying survivors into a new vector.
+    tracks.erase(std::remove_if(tracks.begin(), tracks.end(),
+                                [this](const Track& track) {
+                                    return track.existence_probability() < prune_threshold_;
+                                }),
+                 tracks.end());
+
     // Step 6: Adaptive Birth - Create new tracks from unused measurements
-    std::vector<Track> born_tracks;
-    
     if (!hypotheses.empty() && birth_model_) {
         std::vector<bool> measurement_used(num_meas, false);
         const Hypothesis& best_hypothesis = hypotheses[0];
-        
+
         for (size_t track_idx = 0; track_idx < best_hypothesis.associations.size(); ++track_idx) {
             int meas_idx = best_hypothesis.associations[track_idx];
             if (meas_idx >= 0 && static_cast<size_t>(meas_idx) < num_meas) {
                 measurement_used[meas_idx] = true;
             }
         }
-        
+
         std::vector<Measurement> unused_measurements;
         unused_measurements.reserve(num_meas);
         for (size_t i = 0; i < num_meas; ++i) {
@@ -372,19 +369,16 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
                 unused_measurements.push_back(measurements[i]);
             }
         }
-        
+
         if (!unused_measurements.empty()) {
-            born_tracks = birth_model_->generate_new_tracks(
-                unused_measurements, 
+            std::vector<Track> born_tracks = birth_model_->generate_new_tracks(
+                unused_measurements,
                 current_state_.timestamp());
+            for (auto& new_track : born_tracks) {
+                tracks.push_back(std::move(new_track));
+            }
         }
     }
-    
-    for (auto& new_track : born_tracks) {
-        pruned_tracks.push_back(std::move(new_track));
-    }
-    
-    current_state_.tracks().swap(pruned_tracks);
 }
 
 double SMC_LMB_Tracker::compute_association_likelihood(const Track& track, const Measurement& measurement) const {
