@@ -14,6 +14,7 @@ python -c "import sys; sys.path.insert(0, 'python'); from lmb_engine_loader impo
 python tests/test_two_body_propagator_multistep.py
 python tests/assignments.py
 python tests/test_los_geometry.py
+python tests/test_local_residual_cached_basis.py
 python tests/test_validation_dimensions.py
 python tests/test_sensor_likelihood.py
 python tests/test_adaptive_birth_model.py
@@ -21,9 +22,18 @@ python tests/test_bindings_api.py
 python tests/statistics_helpers.py
 python tests/test_particle_statistics.py
 python tests/test_invariants.py
+python tests/test_mixture_grouping.py
 # Selects its own mode: bitwise against the committed fixtures on the platform that wrote them
 # (x86-64 Linux / libstdc++), portable everywhere else. See the PLATFORM GATING block in the test.
 python tests/test_golden_invariance.py
+python tests/test_run_once_api_surface.py
+# ProcessPoolExecutor Monte Carlo: correctness + speedup. Too expensive in Debug (full 10k-particle
+# runs); Release is the meaningful gate for the parallel path.
+if [[ "${LMB_ENGINE_BUILD:-Release}" == "Debug" ]]; then
+  echo "test_monte_carlo_parallel.py: skipped, it costs minutes in Debug; run it against Release"
+else
+  python tests/test_monte_carlo_parallel.py
+fi
 python tests/test_end_to_end.py
 
 # test_statistical_equivalence.py replaces the bitwise gate off the reference platform, where the

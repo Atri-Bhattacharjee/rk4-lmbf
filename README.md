@@ -272,6 +272,12 @@ python tests/bench_engine.py --compare before.json   # diff against a recorded s
 
 #### Bitwise reproduction is per-platform
 
+**Standing rule for CI/CD:** never require bitwise identity on macOS (or any non-reference
+runner). New tests that pin absolute float digests, OSPA byte heads, or `np.array_equal` against a
+Linux-captured fixture must gate on the reference platform and use portable / `rtol` / statistical
+checks everywhere else — including the macOS GitHub Actions job. Bitwise gates belong only on
+x86-64 Linux / libstdc++.
+
 The committed golden fixtures encode one toolchain's bit pattern, so the bitwise gate is limited to
 the platform they were written on (x86-64 Linux / libstdc++) and `test_golden_invariance.py` selects
 its mode accordingly: bitwise there, `--portable` everywhere else. Two things make the bit pattern a
@@ -417,6 +423,12 @@ CI runs on every push and pull request to `main` on **Linux**, **macOS**, and **
 1. Installs native dependencies (Eigen via apt/brew/vcpkg)
 2. Builds the Release extension with CMake presets
 3. Runs `./scripts/ci-test.sh` (smoke import, propagator, assignment, geometry, validation, likelihood, birth, API and end-to-end tests)
+
+**Do not add bitwise float / digest assertions that must pass on the macOS CI job.** libc++ draws a
+different `normal_distribution` stream from the same seed, so absolute bit patterns from Linux
+fixtures will fail there by design. Keep bitwise checks behind the reference-platform gate (x86-64
+Linux); on macOS use `--portable`, `rtol`, or `test_statistical_equivalence.py`. See
+[Bitwise reproduction is per-platform](#bitwise-reproduction-is-per-platform).
 
 The full Monte Carlo simulation (`python/run.py`) is intentionally excluded from CI because it is too slow for routine checks.
 

@@ -58,12 +58,14 @@ if [[ ${#TESTS[@]} -eq 0 ]]; then
     tests/test_two_body_propagator_multistep.py
     tests/assignments.py
     tests/test_los_geometry.py
+    tests/test_local_residual_cached_basis.py
     tests/test_validation_dimensions.py
     tests/test_sensor_likelihood.py
     tests/test_adaptive_birth_model.py
     tests/test_bindings_api.py
     tests/test_particle_statistics.py
     tests/test_invariants.py
+    tests/test_mixture_grouping.py
     tests/test_golden_invariance.py
   )
 fi

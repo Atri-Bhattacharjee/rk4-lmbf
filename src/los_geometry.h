@@ -201,9 +201,14 @@ inline LosObservation perturbed(const LosObservation& obs, const Vector6& eps) {
  * Direction residual: the predicted direction has chart coordinates B_m^T log_{u_m}(u_p) and the
  * measured one has coordinates 0, hence the minus sign. Rate residual: the predicted angular rate
  * is transported into the measured tangent plane before subtraction.
+ *
+ * @param measured_basis Precomputed tangentBasis(measured.los). Must be identical to that call;
+ *        callers that already have it (e.g. MeasurementLikelihoodCache) pass it to avoid rebuilding
+ *        the basis once per particle.
  */
-inline Vector6 localResidual(const LosObservation& measured, const LosObservation& predicted) {
-    const TangentBasis basis = tangentBasis(measured.los);
+inline Vector6 localResidual(const LosObservation& measured,
+                             const LosObservation& predicted,
+                             const TangentBasis& measured_basis) {
     const Eigen::Vector3d direction_log = logMap(measured.los, predicted.los);
     const Eigen::Vector3d transported_rate = parallelTransport(predicted.los, measured.los, predicted.los_rate);
     const Eigen::Vector3d rate_difference = measured.los_rate - transported_rate;
@@ -211,11 +216,15 @@ inline Vector6 localResidual(const LosObservation& measured, const LosObservatio
     Vector6 residual;
     residual(0) = measured.range - predicted.range;
     residual(1) = measured.range_rate - predicted.range_rate;
-    residual(2) = -basis.col(0).dot(direction_log);
-    residual(3) = -basis.col(1).dot(direction_log);
-    residual(4) = basis.col(0).dot(rate_difference);
-    residual(5) = basis.col(1).dot(rate_difference);
+    residual(2) = -measured_basis.col(0).dot(direction_log);
+    residual(3) = -measured_basis.col(1).dot(direction_log);
+    residual(4) = measured_basis.col(0).dot(rate_difference);
+    residual(5) = measured_basis.col(1).dot(rate_difference);
     return residual;
+}
+
+inline Vector6 localResidual(const LosObservation& measured, const LosObservation& predicted) {
+    return localResidual(measured, predicted, tangentBasis(measured.los));
 }
 
 /**

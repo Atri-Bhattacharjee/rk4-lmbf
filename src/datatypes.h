@@ -31,6 +31,10 @@ struct MeasurementLikelihoodCache {
     double log_norm_factor = 0.0;
     bool is_diagonal = false;
     LocalMeasVector inv_var;
+    //! Geometric part of the measurement, cached once per update so calculate_likelihood need not rebuild it.
+    los::LosObservation measured;
+    //! tangentBasis(measured.los), identical for every particle of this measurement.
+    los::TangentBasis measured_basis = los::TangentBasis::Zero();
 };
 
 /**
@@ -104,16 +108,32 @@ public:
     const std::vector<Particle>& particles() const { return particles_; }
 
     /**
+     * @brief Mutable access to the particle cloud.
+     *
+     * Prefer this (or the move overload of set_particles) when replacing or rewriting the
+     * cloud in place so the vector is not copied. Any reallocation of particles_ invalidates
+     * zero-copy NumPy views that alias it.
+     */
+    std::vector<Particle>& mutable_particles() { return particles_; }
+
+    /**
      * @brief Set the existence probability
      * @param probability New existence probability
      */
     void set_existence_probability(double probability) { existence_probability_ = probability; }
 
     /**
-     * @brief Set the particles
+     * @brief Set the particles (copy)
      * @param particles New particle cloud
      */
     void set_particles(const std::vector<Particle>& particles) { particles_ = particles; }
+
+    /**
+     * @brief Set the particles (move). Prefer this over the copy overload when the caller
+     *        no longer needs its vector.
+     * @param particles New particle cloud
+     */
+    void set_particles(std::vector<Particle>&& particles) { particles_ = std::move(particles); }
 };
 
 /**

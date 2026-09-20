@@ -280,15 +280,3 @@ def chi_square_6_cdf(x: float) -> float:
     """Closed-form CDF of the chi-square distribution with 6 degrees of freedom."""
     half = 0.5 * x
     return 1.0 - np.exp(-half) * (1.0 + half + half * half / 2.0)
-
-
-def random_spd(rng: np.random.Generator, scales, correlation_strength: float = 0.5) -> np.ndarray:
-    """Random SPD matrix with the given marginal standard deviations and O(correlation_strength) correlations."""
-    scales = np.asarray(scales, dtype=float)
-    dim = scales.size
-    a = rng.normal(size=(dim, dim))
-    correlation = a @ a.T
-    d = np.sqrt(np.diag(correlation))
-    correlation = correlation / np.outer(d, d)
-    correlation = (1.0 - correlation_strength) * np.eye(dim) + correlation_strength * correlation
-    return np.outer(scales, scales) * correlation
