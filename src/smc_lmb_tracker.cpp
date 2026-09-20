@@ -133,14 +133,22 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
                 const auto& current_particle = current_particles[p];
                 const double particle_likelihood = sensor_model_->calculate_likelihood(
                     current_particle, measurement, meas_caches[j]);
-                const double updated_weight = current_particle.weight * (particle_likelihood / clutter_intensity_);
+                const double updated_weight = current_particle.weight * particle_likelihood;
                 assoc[p] = updated_weight;
                 total_likelihood += updated_weight;
             }
 
+            // Raw weighted-average likelihood L_ij = sum_p w_p * g_j(x_p). The clutter division
+            // is deliberately NOT folded in here: it cancels exactly in the normalization below,
+            // so each consumer applies its own single 1/kappa -- the cost matrix in Step 3 and the
+            // mixture coefficients in Step 5a. Storing L/kappa is what previously let Step 3
+            // divide by kappa a second time.
             likelihood_matrix(i, j) = total_likelihood;
 
-            if (total_likelihood > 1e-12) {
+            // total_likelihood is raw L, not the L/kappa it was when the division lived in the
+            // loop above, so the floor is scaled by kappa to keep testing the same quantity. This
+            // branch therefore fires for exactly the same (i, j) pairs as before.
+            if (total_likelihood > 1e-12 * clutter_intensity_) {
                 const double inv_total = 1.0 / total_likelihood;
                 for (size_t p = 0; p < num_particles; ++p) {
                     assoc[p] *= inv_total;
@@ -167,7 +175,8 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
         // Detection costs (left block: columns 0 to num_meas-1)
         for (size_t j = 0; j < num_meas; ++j) {
             double likelihood = likelihood_matrix(i, j);
-            // Cost = -ln(P_D * L / κ), where L already includes the weight averaging
+            // Cost = -ln(P_D * L / κ). L is the raw weighted-average likelihood from Step 2,
+            // so the single division by κ below is the only one on this path.
             cost_matrix(i, j) = -std::log(std::max(p_detection_ * likelihood / clutter_intensity_, 1e-12));
         }
         
@@ -256,7 +265,7 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
         }
 
         for (size_t j = 0; j < num_meas; ++j) {
-            assoc_coefficients_[j] *= p_detection_ * likelihood_matrix(i, j);
+            assoc_coefficients_[j] *= p_detection_ * likelihood_matrix(i, j) / clutter_intensity_;
         }
         miss_coefficient *= (1.0 - p_detection_);
 
@@ -381,6 +390,10 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
     }
 }
 
+// Returns the RAW weighted-average likelihood L = sum_p w_p * g(z|x_p), with no clutter
+// intensity and no detection probability applied. That matches what likelihood_matrix holds
+// inside update(); callers reproducing the filter's cost matrix must divide by kappa exactly
+// once themselves (see tests/bench_engine.py::build_cost_matrix).
 double SMC_LMB_Tracker::compute_association_likelihood(const Track& track, const Measurement& measurement) const {
     ensure_models_configured();
     validation::require_measurement(measurement);
