@@ -29,8 +29,10 @@ static StateVector calculate_state_derivative(const StateVector& state_6d) {
     return dydt;
 }
 
-TwoBodyPropagator::TwoBodyPropagator(const Eigen::MatrixXd& process_noise_covariance)
-    : process_noise_covariance_(process_noise_covariance) {
+TwoBodyPropagator::TwoBodyPropagator(const Eigen::MatrixXd& process_noise_covariance,
+                                     std::optional<uint64_t> seed)
+    : process_noise_covariance_(process_noise_covariance),
+      rng_(seed.has_value() ? *seed : std::mt19937_64::result_type(std::random_device{}())) {
     validation::require_covariance_6x6(process_noise_covariance_, "process_noise_covariance");
 
     has_process_noise_ = process_noise_covariance_.trace() > 1e-24;
@@ -59,11 +61,10 @@ Particle TwoBodyPropagator::propagate(const Particle& particle, double dt, doubl
     propagated_particle.state_vector = y1;
 
     if (has_process_noise_ && noise_scale > 1e-12) {
-        static thread_local std::mt19937 gen(std::random_device{}());
         std::normal_distribution<> dist(0.0, 1.0);
         StateVector noise_vec;
         for (int i = 0; i < 6; ++i) {
-            noise_vec(i) = dist(gen);
+            noise_vec(i) = dist(rng_);
         }
         const double std_dev_scale = std::sqrt(noise_scale);
         propagated_particle.state_vector += noise_L_ * noise_vec * std_dev_scale;

@@ -98,6 +98,7 @@ brew install cmake eigen
 |--------|----------|
 | `release` | Normal use (default) |
 | `debug` | Debugging with symbols |
+| `asan` | AddressSanitizer + UndefinedBehaviorSanitizer; drive it via `./scripts/asan-test.sh` |
 
 ```bash
 source ./scripts/cmake-venv-args.sh   # Windows: see scripts/cmake-venv-args.ps1
@@ -116,12 +117,14 @@ Built extensions are written to:
 
 - `python/lmb_engine/Release/` — recommended
 - `python/lmb_engine/Debug/`
+- `python/lmb_engine/Asan/` — sanitizer build, kept separate so it never shadows the others
 
-Optional CMake flag:
+Optional CMake flags:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LMB_ENGINE_ENABLE_VALIDATION` | `OFF` | Keep hot-path validation checks in Release builds |
+| `LMB_ENGINE_SANITIZE` | `OFF` | Instrument with ASan + UBSan. Only the extension is instrumented, so the ASan runtime must be `LD_PRELOAD`ed at run time; use `./scripts/asan-test.sh`, which handles that. |
 
 ### Manual CMake (without presets)
 
@@ -172,6 +175,50 @@ Optional verbose import logging (works with any simulation script):
 LMB_ENGINE_VERBOSE=1 python python/run_once.py
 ```
 
+Both Monte Carlo scripts honour `LMB_NUM_RUNS` (e.g. `LMB_NUM_RUNS=1 python python/run.py` for a quick smoke run).
+
+## Measurement model
+
+A measurement is a line-of-sight observation, not an azimuth/elevation tuple:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `range_` | float | Sensor-to-object distance (m), > 0 |
+| `range_rate_` | float | Radial relative speed (m/s) |
+| `los_` | 3-vector | Unit line-of-sight direction in ECI |
+| `los_rate_` | 3-vector | Line-of-sight angular rate (rad/s), orthogonal to `los_` |
+| `covariance_` | 6x6 | Noise covariance in the **local tangent frame** of `los_` |
+| `sensor_state_` | 6-vector | Sensor ECI state `[x, y, z, vx, vy, vz]` |
+
+The exact conversion is `r = r_s + range * los`, `v = v_s + range_rate * los + range * los_rate`
+(`Measurement.fromCartesian` / `Measurement.toCartesian`), which is smooth everywhere on the sphere: there is
+no azimuth/elevation singularity, no angle wrapping and no `cos(el)` division anywhere in the filter.
+
+`covariance_` is authoritative for the likelihood. It is expressed in the deterministic tangent basis
+`(e1, e2) = tangent_basis(los_)` and ordered as
+
+```
+[d_range (m), d_range_rate (m/s), d_theta1 (rad), d_theta2 (rad), d_omega1 (rad/s), d_omega2 (rad/s)]
+```
+
+with variances in `[m^2, (m/s)^2, rad^2, rad^2, (rad/s)^2, (rad/s)^2]`. The same frame is used by every
+producer and consumer:
+
+- **Simulation** applies noise with `Measurement.perturbed(eps)` (sphere exponential map for the direction,
+  parallel transport for the rate), so an angular sigma of `1e-6 rad` is exactly that at every direction.
+- **Likelihood** (`InOrbitSensorModel`) forms the 6-D residual with `local_residual` (log map + parallel
+  transport) and evaluates a Gaussian with `covariance_`; the six constructor variances only define
+  `defaultCovariance()`.
+- **Birth** (`AdaptiveBirthModel`) samples `eps ~ N(0, birth_covariance_local)` in this frame and maps
+  each sample exactly to ECI, so new-track particles spread in range, angle and rate, never in ECI x/y/z.
+  The constructor takes an optional `seed` for reproducible particle streams.
+
+`Measurement.angularCoordinates()` / `Measurement.fromAnglesAndRates(...)` derive ECI-axis azimuth/elevation
+(and rates) for display or interoperability only; they are singular on the z-axis and are not used by the filter.
+
+The angular-rate sigmas in the simulation scripts (`TRUTH_SIGMA_ANGLE_RATE`, `FILTER_SIGMA_ANGLE_RATE`) are
+placeholders pending sensor characterisation.
+
 ### Tests
 
 Build the extension first, then:
@@ -188,7 +235,62 @@ Or run individual scripts:
 source venv/bin/activate
 python tests/test_two_body_propagator_multistep.py
 python tests/assignments.py
+python tests/test_los_geometry.py          # sphere geometry primitives vs independent references
+python tests/test_validation_dimensions.py # input validation and error messages
+python tests/test_sensor_likelihood.py     # likelihood vs NumPy reference, rotation invariance, chi-square
+python tests/test_adaptive_birth_model.py  # birth covariance recovery and spread statistics
+python tests/test_bindings_api.py          # Python API surface
+python tests/statistics_helpers.py         # self-test of the Welch/KS implementations
+python tests/test_particle_statistics.py   # cloud statistics vs NumPy, zero-copy view aliasing
+python tests/test_invariants.py            # per-step structural invariants of a seeded run
+python tests/test_golden_invariance.py     # digest vs the committed fixture (see below)
+python tests/test_end_to_end.py            # short tracker runs, incl. a pole-aligned scene
 ```
+
+`LMB_ENGINE_BUILD=Debug` (or `Release`, or `Asan`) forces the loader to pick a specific build
+directory.
+
+### Determinism and regression harness
+
+`TwoBodyPropagator`, `AdaptiveBirthModel` and `SMC_LMB_Tracker` all take an optional `seed`. With
+those set plus `np.random.seed`, a whole simulation becomes a pure function of one integer, which
+is what the regression harness is built on. Debug, Release and the sanitizer build all produce
+bitwise-identical results *on one toolchain*.
+
+```bash
+python tests/test_golden_invariance.py               # comparison against tests/fixtures/
+python tests/test_golden_invariance.py --exact       # force bitwise
+python tests/test_golden_invariance.py --rtol 1e-9   # tolerant, for a deliberate FP-order change
+python tests/test_golden_invariance.py --portable    # force the platform-independent subset
+python tests/test_golden_invariance.py --write       # regenerate the fixtures
+python tests/test_statistical_equivalence.py         # 48 seeds/arm, Welch t + KS on mean OSPA
+python tests/bench_engine.py --json before.json      # record hot-path timings and peak RSS
+python tests/bench_engine.py --compare before.json   # diff against a recorded set
+./scripts/gate.sh                                    # Release + Debug suites, statistics, benchmark
+./scripts/asan-test.sh                               # ASan + UBSan build and suite
+```
+
+#### Bitwise reproduction is per-platform
+
+The committed golden fixtures encode one toolchain's bit pattern, so the bitwise gate is limited to
+the platform they were written on (x86-64 Linux / libstdc++) and `test_golden_invariance.py` selects
+its mode accordingly: bitwise there, `--portable` everywhere else. Two things make the bit pattern a
+property of the toolchain rather than of the filter:
+
+* **The RNG stream.** `std::mt19937_64` is specified bit-for-bit, but `std::normal_distribution` and
+  `std::uniform_real_distribution` are not. libstdc++ and the MSVC STL agree; libc++ (macOS) draws a
+  different sequence from the same seed, and a run diverges on its first birth.
+* **Floating-point rounding.** Clang contracts `a * b + c` into a single-rounding `fma` wherever the
+  ISA has one (always, on arm64), Apple's libm is not bit-identical to glibc's, and Eigen reduces in
+  NEON lane order rather than SSE lane order.
+
+The first of those is a different draw from the same distribution, not a rounding difference, so no
+`--rtol` absorbs it. Portable mode therefore checks what holds anywhere — the NumPy-driven
+measurement counts, that the filter is still tracking, and run-to-run repeatability — and prints the
+observed drift for the log. The numerical gate off the reference platform is
+`test_statistical_equivalence.py`, which `ci-test.sh` and `ci-test.ps1` run there for exactly that
+reason (at `--alpha 1e-4`, since it runs on every PR). On the reference platform it stays out of
+`ci-test.sh`: the bitwise gate already covers it, and in Debug it costs minutes.
 
 ### Smoke import
 
@@ -211,6 +313,8 @@ rk4-lmbf/
 │   └── workflows/
 │       └── ci.yml              # Linux, macOS, Windows build + test
 ├── scripts/
+│   ├── gate.sh                 # full pre-commit gate: both builds, statistics, benchmark
+│   ├── asan-test.sh            # ASan + UBSan build and suite
 │   ├── build.sh                # Linux/macOS: venv + configure + build
 │   ├── build.ps1               # Windows build helper
 │   ├── cmake-venv-args.sh      # resolve venv Python & pybind11 for CMake
@@ -220,11 +324,13 @@ rk4-lmbf/
 ├── src/                        # C++ SMC-LMB filter engine
 │   ├── main.cpp                # pybind11 module bindings
 │   ├── smc_lmb_tracker.{h,cpp} # core LMB filter
+│   ├── los_geometry.h          # tangent basis, exp/log maps, transport, observe/toCartesian
 │   ├── adaptive_birth_model.{h,cpp}
 │   ├── in_orbit_sensor_model.{h,cpp}
 │   ├── two_body_propagator.{h,cpp}
 │   ├── assignment.{h,cpp}      # K-best data association (Munkres LAP)
 │   ├── metrics.{h,cpp}
+│   ├── particle_statistics.h   # weighted mean/covariance of a particle cloud
 │   ├── munkres.{h,cpp}         # linear assignment (header-included)
 │   ├── matrix.{h,cpp}          # matrix utilities (header-included)
 │   ├── datatypes.h
@@ -237,10 +343,26 @@ rk4-lmbf/
 │   ├── 2026_ieee_aerospace.py  # paper config (K_BEST=100)
 │   └── lmb_engine/             # built extension output (.so / .pyd)
 │       ├── Release/            # recommended built extension
-│       └── Debug/
+│       ├── Debug/
+│       └── Asan/               # sanitizer build (scripts/asan-test.sh)
 ├── tests/
 │   ├── test_two_body_propagator_multistep.py
-│   └── assignments.py
+│   ├── assignments.py
+│   ├── reference_geometry.py   # independent long-double/NumPy references used by the tests
+│   ├── test_los_geometry.py
+│   ├── test_validation_dimensions.py
+│   ├── test_sensor_likelihood.py
+│   ├── test_adaptive_birth_model.py
+│   ├── test_bindings_api.py
+│   ├── test_end_to_end.py
+│   ├── harness_scenario.py     # fully-seeded scenario runner + digest, shared by the harnesses
+│   ├── statistics_helpers.py   # Welch t-test and two-sample KS, implemented on NumPy
+│   ├── test_particle_statistics.py     # cloud statistics and zero-copy view aliasing
+│   ├── test_invariants.py      # per-step structural invariants
+│   ├── test_golden_invariance.py       # bitwise/rtol digest regression
+│   ├── test_statistical_equivalence.py # distributional equivalence vs a committed baseline
+│   ├── bench_engine.py         # hot-path timings and peak RSS
+│   └── fixtures/               # committed golden digests, statistical baseline, bench baseline
 └── external/                   # optional git submodules (not required for default build)
     ├── astro/                  # openastro propagation library
     ├── sgp4/                   # SGP4 propagator
@@ -294,7 +416,7 @@ CI runs on every push and pull request to `main` on **Linux**, **macOS**, and **
 
 1. Installs native dependencies (Eigen via apt/brew/vcpkg)
 2. Builds the Release extension with CMake presets
-3. Runs `./scripts/ci-test.sh` (smoke import, propagator test, assignment tests)
+3. Runs `./scripts/ci-test.sh` (smoke import, propagator, assignment, geometry, validation, likelihood, birth, API and end-to-end tests)
 
 The full Monte Carlo simulation (`python/run.py`) is intentionally excluded from CI because it is too slow for routine checks.
 

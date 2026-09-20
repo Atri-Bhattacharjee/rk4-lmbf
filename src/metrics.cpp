@@ -1,21 +1,9 @@
 #include "metrics.h"
 #include "assignment.h"
+#include "particle_statistics.h"
 #include <cmath>
 #include <algorithm>
 #include <vector>
-
-static StateVector mean_state(const Track& track) {
-    const auto& particles = track.particles();
-    if (particles.empty()) return StateVector::Zero();
-    StateVector sum = StateVector::Zero();
-    double total_weight = 0.0;
-    for (const auto& p : particles) {
-        sum += p.state_vector * p.weight;
-        total_weight += p.weight;
-    }
-    if (total_weight == 0.0) return StateVector::Zero();
-    return sum / total_weight;
-}
 
 double calculate_ospa_distance(const std::vector<Track>& tracks,
                                const std::vector<Eigen::VectorXd>& ground_truths,
@@ -26,7 +14,7 @@ double calculate_ospa_distance(const std::vector<Track>& tracks,
     std::vector<StateVector> track_means;
     track_means.reserve(m);
     for (const auto& track : tracks) {
-        StateVector mean = mean_state(track);
+        StateVector mean = particle_stats::weighted_mean(track);
         if (!ground_truths.empty() && mean.size() != ground_truths[0].size()) {
             return cutoff;
         }

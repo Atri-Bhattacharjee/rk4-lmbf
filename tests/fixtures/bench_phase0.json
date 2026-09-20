@@ -1,0 +1,55 @@
+{
+  "config": {
+    "num_particles": 10000,
+    "k_best": 100,
+    "repeats": 21,
+    "warmups": 2,
+    "num_tracks": 3,
+    "num_measurements": 3,
+    "hypotheses_returned": 100
+  },
+  "calibration_min_ms": 15.823588000785094,
+  "timings_ms": {
+    "calibration (numpy sin)": {
+      "median_ms": 15.909410998574458,
+      "min_ms": 15.823588000785094,
+      "note": "engine-independent reference"
+    },
+    "predict": {
+      "median_ms": 4.263302005711012,
+      "min_ms": 4.22004000574816,
+      "note": "3 tracks, net of restore"
+    },
+    "set_tracks (restore)": {
+      "median_ms": 0.05992299702484161,
+      "min_ms": 0.059642996347974986,
+      "note": "3 cloud copies"
+    },
+    "update": {
+      "median_ms": 12.944898000569083,
+      "min_ms": 12.587270997755695,
+      "note": "3x3, net of restore"
+    },
+    "track.particles() copy": {
+      "median_ms": 4.336801001045387,
+      "min_ms": 4.268912998668384,
+      "note": "all 3 tracks"
+    },
+    "compute_track_mean (Python)": {
+      "median_ms": 13.647268002387136,
+      "min_ms": 13.495520994183607,
+      "note": "all 3 tracks"
+    },
+    "solve_assignment": {
+      "median_ms": 0.25999200443038717,
+      "min_ms": 0.2333209995413199,
+      "note": "3x6, 100 hypotheses returned"
+    },
+    "calculate_ospa_distance": {
+      "median_ms": 0.051297000027261674,
+      "min_ms": 0.05092700303066522,
+      "note": ""
+    }
+  },
+  "peak_rss_mb": 132.45703125
+}

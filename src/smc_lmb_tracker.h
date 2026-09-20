@@ -11,6 +11,9 @@
 
 #include <vector>
 #include <memory>
+#include <cstdint>
+#include <optional>
+#include <random>
 #include "datatypes.h"
 #include "models.h"
 #include "assignment.h"
@@ -36,6 +39,7 @@ private:
     double p_detection_;                                //!< Detection probability (P_D) per Reuter LMB formulation
     double noise_decay_rate_;                           //!< Process noise annealing decay rate (lambda)
     double noise_min_scale_;                            //!< Process noise annealing minimum scale factor (alpha_min)
+    mutable std::mt19937_64 resample_rng_;              //!< Resampler stream; seeded from the ctor or std::random_device
 
     void ensure_models_configured() const;
 
@@ -43,7 +47,7 @@ public:
     /**
      * @brief Default constructor
      */
-    SMC_LMB_Tracker() : current_state_(0.0, std::vector<Track>{}), propagator_(nullptr), sensor_model_(nullptr), birth_model_(nullptr), survival_probability_(0.0), k_best_(100), prune_threshold_(0.01), clutter_intensity_(1.0e-6), p_detection_(0.99), noise_decay_rate_(0.0), noise_min_scale_(1.0) {}
+    SMC_LMB_Tracker() : current_state_(0.0, std::vector<Track>{}), propagator_(nullptr), sensor_model_(nullptr), birth_model_(nullptr), survival_probability_(0.0), k_best_(100), prune_threshold_(0.01), clutter_intensity_(1.0e-6), p_detection_(0.99), noise_decay_rate_(0.0), noise_min_scale_(1.0), resample_rng_(std::mt19937_64::result_type(std::random_device{}())) {}
 
     /**
      * @brief Construct a new SMC_LMB_Tracker object
@@ -58,6 +62,8 @@ public:
      * @param p_detection Detection probability (P_D) for the sensor model
      * @param noise_decay_rate Process noise annealing decay rate (lambda, per second)
      * @param noise_min_scale Process noise annealing minimum scale factor (alpha_min)
+     * @param seed Optional seed for the resampler's random stream. When omitted the stream is
+     *             seeded from std::random_device, which is the historical behavior.
      */
     SMC_LMB_Tracker(std::shared_ptr<IOrbitPropagator> propagator,
                    std::shared_ptr<ISensorModel> sensor_model,
@@ -68,7 +74,8 @@ public:
                    double clutter_intensity,
                    double p_detection,
                    double noise_decay_rate,
-                   double noise_min_scale);
+                   double noise_min_scale,
+                   std::optional<uint64_t> seed = std::nullopt);
 
     /**
      * @brief Run the predict step of the filter

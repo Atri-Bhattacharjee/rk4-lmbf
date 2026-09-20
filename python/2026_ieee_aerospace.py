@@ -9,6 +9,9 @@ Scenario:
 - Sensor at Earth's center (mathematical testing configuration)
 - 100 time steps at 60-second intervals
 
+Measurements are (range, range rate, line-of-sight unit vector, line-of-sight angular rate) with a
+6x6 noise covariance in the local tangent frame of the measured direction (see the constants below).
+
 The simulation uses a "dual-noise" strategy:
 - Truth generation uses low noise (high precision sensor)
 - Filter model uses inflated noise (wide acceptance gate for birth convergence)
@@ -44,17 +47,44 @@ K_BEST = 100             # Number of K-best assignment hypotheses
 NOISE_DECAY_RATE = 0.001  # Decay rate (lambda), per second - noise drops significantly over ~5 mins
 NOISE_MIN_SCALE = 0.001  # Minimum scale factor (alpha_min) - steady-state is 0.1% of birth noise
 
+# --- Measurement representation ---
+# A measurement is (range, range rate, unit line-of-sight vector, line-of-sight angular-rate vector).
+# All measurement noise lives in the local tangent frame of the measured direction, with basis
+# (e1, e2) = lmb_engine.tangent_basis(los), ordered as
+#   [d_range (m), d_range_rate (m/s), d_theta1 (rad), d_theta2 (rad), d_omega1 (rad/s), d_omega2 (rad/s)]
+# There is no azimuth/elevation anywhere in the filter, hence no pole singularity.
+
 # --- Truth Generation Noise (High Precision) ---
 # These represent the actual sensor precision for generating measurements
 TRUTH_SIGMA_RANGE = 10.0       # meters
 TRUTH_SIGMA_RANGE_RATE = 1.0   # m/s
 TRUTH_SIGMA_ANGLE = 1e-6       # radians (~7m at LEO)
+TRUTH_SIGMA_ANGLE_RATE = 1e-7  # rad/s -- PLACEHOLDER, no sensor characterisation behind this value yet
 
 # --- Filter Model Noise (Inflated) ---
 # These are what the filter "believes" the noise is - inflated for robustness
 FILTER_SIGMA_RANGE = 5000.0      # meters
 FILTER_SIGMA_RANGE_RATE = 500.0  # m/s
 FILTER_SIGMA_ANGLE = 1e-2      # radians (~7km gate at LEO)
+FILTER_SIGMA_ANGLE_RATE = 1e-3  # rad/s -- PLACEHOLDER (~700 m/s transverse gate at 700 km)
+
+# Six-component sigma vectors in local tangent-frame order
+TRUTH_SIGMAS = np.array([
+    TRUTH_SIGMA_RANGE,
+    TRUTH_SIGMA_RANGE_RATE,
+    TRUTH_SIGMA_ANGLE,
+    TRUTH_SIGMA_ANGLE,
+    TRUTH_SIGMA_ANGLE_RATE,
+    TRUTH_SIGMA_ANGLE_RATE,
+])
+FILTER_SIGMAS = np.array([
+    FILTER_SIGMA_RANGE,
+    FILTER_SIGMA_RANGE_RATE,
+    FILTER_SIGMA_ANGLE,
+    FILTER_SIGMA_ANGLE,
+    FILTER_SIGMA_ANGLE_RATE,
+    FILTER_SIGMA_ANGLE_RATE,
+])
 
 # --- Process Noise Covariance ---
 # Filter propagator noise (small perturbations)
@@ -67,19 +97,17 @@ Q_FILTER = np.diag([
     50.0**2     # vz velocity variance ((m/s)^2)
 ])
 
-# Birth model noise (high velocity variance for eccentricity)
-Q_BIRTH = np.diag([
-    1000.0**2,    # x position variance (m^2)
-    1000.0**2,    # y position variance (m^2)
-    1000.0**2,    # z position variance (m^2)
-    500.0**2,   # vx velocity variance ((m/s)^2) - captures eccentricity
-    500.0**2,   # vy velocity variance ((m/s)^2)
-    500.0**2    # vz velocity variance ((m/s)^2)
+# --- Birth Covariance (local tangent frame of the measured direction) ---
+# New-track particles are the measurement plus Gaussian noise with this covariance, mapped exactly to
+# ECI. The spread is therefore range-, angle- and rate-wise, never in ECI x/y/z.
+BIRTH_COVARIANCE_LOCAL = np.diag([
+    1000.0**2,  # range variance (m^2)
+    500.0**2,   # range-rate variance ((m/s)^2)
+    1e-4**2,    # angle variance along e1 (rad^2)
+    1e-4**2,    # angle variance along e2 (rad^2)
+    5e-5**2,    # angular-rate variance along e1 ((rad/s)^2)
+    5e-5**2,    # angular-rate variance along e2 ((rad/s)^2)
 ])
-
-# --- Sensor Configuration ---
-# Sensor at Earth's center (for mathematical testing)
-SENSOR_STATE = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
 # =============================================================================
 # SCENARIO DEFINITION
@@ -93,6 +121,10 @@ MU_EARTH = 3.986004418e14  # Earth gravitational parameter (m^3/s^2)
 # Orbital radius and circular velocity
 ORBIT_RADIUS = R_EARTH + ALTITUDE  # ~6771 km
 V_CIRCULAR = np.sqrt(MU_EARTH / ORBIT_RADIUS)  # ~7672 m/s
+
+# --- Sensor Configuration ---
+# Sensor at Earth's center (for mathematical testing)
+SENSOR_STATE = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
 # Define 3 ground truth objects with staggered births
 # Format: (object_id, birth_step, initial_state_vector)
@@ -189,9 +221,9 @@ def generate_measurements(active_truths, sensor_state, current_time):
     
     For each active truth:
     1. Roll for detection (skip if miss based on P_DETECTION)
-    2. Convert ECI position to spherical measurement
-    3. Add Gaussian noise using TRUTH sigmas
-    4. Create Measurement object with FILTER covariance (inflated)
+    2. Form the exact (range, range rate, line of sight, line-of-sight rate) observation
+    3. Add Gaussian noise using TRUTH sigmas in the local tangent frame of the true direction
+    4. Attach the FILTER covariance (inflated) in the same frame and ordering
     
     Args:
         active_truths: List of (object_id, state_vector) tuples
@@ -209,36 +241,18 @@ def generate_measurements(active_truths, sensor_state, current_time):
             # Missed detection - skip this object
             continue
         
-        # Convert truth state to measurement space (perfect measurement)
-        # Returns [range, range_rate, azimuth, elevation]
-        perfect_meas = lmb_engine.Measurement.cartesianToMeasurement(
-            truth_state, sensor_state
+        # Exact observation of the truth, then TRUTH-sigma noise applied in the local tangent frame
+        # [d_range, d_range_rate, d_theta1, d_theta2, d_omega1, d_omega2] (sphere exponential map for the
+        # direction, parallel transport for the angular rate). This is where the actual sensor precision enters.
+        measurement = lmb_engine.Measurement.fromCartesian(truth_state, sensor_state).perturbed(
+            np.random.normal(size=6) * TRUTH_SIGMAS
         )
-        
-        # Add noise using TRUTH sigmas (actual sensor precision)
-        noise = np.array([
-            np.random.normal(0, TRUTH_SIGMA_RANGE),
-            np.random.normal(0, TRUTH_SIGMA_RANGE_RATE),
-            np.random.normal(0, TRUTH_SIGMA_ANGLE),
-            np.random.normal(0, TRUTH_SIGMA_ANGLE)
-        ])
-        noisy_meas = perfect_meas + noise
-        
-        # Create Measurement object
-        measurement = lmb_engine.Measurement()
         measurement.timestamp_ = current_time
-        measurement.value_ = noisy_meas
-        measurement.sensor_state_ = sensor_state
         measurement.sensor_id_ = "sensor_0"
         
         # CRITICAL: Set covariance using FILTER sigmas (inflated)
         # This tells the filter "my data is rough" -> wide acceptance gate
-        measurement.covariance_ = np.diag([
-            FILTER_SIGMA_RANGE**2,
-            FILTER_SIGMA_RANGE_RATE**2,
-            FILTER_SIGMA_ANGLE**2,
-            FILTER_SIGMA_ANGLE**2
-        ])
+        measurement.covariance_ = np.diag(FILTER_SIGMAS**2)
         
         measurements.append(measurement)
     
@@ -248,37 +262,27 @@ def generate_measurements(active_truths, sensor_state, current_time):
 def compute_track_mean(track):
     """
     Compute the weighted mean state of a track's particles.
-    
+
+    Delegates to Track.mean_state(), which implements the same contract in C++: the weighted mean,
+    falling back to the unweighted mean when the total weight is at or below 1e-12, and zeros for an
+    empty cloud. The previous NumPy version cost ~13 ms per step for three 10,000-particle tracks,
+    almost all of it converting each particle into a Python object.
+
     Args:
         track: lmb_engine.Track object
-        
+
     Returns:
         numpy array: 6D mean state vector
     """
-    particles = track.particles()
-    if len(particles) == 0:
-        return np.zeros(6)
-    
-    states = np.array([p.state_vector for p in particles])
-    weights = np.array([p.weight for p in particles])
-    
-    # Normalize weights (should already sum to 1, but be robust)
-    weight_sum = np.sum(weights)
-    if weight_sum > 1e-12:
-        weights = weights / weight_sum
-    else:
-        weights = np.ones(len(particles)) / len(particles)
-    
-    # Weighted average
-    mean_state = np.average(states, weights=weights, axis=0)
-    return mean_state
+    return np.asarray(track.mean_state(), dtype=np.float64).reshape(6)
 
 
 # =============================================================================
 # MONTE CARLO CONFIGURATION
 # =============================================================================
 
-NUM_MONTE_CARLO = 20  # Number of Monte Carlo runs
+# Number of Monte Carlo runs; override with the LMB_NUM_RUNS environment variable (e.g. for smoke tests)
+NUM_MONTE_CARLO = int(os.environ.get("LMB_NUM_RUNS", "20"))
 
 
 # =============================================================================
@@ -321,19 +325,15 @@ def run_single_simulation(verbose=False):
     # Filter propagator (with process noise)
     filter_propagator = lmb_engine.TwoBodyPropagator(Q_FILTER)
     
-    # Sensor model (using FILTER variances - inflated)
-    sensor_model = lmb_engine.InOrbitSensorModel(
-        FILTER_SIGMA_RANGE**2,
-        FILTER_SIGMA_RANGE_RATE**2,
-        FILTER_SIGMA_ANGLE**2,
-        FILTER_SIGMA_ANGLE**2
-    )
+    # Sensor model (using FILTER variances - inflated). Measurement.covariance_ is authoritative for the
+    # likelihood; these six variances define the model's defaultCovariance() in the same frame/order.
+    sensor_model = lmb_engine.InOrbitSensorModel(*FILTER_SIGMAS**2)
     
-    # Birth model (tangent fan initialization)
+    # Birth model: measurement + local tangent-frame Gaussian noise, mapped exactly to ECI
     birth_model = lmb_engine.AdaptiveBirthModel(
         NUM_PARTICLES,
         P_BIRTH,
-        Q_BIRTH
+        BIRTH_COVARIANCE_LOCAL
     )
     
     # Main tracker
