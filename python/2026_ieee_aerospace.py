@@ -289,7 +289,7 @@ NUM_MONTE_CARLO = int(os.environ.get("LMB_NUM_RUNS", "20"))
 # SINGLE SIMULATION
 # =============================================================================
 
-def run_single_simulation(verbose=False):
+def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
     """
     Run a single SMC-LMB filter simulation.
     
@@ -299,12 +299,17 @@ def run_single_simulation(verbose=False):
     
     Args:
         verbose: If True, print detailed progress information
+        collect_track_errors: When False, skip Object-1 component-error work.
+        seed: Optional integer. When set, seeds NumPy and the filter/birth/resampler RNGs.
         
     Returns:
         tuple: (ospa_results, track_error_history)
             - ospa_results: OSPA distance at each time step (length NUM_STEPS)
             - track_error_history: 6D error vectors for Object 1 (shape NUM_STEPS x 6)
     """
+    if seed is not None:
+        np.random.seed(seed)
+
     if verbose:
         print("=" * 60)
         print("SMC-LMB Filter Validation Simulation")
@@ -319,11 +324,16 @@ def run_single_simulation(verbose=False):
     # Step 1: Initialize Models and Tracker
     # -------------------------------------------------------------------------
     
-    # Truth propagator (zero noise for deterministic motion)
-    truth_propagator = get_ground_truth_propagator()
+    # Truth propagator (zero noise for deterministic motion). When seed is set, pin it too:
+    # the epsilon noise matrix still has a positive trace, so an unseeded instance draws from
+    # random_device and breaks reproducibility.
+    if seed is None:
+        truth_propagator = get_ground_truth_propagator()
+    else:
+        truth_propagator = lmb_engine.TwoBodyPropagator(np.eye(6) * 1e-18, seed=seed)
     
     # Filter propagator (with process noise)
-    filter_propagator = lmb_engine.TwoBodyPropagator(Q_FILTER)
+    filter_propagator = lmb_engine.TwoBodyPropagator(Q_FILTER, seed=seed)
     
     # Sensor model (using FILTER variances - inflated). Measurement.covariance_ is authoritative for the
     # likelihood; these six variances define the model's defaultCovariance() in the same frame/order.
@@ -333,7 +343,8 @@ def run_single_simulation(verbose=False):
     birth_model = lmb_engine.AdaptiveBirthModel(
         NUM_PARTICLES,
         P_BIRTH,
-        BIRTH_COVARIANCE_LOCAL
+        BIRTH_COVARIANCE_LOCAL,
+        seed=seed,
     )
     
     # Main tracker
@@ -347,7 +358,8 @@ def run_single_simulation(verbose=False):
         CLUTTER_INTENSITY,
         P_DETECTION,
         NOISE_DECAY_RATE,
-        NOISE_MIN_SCALE
+        NOISE_MIN_SCALE,
+        seed=seed,
     )
     
     # -------------------------------------------------------------------------
@@ -421,30 +433,31 @@ def run_single_simulation(verbose=False):
         # ---------------------------------------------------------------------
         # E2. TRACK ERROR FOR OBJECT 1 (Figure 3 data)
         # ---------------------------------------------------------------------
-        # Find Truth Object 1
-        truth_obj1_state = None
-        for obj_id, state in active_ground_truths:
-            if obj_id == 1:
-                truth_obj1_state = state
-                break
-        
-        if truth_obj1_state is not None and len(tracks) > 0:
-            # Find the closest track to Truth Object 1 (by position distance)
-            min_dist = float('inf')
-            best_track = None
-            for track in tracks:
-                track_mean = compute_track_mean(track)
-                pos_dist = np.linalg.norm(track_mean[:3] - truth_obj1_state[:3])
-                if pos_dist < min_dist:
-                    min_dist = pos_dist
-                    best_track = track_mean
+        if collect_track_errors:
+            # Find Truth Object 1
+            truth_obj1_state = None
+            for obj_id, state in active_ground_truths:
+                if obj_id == 1:
+                    truth_obj1_state = state
+                    break
             
-            # Compute component-wise error: Track - Truth
-            error_vector = best_track - truth_obj1_state
-            track_error_history.append(error_vector)
-        else:
-            # Object 1 doesn't exist yet or no tracks - append zeros
-            track_error_history.append(np.zeros(6))
+            if truth_obj1_state is not None and len(tracks) > 0:
+                # Find the closest track to Truth Object 1 (by position distance)
+                min_dist = float('inf')
+                best_track = None
+                for track in tracks:
+                    track_mean = compute_track_mean(track)
+                    pos_dist = np.linalg.norm(track_mean[:3] - truth_obj1_state[:3])
+                    if pos_dist < min_dist:
+                        min_dist = pos_dist
+                        best_track = track_mean
+                
+                # Compute component-wise error: Track - Truth
+                error_vector = best_track - truth_obj1_state
+                track_error_history.append(error_vector)
+            else:
+                # Object 1 doesn't exist yet or no tracks - append zeros
+                track_error_history.append(np.zeros(6))
         
         # ---------------------------------------------------------------------
         # F. METRIC CALCULATION
@@ -502,6 +515,31 @@ def run_single_simulation(verbose=False):
 # MAIN EXECUTION (MONTE CARLO DRIVER)
 # =============================================================================
 
+def _ieee_derive_run_seeds(master_seed, num_runs):
+    children = np.random.SeedSequence(int(master_seed)).spawn(int(num_runs))
+    return [int(child.generate_state(1, dtype=np.uint32)[0]) for child in children]
+
+
+def _ieee_resolve_max_workers():
+    env = os.environ.get("LMB_NUM_WORKERS")
+    if env is not None and str(env).strip() != "":
+        return max(1, int(env))
+    return max(1, int(os.cpu_count() or 1))
+
+
+def _ieee_monte_carlo_worker(payload):
+    """Top-level worker for ProcessPoolExecutor (picklable under spawn)."""
+    run_index, seed = payload
+    ospa, errors = run_single_simulation(
+        verbose=False,
+        collect_track_errors=(run_index == 0),
+        seed=int(seed),
+    )
+    ospa_arr = np.asarray(ospa, dtype=np.float64)
+    err_arr = np.asarray(errors, dtype=np.float64) if run_index == 0 else None
+    return int(run_index), ospa_arr, err_arr
+
+
 def main():
     """
     Monte Carlo simulation driver.
@@ -510,6 +548,17 @@ def main():
     - Figure 1: All individual runs overlaid (thin cyan lines)
     - Figure 2: Average performance (thick black line)
     """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import multiprocessing as mp
+
+    master_env = os.environ.get("LMB_MC_SEED")
+    if master_env is not None and str(master_env).strip() != "":
+        master_seed = int(master_env)
+    else:
+        master_seed = int(np.random.SeedSequence().entropy)
+    max_workers = _ieee_resolve_max_workers()
+    run_seeds = _ieee_derive_run_seeds(master_seed, NUM_MONTE_CARLO)
+
     print("=" * 60)
     print("SMC-LMB Monte Carlo Analysis")
     print("=" * 60)
@@ -517,6 +566,8 @@ def main():
     print(f"  Monte Carlo Runs: {NUM_MONTE_CARLO}")
     print(f"  Steps per Run: {NUM_STEPS}, DT: {DT}s")
     print(f"  Particles: {NUM_PARTICLES}")
+    print(f"  Master seed: {master_seed}")
+    print(f"  Workers: {max_workers}" + (" (serial)" if max_workers == 1 else ""))
     print("=" * 60)
     
     # -------------------------------------------------------------------------
@@ -524,25 +575,43 @@ def main():
     # -------------------------------------------------------------------------
     
     print("\nRunning Monte Carlo simulations...")
-    all_run_data = []
-    representative_errors = None  # Store error history from first run for Figure 3
-    
-    for i in range(NUM_MONTE_CARLO):
-        ospa_results, track_error_history = run_single_simulation(verbose=False)
-        all_run_data.append(ospa_results)
-        
-        # Save error history from first run only (for Figure 3)
-        if i == 0:
-            representative_errors = np.array(track_error_history)
-        
-        print(f"Run {i+1}/{NUM_MONTE_CARLO} complete - Final OSPA: {ospa_results[-1]:.1f}m")
+    results_by_index = [None] * NUM_MONTE_CARLO
+    representative_errors = None
+    finished = 0
+    payloads = [(i, run_seeds[i]) for i in range(NUM_MONTE_CARLO)]
+
+    def _store(run_index, ospa_results, track_error_history):
+        nonlocal representative_errors, finished
+        results_by_index[run_index] = ospa_results
+        if run_index == 0:
+            representative_errors = track_error_history
+        finished += 1
+        print(
+            f"Run {run_index + 1}/{NUM_MONTE_CARLO} complete - Final OSPA: {ospa_results[-1]:.1f}m "
+            f"({finished}/{NUM_MONTE_CARLO} finished)"
+        )
+
+    if max_workers == 1:
+        for payload in payloads:
+            run_index, ospa_results, track_error_history = _ieee_monte_carlo_worker(payload)
+            _store(run_index, ospa_results, track_error_history)
+    else:
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
+            futures = {
+                executor.submit(_ieee_monte_carlo_worker, payload): payload[0]
+                for payload in payloads
+            }
+            for future in as_completed(futures):
+                run_index, ospa_results, track_error_history = future.result()
+                _store(run_index, ospa_results, track_error_history)
+
+    # Convert to 2D numpy array: shape (NUM_MONTE_CARLO, NUM_STEPS), ordered by run index
+    all_run_data = np.stack(results_by_index, axis=0)
     
     # -------------------------------------------------------------------------
     # Phase 2: Statistical Calculation
     # -------------------------------------------------------------------------
-    
-    # Convert to 2D numpy array: shape (NUM_MONTE_CARLO, NUM_STEPS)
-    all_run_data = np.array(all_run_data)
     
     # Compute column-wise mean (average OSPA at each time step)
     mean_ospa = np.mean(all_run_data, axis=0)
@@ -673,7 +742,5 @@ def main():
 
 
 if __name__ == "__main__":
-    # No seed - allow OS entropy for true Monte Carlo randomness
-    
-    # Run Monte Carlo analysis
+    # Per-run seeds are derived from LMB_MC_SEED (or a one-shot entropy master).
     all_data, mean_data = main()

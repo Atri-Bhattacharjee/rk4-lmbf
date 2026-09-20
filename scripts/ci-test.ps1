@@ -23,6 +23,12 @@ python tests/test_invariants.py
 # (x86-64 Linux / libstdc++), portable here. See the PLATFORM GATING block in the test.
 python tests/test_golden_invariance.py
 python tests/test_run_once_api_surface.py
+# ProcessPoolExecutor Monte Carlo: correctness + speedup. Too expensive in Debug.
+if ($env:LMB_ENGINE_BUILD -eq "Debug") {
+    Write-Host "test_monte_carlo_parallel.py: skipped, it costs minutes in Debug; run it against Release"
+} else {
+    python tests/test_monte_carlo_parallel.py
+}
 python tests/test_end_to_end.py
 
 # test_statistical_equivalence.py replaces the bitwise gate here, since Windows is never the

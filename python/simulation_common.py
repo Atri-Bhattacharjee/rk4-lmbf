@@ -5,6 +5,7 @@ python/2026_ieee_aerospace.py is intentionally independent of this module.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import numpy as np
 
@@ -317,6 +318,106 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
     return ospa_results, track_error_history
 
 
+# =============================================================================
+# MONTE CARLO BATCH (sequential or ProcessPoolExecutor)
+# =============================================================================
+
+
+def derive_run_seeds(master_seed: int, num_runs: int) -> list[int]:
+    """Explicit per-run seeds derived from a master seed (order-stable, independent of workers)."""
+    children = np.random.SeedSequence(int(master_seed)).spawn(int(num_runs))
+    # uint32 so the same integer is valid for np.random.seed and the C++ mt19937_64 seed argument.
+    return [int(child.generate_state(1, dtype=np.uint32)[0]) for child in children]
+
+
+def resolve_max_workers(max_workers: int | None = None) -> int:
+    """Resolve worker count: argument, else LMB_NUM_WORKERS, else cpu_count. 1 means serial."""
+    if max_workers is not None:
+        return max(1, int(max_workers))
+    env = os.environ.get("LMB_NUM_WORKERS")
+    if env is not None and str(env).strip() != "":
+        return max(1, int(env))
+    return max(1, int(os.cpu_count() or 1))
+
+
+def _monte_carlo_worker(payload: tuple[int, int]) -> tuple[int, np.ndarray, np.ndarray | None]:
+    """Top-level worker for ProcessPoolExecutor (must be picklable under spawn)."""
+    run_index, seed = payload
+    ospa, errors = run_single_simulation(
+        verbose=False,
+        collect_track_errors=(run_index == 0),
+        seed=int(seed),
+    )
+    ospa_arr = np.asarray(ospa, dtype=np.float64)
+    err_arr = np.asarray(errors, dtype=np.float64) if run_index == 0 else None
+    return int(run_index), ospa_arr, err_arr
+
+
+def run_monte_carlo(
+    num_runs: int,
+    *,
+    master_seed: int,
+    max_workers: int | None = None,
+    on_run_complete=None,
+) -> tuple[np.ndarray, np.ndarray, list[int]]:
+    """
+    Run ``num_runs`` independent simulations with explicit derived seeds.
+
+    Aggregation is always by run index (not completion order). ``representative_errors``
+    always comes from run 0. ``max_workers == 1`` (or LMB_NUM_WORKERS=1) is a serial fallback.
+
+    Returns:
+        all_ospa: shape (num_runs, NUM_STEPS)
+        representative_errors: shape (NUM_STEPS, 6) from run 0
+        run_seeds: per-run seeds used
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import multiprocessing as mp
+
+    num_runs = int(num_runs)
+    if num_runs <= 0:
+        raise ValueError(f"num_runs must be positive, got {num_runs}")
+
+    # Spawned workers re-import this package; keep the python/ directory on PYTHONPATH.
+    python_dir = str(Path(__file__).resolve().parent)
+    existing = os.environ.get("PYTHONPATH", "")
+    if python_dir not in existing.split(os.pathsep):
+        os.environ["PYTHONPATH"] = python_dir + (os.pathsep + existing if existing else "")
+
+    run_seeds = derive_run_seeds(master_seed, num_runs)
+    workers = resolve_max_workers(max_workers)
+    payloads = [(i, run_seeds[i]) for i in range(num_runs)]
+
+    results_by_index: list[np.ndarray | None] = [None] * num_runs
+    representative_errors: np.ndarray | None = None
+
+    def _store(run_index: int, ospa: np.ndarray, errors: np.ndarray | None) -> None:
+        nonlocal representative_errors
+        results_by_index[run_index] = ospa
+        if run_index == 0:
+            representative_errors = errors
+        if on_run_complete is not None:
+            on_run_complete(run_index, ospa)
+
+    if workers == 1:
+        for payload in payloads:
+            run_index, ospa, errors = _monte_carlo_worker(payload)
+            _store(run_index, ospa, errors)
+    else:
+        # spawn avoids forking a process that already loaded the native extension / OpenMP.
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as executor:
+            futures = {executor.submit(_monte_carlo_worker, payload): payload[0] for payload in payloads}
+            for future in as_completed(futures):
+                run_index, ospa, errors = future.result()
+                _store(run_index, ospa, errors)
+
+    if any(item is None for item in results_by_index) or representative_errors is None:
+        raise RuntimeError("Monte Carlo batch did not produce a complete result set")
+
+    return np.stack(results_by_index, axis=0), representative_errors, run_seeds
+
+
 __all__ = [
     "lmb_engine",
     "NUM_STEPS",
@@ -343,4 +444,7 @@ __all__ = [
     "generate_measurements",
     "compute_track_mean",
     "run_single_simulation",
+    "derive_run_seeds",
+    "resolve_max_workers",
+    "run_monte_carlo",
 ]

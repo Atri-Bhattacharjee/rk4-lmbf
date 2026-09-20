@@ -17,6 +17,7 @@ The simulation uses a "dual-noise" strategy:
 - Filter model uses inflated noise (wide acceptance gate for birth convergence)
 
 Shared configuration and run_single_simulation live in simulation_common.py.
+Monte Carlo runs use ProcessPoolExecutor with explicit per-run derived seeds.
 """
 import os
 
@@ -24,10 +25,24 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from simulation_common import *  # noqa: F401,F403
-from simulation_common import NUM_STEPS, DT, NUM_PARTICLES, run_single_simulation
+from simulation_common import (
+    NUM_STEPS,
+    DT,
+    NUM_PARTICLES,
+    resolve_max_workers,
+    run_monte_carlo,
+)
 
 # Number of Monte Carlo runs; override with LMB_NUM_RUNS (e.g. for smoke tests)
 NUM_MONTE_CARLO = int(os.environ.get("LMB_NUM_RUNS", "20"))
+
+
+def _resolve_master_seed() -> int:
+    env = os.environ.get("LMB_MC_SEED")
+    if env is not None and str(env).strip() != "":
+        return int(env)
+    # One entropy draw for the whole batch; per-run seeds are derived from this.
+    return int(np.random.SeedSequence().entropy)
 
 
 def main():
@@ -39,6 +54,9 @@ def main():
     - Figure 2: Average performance (thick black line)
     - Figure 3: Component error for Object 1 from run 0
     """
+    master_seed = _resolve_master_seed()
+    max_workers = resolve_max_workers()
+
     print("=" * 60)
     print("SMC-LMB Monte Carlo Analysis")
     print("=" * 60)
@@ -46,23 +64,26 @@ def main():
     print(f"  Monte Carlo Runs: {NUM_MONTE_CARLO}")
     print(f"  Steps per Run: {NUM_STEPS}, DT: {DT}s")
     print(f"  Particles: {NUM_PARTICLES}")
+    print(f"  Master seed: {master_seed}")
+    print(f"  Workers: {max_workers}" + (" (serial)" if max_workers == 1 else ""))
     print("=" * 60)
 
     print("\nRunning Monte Carlo simulations...")
-    all_run_data = []
-    representative_errors = None
+    completed = {"n": 0}
 
-    for i in range(NUM_MONTE_CARLO):
-        ospa_results, track_error_history = run_single_simulation(
-            verbose=False,
-            collect_track_errors=(i == 0),
+    def handle_complete(run_index, ospa_results):
+        completed["n"] += 1
+        print(
+            f"Run {run_index + 1}/{NUM_MONTE_CARLO} complete - Final OSPA: {ospa_results[-1]:.1f}m "
+            f"({completed['n']}/{NUM_MONTE_CARLO} finished)"
         )
-        all_run_data.append(ospa_results)
-        if i == 0:
-            representative_errors = np.array(track_error_history)
-        print(f"Run {i+1}/{NUM_MONTE_CARLO} complete - Final OSPA: {ospa_results[-1]:.1f}m")
 
-    all_run_data = np.array(all_run_data)
+    all_run_data, representative_errors, _run_seeds = run_monte_carlo(
+        NUM_MONTE_CARLO,
+        master_seed=master_seed,
+        max_workers=max_workers,
+        on_run_complete=handle_complete,
+    )
     mean_ospa = np.mean(all_run_data, axis=0)
 
     print("\n" + "-" * 60)

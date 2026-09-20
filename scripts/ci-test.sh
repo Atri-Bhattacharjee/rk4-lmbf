@@ -27,6 +27,13 @@ python tests/test_mixture_grouping.py
 # (x86-64 Linux / libstdc++), portable everywhere else. See the PLATFORM GATING block in the test.
 python tests/test_golden_invariance.py
 python tests/test_run_once_api_surface.py
+# ProcessPoolExecutor Monte Carlo: correctness + speedup. Too expensive in Debug (full 10k-particle
+# runs); Release is the meaningful gate for the parallel path.
+if [[ "${LMB_ENGINE_BUILD:-Release}" == "Debug" ]]; then
+  echo "test_monte_carlo_parallel.py: skipped, it costs minutes in Debug; run it against Release"
+else
+  python tests/test_monte_carlo_parallel.py
+fi
 python tests/test_end_to_end.py
 
 # test_statistical_equivalence.py replaces the bitwise gate off the reference platform, where the
