@@ -107,6 +107,8 @@ jobs:
         shell: bash
         run: ./scripts/ci-test.sh
 
+      # Never require bitwise float/digest identity on macOS: libc++ RNG streams differ from the
+      # Linux/libstdc++ fixtures. See README "Bitwise reproduction is per-platform".
       - name: Test (macOS)
         if: runner.os == 'macOS'
         shell: bash
