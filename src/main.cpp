@@ -257,9 +257,18 @@ PYBIND11_MODULE(lmb_engine, m) {
     m.def("perturbed", &perturbed_validated, pybind11::arg("observation"), pybind11::arg("eps"),
           "Apply a 6-D local tangent-frame perturbation [d_range, d_range_rate, d_theta1, d_theta2, d_omega1, d_omega2]\n"
           "expressed in tangent_basis(observation.los)");
-    m.def("local_residual", &los::localResidual, pybind11::arg("measured"), pybind11::arg("predicted"),
+    m.def("local_residual",
+          static_cast<los::Vector6 (*)(const los::LosObservation&, const los::LosObservation&)>(
+              &los::localResidual),
+          pybind11::arg("measured"), pybind11::arg("predicted"),
           "Residual (measured - predicted) in the 6-D local tangent frame of the measured direction:\n"
-          "[d_range, d_range_rate, d_theta1, d_theta2, d_omega1, d_omega2]");
+          "[d_range, d_range_rate, d_theta1, d_theta2, d_omega1, d_omega2]")
+     .def("local_residual",
+          static_cast<los::Vector6 (*)(const los::LosObservation&, const los::LosObservation&,
+                                       const los::TangentBasis&)>(&los::localResidual),
+          pybind11::arg("measured"), pybind11::arg("predicted"), pybind11::arg("measured_basis"),
+          "Same residual, but with a precomputed tangent_basis(measured.los). Bit-identical to the\n"
+          "two-argument form when measured_basis == tangent_basis(measured.los).");
     m.def("angular_coordinates", &los::angularCoordinates, pybind11::arg("observation"),
           "Derived ECI-axis [azimuth, elevation, azimuth_rate, elevation_rate] (display/interop only; singular on the z-axis)");
     m.def("from_angles_and_rates", &los::fromAnglesAndRates,

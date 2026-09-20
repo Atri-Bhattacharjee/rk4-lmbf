@@ -11,6 +11,7 @@ python -c "import sys; sys.path.insert(0, 'python'); from lmb_engine_loader impo
 python tests/test_two_body_propagator_multistep.py
 python tests/assignments.py
 python tests/test_los_geometry.py
+python tests/test_local_residual_cached_basis.py
 python tests/test_validation_dimensions.py
 python tests/test_sensor_likelihood.py
 python tests/test_adaptive_birth_model.py

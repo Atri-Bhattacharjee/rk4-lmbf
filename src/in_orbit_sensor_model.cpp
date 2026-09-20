@@ -56,6 +56,8 @@ los::LosObservation InOrbitSensorModel::predictObservation(const Particle& parti
 
 MeasurementLikelihoodCache InOrbitSensorModel::buildCache(const Measurement& measurement) {
     MeasurementLikelihoodCache cache;
+    cache.measured = measurement.observation();
+    cache.measured_basis = los::tangentBasis(cache.measured.los);
     const MeasCovariance& cov = measurement.covariance_;
 
     if (isDiagonalCovariance(cov)) {
@@ -99,7 +101,7 @@ double InOrbitSensorModel::calculate_likelihood(const Particle& particle,
                                                 const MeasurementLikelihoodCache& cache) const {
     LMB_VALIDATION_ONLY(validation::require_state_vector(particle.state_vector, "particle.state_vector"));
 
-    const los::LosObservation measured = measurement.observation();
+    const los::LosObservation& measured = cache.measured;
     los::LosObservation predicted = predictObservation(particle, measurement.sensor_state_);
     if (predicted.range <= validation::RANGE_EPSILON) {
         // Direction undefined at the sensor: attribute no angular information to the particle.
@@ -107,7 +109,7 @@ double InOrbitSensorModel::calculate_likelihood(const Particle& particle,
         predicted.los_rate = Eigen::Vector3d::Zero();
     }
 
-    const LocalMeasVector residual = los::localResidual(measured, predicted);
+    const LocalMeasVector residual = los::localResidual(measured, predicted, cache.measured_basis);
 
     double mahalanobis_sq = 0.0;
     if (cache.is_diagonal) {

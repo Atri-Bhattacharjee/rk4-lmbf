@@ -31,6 +31,10 @@ struct MeasurementLikelihoodCache {
     double log_norm_factor = 0.0;
     bool is_diagonal = false;
     LocalMeasVector inv_var;
+    //! Geometric part of the measurement, cached once per update so calculate_likelihood need not rebuild it.
+    los::LosObservation measured;
+    //! tangentBasis(measured.los), identical for every particle of this measurement.
+    los::TangentBasis measured_basis = los::TangentBasis::Zero();
 };
 
 /**
