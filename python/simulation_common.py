@@ -103,6 +103,12 @@ V_CIRCULAR = np.sqrt(MU_EARTH / ORBIT_RADIUS)
 
 SENSOR_STATE = np.array([ORBIT_RADIUS, 0.0, 0.0, 0.0, V_CIRCULAR, 0.0])
 
+# Unbounded in range. Paired with add_unpointed below this is the omniscient sensor the filter had
+# before fields of view existed, which is why this scenario's numbers (and the committed golden
+# fixtures) are unchanged by the sensor rework. Give it a max_range and a half_width, and use
+# SensorArray.add instead, to bound it.
+SENSOR_FOV = lmb_engine.SensorFovConfig()
+
 SCENARIO = [
     (1, 0, np.array([
         +2.6544665658e+06,
@@ -149,19 +155,58 @@ def propagate_truth_state(propagator, state_vector, dt):
     return np.array(propagated.state_vector)
 
 
-def generate_measurements(active_truths, sensor_state, current_time):
-    """Simulate sensor measurements from active ground-truth objects."""
+def build_sensor_array(fov_config=None):
+    """The shipped one-sensor array: a single unpointed sensor at SENSOR_STATE.
+
+    Unpointed and unbounded by default, so the scenario sees exactly what it always saw. Pass a
+    bounded SensorFovConfig, or build your own array with SensorArray.add, for a pointed sensor.
+    """
+    sensors = lmb_engine.SensorArray(SENSOR_FOV if fov_config is None else fov_config)
+    sensors.add_unpointed("sensor_0", SENSOR_STATE)
+    return sensors
+
+
+def _as_sensor_array(sensors):
+    """Accept a SensorArray, or a bare 6-D sensor state for callers that predate them.
+
+    A bare state is wrapped in a one-sensor unbounded, unpointed array, which is the same
+    omniscient sensor it used to denote. tests/harness_scenario.py and tests/bench_engine.py pass
+    a state this way.
+    """
+    if isinstance(sensors, lmb_engine.SensorArray):
+        return sensors
+    array = lmb_engine.SensorArray(lmb_engine.SensorFovConfig())
+    array.add_unpointed("sensor_0", np.asarray(sensors, dtype=np.float64).reshape(6))
+    return array
+
+
+def generate_measurements(active_truths, sensors, current_time):
+    """Simulate sensor measurements from active ground-truth objects.
+
+    An object is only reported when some sensor can actually observe it, and it is reported as a
+    measurement of that sensor -- stamped with its id and its state, which is what lets the filter
+    score the association against the right field of view. The visibility test is
+    SensorArray.sees, the same predicate the filter uses on the particle clouds.
+
+    ``sensors`` may be a SensorArray or a bare 6-D sensor state (see _as_sensor_array).
+    """
+    sensors = _as_sensor_array(sensors)
     measurements = []
 
     for _, truth_state in active_truths:
+        sensor_index = sensors.visible_sensor(truth_state)
+        if sensor_index < 0:
+            # Outside every sensor's volume: nothing to detect, so no detection roll either.
+            continue
+
         if np.random.random() > P_DETECTION:
             continue
 
-        measurement = lmb_engine.Measurement.fromCartesian(truth_state, sensor_state).perturbed(
-            np.random.normal(size=6) * TRUTH_SIGMAS
-        )
+        measurement = lmb_engine.Measurement.fromCartesian(
+            truth_state, sensors.state(sensor_index)
+        ).perturbed(np.random.normal(size=6) * TRUTH_SIGMAS)
         measurement.timestamp_ = current_time
-        measurement.sensor_id_ = "sensor_0"
+        measurement.sensor_id_ = sensors.id(sensor_index)
         # Copy so each Measurement owns its matrix; values are still the hoisted constant.
         measurement.covariance_ = FILTER_COVARIANCE.copy()
         measurements.append(measurement)
@@ -235,6 +280,7 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None, c
     )
 
     active_ground_truths = []
+    sensors = build_sensor_array()
     sensor_state = SENSOR_STATE.copy()
     gospa_results = []
     gospa_components = {"localisation": [], "missed": [], "false_positive": []}
@@ -253,6 +299,7 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None, c
                 new_state = propagate_truth_state(truth_propagator, state, DT)
                 active_ground_truths[i] = (obj_id, new_state)
             sensor_state = propagate_truth_state(truth_propagator, sensor_state, DT)
+            sensors.set_state(0, sensor_state)
 
         for obj_id, birth_step, initial_state in SCENARIO:
             if step == birth_step:
@@ -262,14 +309,14 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None, c
 
         measurements = generate_measurements(
             active_ground_truths,
-            sensor_state,
+            sensors,
             current_time,
         )
 
         if step > 0:
             tracker.predict(DT)
 
-        tracker.update(measurements)
+        tracker.update(measurements, sensors)
         tracks = tracker.get_tracks()
         truth_states = [state.copy() for (_, state) in active_ground_truths]
 
@@ -465,9 +512,11 @@ __all__ = [
     "Q_FILTER",
     "BIRTH_COVARIANCE_LOCAL",
     "SENSOR_STATE",
+    "SENSOR_FOV",
     "SCENARIO",
     "get_ground_truth_propagator",
     "propagate_truth_state",
+    "build_sensor_array",
     "generate_measurements",
     "compute_track_mean",
     "run_single_simulation",

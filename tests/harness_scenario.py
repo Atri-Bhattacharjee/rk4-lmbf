@@ -234,12 +234,26 @@ def run_scenario(
     master_seed: int,
     config: ScenarioConfig = DEFAULT_CONFIG,
     observer: Optional[Callable[..., None]] = None,
+    sensors=None,
+    point_sensors: Optional[Callable[..., None]] = None,
 ) -> Digest:
     """Run a fully-seeded simulation and return its digest.
 
     ``observer``, when given, is called after every update as
     ``observer(step=..., tracker=..., tracks=..., measurements=..., measurements_before=...)``.
     ``test_invariants.py`` uses it so it does not have to duplicate this loop.
+
+    ``sensors`` is None by default, and the run then drives the single-argument ``update``
+    against a bare sensor state -- it never constructs a SensorArray at all. That is deliberate:
+    the committed golden fixtures are produced by a run that does not touch the field-of-view
+    path. Passing a SensorArray instead drives the two-argument ``update``, which is how
+    test_fov_detection_probability.py gets a fully seeded multi-sensor scenario. Its sensor 0 is
+    kept on the propagated sensor trajectory; any further sensors are left where the caller put
+    them.
+
+    ``point_sensors``, when given alongside ``sensors``, is called once per step as
+    ``point_sensors(step=..., sensors=..., truths=...)`` after the truths have moved and before
+    measurements are generated. That is the per-timestep pointing input: re-aim boresights there.
     """
     seeds = derive_seeds(master_seed)
     np.random.seed(seeds["measurement"])
@@ -267,12 +281,19 @@ def run_scenario(
             for i, (obj_id, state) in enumerate(active_truths):
                 active_truths[i] = (obj_id, run_once.propagate_truth_state(truth_propagator, state, run_once.DT))
             sensor_state = run_once.propagate_truth_state(truth_propagator, sensor_state, run_once.DT)
+            if sensors is not None:
+                sensors.set_state(0, sensor_state)
 
         for obj_id, birth_step, initial_state in run_once.SCENARIO:
             if step == birth_step:
                 active_truths.append((obj_id, initial_state.copy()))
 
-        measurements = run_once.generate_measurements(active_truths, sensor_state, current_time)
+        if sensors is not None and point_sensors is not None:
+            point_sensors(step=step, sensors=sensors, truths=active_truths)
+
+        measurements = run_once.generate_measurements(
+            active_truths, sensor_state if sensors is None else sensors, current_time
+        )
         # Snapshot so test_invariants.py can prove update() does not mutate its input.
         measurements_before = [
             (
@@ -290,7 +311,10 @@ def run_scenario(
 
         if step > 0:
             tracker.predict(run_once.DT)
-        tracker.update(measurements)
+        if sensors is None:
+            tracker.update(measurements)
+        else:
+            tracker.update(measurements, sensors)
 
         tracks = tracker.get_tracks()
         truth_states = [state.copy() for (_, state) in active_truths]

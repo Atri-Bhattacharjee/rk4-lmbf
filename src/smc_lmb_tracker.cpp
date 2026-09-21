@@ -77,6 +77,90 @@ void SMC_LMB_Tracker::predict(double dt) {
 }
 
 void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
+    update_impl(measurements, nullptr);
+}
+
+void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements,
+                             const sensor::SensorArray& sensors) {
+    update_impl(measurements, &sensors);
+}
+
+void SMC_LMB_Tracker::prepare_coverage(const std::vector<Track>& tracks,
+                                       const std::vector<Measurement>& measurements,
+                                       const sensor::SensorArray* sensors) {
+    const size_t num_tracks = tracks.size();
+    const size_t num_meas = measurements.size();
+
+    if (sensors == nullptr) {
+        // No sensor array: the historical omniscient sensor. coverage_union_ is exactly 1.0 and
+        // meas_sensor_ carries the -1 sentinel, so detection_probability() and
+        // miss_detection_probability() reduce to p_detection_ bit for bit (x * 1.0 == x in
+        // IEEE-754) and the committed golden fixtures still reproduce.
+        num_sensors_ = 0;
+        coverage_per_sensor_.clear();
+        coverage_union_.assign(num_tracks, 1.0);
+        meas_sensor_.assign(num_meas, -1);
+        return;
+    }
+
+    num_sensors_ = sensors->size();
+    if (num_sensors_ == 0 && num_meas > 0) {
+        throw std::invalid_argument("update(): got " + std::to_string(num_meas) +
+                                    " measurement(s) but the SensorArray is empty");
+    }
+
+    meas_sensor_.assign(num_meas, -1);
+    for (size_t j = 0; j < num_meas; ++j) {
+        const int sensor_index = sensors->index_of(measurements[j].sensor_id_);
+        if (sensor_index < 0) {
+            throw std::invalid_argument("update(): Measurement.sensor_id_ '" +
+                                        measurements[j].sensor_id_ +
+                                        "' is not in the SensorArray");
+        }
+        meas_sensor_[j] = sensor_index;
+    }
+
+    coverage_per_sensor_.assign(num_tracks * num_sensors_, 0.0);
+    coverage_union_.assign(num_tracks, 0.0);
+    for (size_t i = 0; i < num_tracks; ++i) {
+        coverage_union_[i] = sensors->coverage(tracks[i], coverage_scratch_);
+        std::copy(coverage_scratch_.begin(), coverage_scratch_.end(),
+                  coverage_per_sensor_.begin() + static_cast<std::ptrdiff_t>(i * num_sensors_));
+    }
+}
+
+void SMC_LMB_Tracker::apply_missed_detection_only(std::vector<Track>& tracks) {
+    for (size_t i = 0; i < tracks.size(); ++i) {
+        double weight_sum = 0.0;
+        for (const Particle& particle : tracks[i].particles()) {
+            weight_sum += particle.weight;
+        }
+
+        // Same Bernoulli existence update as the main path, with the mixture collapsed to its miss
+        // term. No resampling: scaling every particle weight by one constant leaves the normalised
+        // cloud where it was, and skipping it keeps resample_rng_ in step with a seeded run.
+        const double sum_weights = (1.0 - miss_detection_probability(i)) * weight_sum;
+        const double r_legacy = tracks[i].existence_probability();
+        const double denominator = 1.0 - r_legacy + r_legacy * sum_weights;
+        // denominator <= 0 needs r == 1 and sum_weights == 0: the track certainly exists, was
+        // certainly observable, and was certainly not reported. That is a contradiction the filter
+        // resolves by killing the track rather than dividing 0/0.
+        tracks[i].set_existence_probability(denominator > 0.0 ? (r_legacy * sum_weights) / denominator
+                                                              : 0.0);
+    }
+}
+
+void SMC_LMB_Tracker::prune_tracks(std::vector<Track>& tracks) {
+    // erase-remove in place instead of copying survivors into a new vector.
+    tracks.erase(std::remove_if(tracks.begin(), tracks.end(),
+                                [this](const Track& track) {
+                                    return track.existence_probability() < prune_threshold_;
+                                }),
+                 tracks.end());
+}
+
+void SMC_LMB_Tracker::update_impl(const std::vector<Measurement>& measurements,
+                                  const sensor::SensorArray* sensors) {
     ensure_models_configured();
 
     for (const auto& measurement : measurements) {
@@ -87,6 +171,12 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
     size_t num_tracks = tracks.size();
     size_t num_meas = measurements.size();
 
+    // Resolve every measurement to its sensor and measure each track's coverage before any
+    // branch takes an early return, so an unknown sensor_id_ is rejected on every path --
+    // including a birth-only step, where nothing downstream would consult the array. With no
+    // sensor array this is bookkeeping only: no per-particle work and no arithmetic.
+    prepare_coverage(tracks, measurements, sensors);
+
     // Handle the case of no existing tracks - just create new ones from all measurements
     if (num_tracks == 0) {
         std::vector<Track> born_tracks = birth_model_->generate_new_tracks(measurements, current_state_.timestamp());
@@ -94,8 +184,16 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
         return;
     }
 
-    // Handle the case of no measurements - nothing to update
     if (num_meas == 0) {
+        if (sensors == nullptr) {
+            // Without a sensor array there is no notion of what was observable this step, so an
+            // empty measurement list carries no information -- the historical behaviour.
+            return;
+        }
+        // With one, a step in which nobody reported anything is still evidence about a track a
+        // sensor was pointed at.
+        apply_missed_detection_only(tracks);
+        prune_tracks(tracks);
         return;
     }
 
@@ -168,19 +266,36 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
     size_t augmented_cols = num_meas + num_tracks;
     Eigen::MatrixXd cost_matrix(num_tracks, augmented_cols);
     
-    double miss_cost = -std::log(std::max(1.0 - p_detection_, 1e-12));
     const double INF_COST = 1e9;  // Large cost for impossible assignments
     
     for (size_t i = 0; i < num_tracks; ++i) {
         // Detection costs (left block: columns 0 to num_meas-1)
         for (size_t j = 0; j < num_meas; ++j) {
+            const double p_detect = detection_probability(i, j);
+            if (num_sensors_ > 0 && p_detect <= 0.0) {
+                // None of this track's particles are where that sensor is looking, so it cannot
+                // have produced that measurement. Say so outright, as the off-diagonal miss entries
+                // do. Leaning on the 1e-12 floor instead would leave the association a tiny but
+                // non-zero hypothesis weight, which is enough to drift the existence probability of
+                // a track nobody can see. The num_sensors_ guard keeps the floor in place on the
+                // path with no sensor array, where P_D_eff is the configured P_D and a zero can
+                // only come from a likelihood that underflowed.
+                cost_matrix(i, j) = INF_COST;
+                continue;
+            }
             double likelihood = likelihood_matrix(i, j);
-            // Cost = -ln(P_D * L / κ). L is the raw weighted-average likelihood from Step 2,
-            // so the single division by κ below is the only one on this path.
-            cost_matrix(i, j) = -std::log(std::max(p_detection_ * likelihood / clutter_intensity_, 1e-12));
+            // Cost = -ln(P_D_eff * L / κ). L is the raw weighted-average likelihood from Step 2,
+            // so the single division by κ below is the only one on this path. P_D_eff is the
+            // configured P_D scaled by the fraction of this track's cloud inside the volume of the
+            // sensor that produced measurement j.
+            cost_matrix(i, j) = -std::log(std::max(p_detect * likelihood / clutter_intensity_, 1e-12));
         }
         
-        // Missed detection costs (right block: columns num_meas to num_meas+num_tracks-1)
+        // Missed detection costs (right block: columns num_meas to num_meas+num_tracks-1).
+        // Per track rather than one hoisted scalar: the miss probability now depends on how much
+        // of this track any sensor could see. A track outside every field of view has
+        // P_D_eff = 0, hence miss_cost = 0 -- it pays nothing for not being reported.
+        const double miss_cost = -std::log(std::max(1.0 - miss_detection_probability(i), 1e-12));
         for (size_t j = 0; j < num_tracks; ++j) {
             if (i == j) {
                 // Diagonal: this track missed detection
@@ -265,9 +380,9 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
         }
 
         for (size_t j = 0; j < num_meas; ++j) {
-            assoc_coefficients_[j] *= p_detection_ * likelihood_matrix(i, j) / clutter_intensity_;
+            assoc_coefficients_[j] *= detection_probability(i, j) * likelihood_matrix(i, j) / clutter_intensity_;
         }
-        miss_coefficient *= (1.0 - p_detection_);
+        miss_coefficient *= (1.0 - miss_detection_probability(i));
 
         // Step 5b: one pass per used association. O(D * num_particles) with D <= num_meas + 1.
         // Measurements ascending, then the miss term, so the summation order is fixed run to run.
@@ -352,12 +467,7 @@ void SMC_LMB_Tracker::update(const std::vector<Measurement>& measurements) {
         tracks[i].set_particles(std::move(resampled_particles));
     }
 
-    // Track pruning: erase-remove in place instead of copying survivors into a new vector.
-    tracks.erase(std::remove_if(tracks.begin(), tracks.end(),
-                                [this](const Track& track) {
-                                    return track.existence_probability() < prune_threshold_;
-                                }),
-                 tracks.end());
+    prune_tracks(tracks);
 
     // Step 6: Adaptive Birth - Create new tracks from unused measurements
     if (!hypotheses.empty() && birth_model_) {

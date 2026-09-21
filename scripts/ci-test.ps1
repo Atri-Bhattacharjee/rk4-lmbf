@@ -13,6 +13,11 @@ python tests/assignments.py
 python tests/test_gospa_metric.py
 python tests/test_los_geometry.py
 python tests/test_local_residual_cached_basis.py
+# Sensor pointing / field-of-view geometry, then the FOV-scaled detection probability it
+# feeds. Both are seconds-scale, and a broken visibility predicate should fail here rather
+# than as a mystery in the golden stage.
+python tests/test_sensor_fov.py
+python tests/test_fov_detection_probability.py
 python tests/test_validation_dimensions.py
 python tests/test_sensor_likelihood.py
 python tests/test_adaptive_birth_model.py

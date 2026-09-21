@@ -5,6 +5,7 @@
 #include <Eigen/Dense>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -14,6 +15,7 @@
 #include "adaptive_birth_model.h"
 #include "smc_lmb_tracker.h"
 #include "in_orbit_sensor_model.h"
+#include "sensor_fov.h"
 #include "assignment.h"
 #include "metrics.h"
 #include "particle_statistics.h"
@@ -27,6 +29,56 @@ namespace {
 StateVector require_state_vector_fixed(const Eigen::VectorXd& vector, const char* context) {
     validation::require_state_vector(vector, context);
     return StateVector(vector);
+}
+
+Eigen::Vector3d require_vector3_fixed(const Eigen::VectorXd& vector, const char* context) {
+    if (vector.size() != 3) {
+        throw std::invalid_argument(std::string(context) + ": expected 3 elements, got " +
+                                    std::to_string(vector.size()));
+    }
+    return Eigen::Vector3d(vector);
+}
+
+//! A position, taken either as a 3-vector or as the first half of a 6-D state. Visibility depends
+//! only on position, so both spellings are accepted wherever a target is named.
+Eigen::Vector3d require_position_fixed(const Eigen::VectorXd& vector, const char* context) {
+    if (vector.size() != 3 && vector.size() != 6) {
+        throw std::invalid_argument(std::string(context) + ": expected 3 or 6 elements, got " +
+                                    std::to_string(vector.size()));
+    }
+    if (!vector.allFinite()) {
+        throw std::invalid_argument(std::string(context) + ": must be finite");
+    }
+    return Eigen::Vector3d(vector.head(3));
+}
+
+sensor::SensorFovConfig make_sensor_fov_config(double min_range, double max_range,
+                                               double half_width, double half_height) {
+    sensor::SensorFovConfig fov;
+    fov.min_range = min_range;
+    fov.max_range = max_range;
+    fov.half_width = half_width;
+    fov.half_height = half_height;
+    sensor::require_fov_config(fov);
+    return fov;
+}
+
+//! Rows of `values` assigned one per sensor; the row count must match the array exactly so a
+//! mis-shaped per-step update fails loudly instead of silently re-pointing a subset.
+void require_row_count(const Eigen::MatrixXd& values, size_t expected_rows, int expected_cols,
+                       const char* context) {
+    if (values.rows() != static_cast<Eigen::Index>(expected_rows) || values.cols() != expected_cols) {
+        throw std::invalid_argument(std::string(context) + ": expected a (" +
+                                    std::to_string(expected_rows) + ", " + std::to_string(expected_cols) +
+                                    ") array, got (" + std::to_string(values.rows()) + ", " +
+                                    std::to_string(values.cols()) + ")");
+    }
+}
+
+pybind11::array_t<double> to_numpy(const std::vector<double>& values) {
+    pybind11::array_t<double> out(static_cast<pybind11::ssize_t>(values.size()));
+    std::copy(values.begin(), values.end(), out.mutable_data());
+    return out;
 }
 
 Eigen::Vector3d require_vector3(const Eigen::VectorXd& vector, const char* context) {
@@ -441,6 +493,163 @@ PYBIND11_MODULE(lmb_engine, m) {
         .def("defaultCovariance", &InOrbitSensorModel::defaultCovariance,
              "diag(range_var, range_rate_var, angle_var_1, angle_var_2, angle_rate_var_1, angle_rate_var_2)");
     
+    m.attr("SENSOR_MAX_HALF_ANGLE") = sensor::kMaxHalfAngle;
+    m.attr("SENSOR_DEFAULT_HALF_ANGLE") = sensor::kDefaultHalfAngle;
+
+    pybind11::class_<sensor::SensorFovConfig>(m, "SensorFovConfig",
+        "Range bounds and angular half-widths, shared by every sensor in a SensorArray.\n\n"
+        "A pointed sensor sees a target at relative position d when\n"
+        "  min_range <= |d| <= max_range,  d.boresight > 0,\n"
+        "  |d.width| <= (d.boresight) tan(half_width),  |d.up| <= (d.boresight) tan(half_height)\n"
+        "-- a rectangular pyramid in the tangent-plane (pinhole) convention. An unpointed sensor\n"
+        "ignores the angular test and is bounded only by range.\n\n"
+        "The defaults ([0, inf) in range) paired with SensorArray.add_unpointed reproduce the\n"
+        "omniscient single sensor the filter had before fields of view existed.")
+        .def(pybind11::init(&make_sensor_fov_config),
+             pybind11::arg("min_range") = 0.0,
+             pybind11::arg("max_range") = std::numeric_limits<double>::infinity(),
+             pybind11::arg("half_width") = sensor::kDefaultHalfAngle,
+             pybind11::arg("half_height") = sensor::kDefaultHalfAngle,
+             "Half-angles are in radians and must lie in (0, pi/2).")
+        .def_readwrite("min_range", &sensor::SensorFovConfig::min_range, "Inclusive lower range bound [m]")
+        .def_readwrite("max_range", &sensor::SensorFovConfig::max_range, "Inclusive upper range bound [m]")
+        .def_readwrite("half_width", &sensor::SensorFovConfig::half_width,
+                       "Half-angle about the frame's width axis [rad], in (0, pi/2)")
+        .def_readwrite("half_height", &sensor::SensorFovConfig::half_height,
+                       "Half-angle about the frame's height axis [rad], in (0, pi/2)")
+        .def("__repr__", [](const sensor::SensorFovConfig& fov) {
+            return "SensorFovConfig(min_range=" + std::to_string(fov.min_range) +
+                   ", max_range=" + std::to_string(fov.max_range) +
+                   ", half_width=" + std::to_string(fov.half_width) +
+                   ", half_height=" + std::to_string(fov.half_height) + ")";
+        });
+
+    pybind11::class_<sensor::SensorArray, std::shared_ptr<sensor::SensorArray>>(m, "SensorArray",
+        "An ordered set of sensors sharing one SensorFovConfig.\n\n"
+        "Sensors are addressed by the index add() returns, and looked up by id when a Measurement\n"
+        "has to be traced back to the sensor that produced it, so ids must be unique and must match\n"
+        "Measurement.sensor_id_. Pointing is expected to be rewritten every timestep.\n\n"
+        "sees() is the single source of truth for visibility: use it to decide whether a truth\n"
+        "object produces a measurement at all, and the filter will score that measurement with the\n"
+        "same predicate.\n\n"
+        "Sensor volumes are assumed disjoint. The filter is not built to have one object reported\n"
+        "by two sensors in the same step.")
+        .def(pybind11::init([](const sensor::SensorFovConfig& fov) {
+                 return std::make_shared<sensor::SensorArray>(fov);
+             }),
+             pybind11::arg("fov_config") = sensor::SensorFovConfig(),
+             "Empty array with the given global field-of-view configuration.")
+        .def_property("fov_config",
+                      [](const sensor::SensorArray& self) { return self.fov(); },
+                      [](sensor::SensorArray& self, const sensor::SensorFovConfig& fov) { self.set_fov(fov); },
+                      "Range bounds and half-angles shared by every sensor here. The getter returns a\n"
+                      "copy, so mutating it does nothing until it is assigned back.")
+        .def("add",
+             [](sensor::SensorArray& self, std::string id, const Eigen::VectorXd& state,
+                const Eigen::VectorXd& boresight) {
+                 return self.add(std::move(id), require_state_vector_fixed(state, "state"),
+                                 require_vector3_fixed(boresight, "boresight"));
+             },
+             pybind11::arg("id"), pybind11::arg("state"), pybind11::arg("boresight"),
+             "Add a pointed sensor and return its index. The boresight is normalised; the roll is\n"
+             "initialised deterministically and can be set with set_pointing().")
+        .def("add_unpointed",
+             [](sensor::SensorArray& self, std::string id, const Eigen::VectorXd& state) {
+                 return self.add_unpointed(std::move(id), require_state_vector_fixed(state, "state"));
+             },
+             pybind11::arg("id"), pybind11::arg("state"),
+             "Add a range-only sensor and return its index. It ignores the field of view entirely.")
+        .def("size", &sensor::SensorArray::size, "Number of sensors")
+        .def("__len__", &sensor::SensorArray::size)
+        .def("index_of", &sensor::SensorArray::index_of, pybind11::arg("id"),
+             "Index of the sensor with this id, or -1 when there is none")
+        .def("id", [](const sensor::SensorArray& self, size_t i) { return self.at(i).id; },
+             pybind11::arg("index"), "Id of sensor `index`")
+        .def("state", [](const sensor::SensorArray& self, size_t i) { return self.at(i).state; },
+             pybind11::arg("index"), "6-D ECI state of sensor `index`")
+        .def("boresight", [](const sensor::SensorArray& self, size_t i) { return self.at(i).boresight; },
+             pybind11::arg("index"), "Unit ECI pointing direction of sensor `index`")
+        .def("up", [](const sensor::SensorArray& self, size_t i) { return self.at(i).up; },
+             pybind11::arg("index"), "Unit height axis of sensor `index`, orthogonal to its boresight")
+        .def("width_axis", [](const sensor::SensorArray& self, size_t i) { return self.at(i).width; },
+             pybind11::arg("index"), "Unit width axis of sensor `index`: up x boresight")
+        .def("pointed", [](const sensor::SensorArray& self, size_t i) { return self.at(i).pointed; },
+             pybind11::arg("index"), "False when sensor `index` is bounded by range alone")
+        .def("set_state",
+             [](sensor::SensorArray& self, size_t i, const Eigen::VectorXd& state) {
+                 self.set_state(i, require_state_vector_fixed(state, "state"));
+             },
+             pybind11::arg("index"), pybind11::arg("state"), "Move one sensor")
+        .def("set_states",
+             [](sensor::SensorArray& self, const Eigen::MatrixXd& states) {
+                 require_row_count(states, self.size(), 6, "states");
+                 for (size_t i = 0; i < self.size(); ++i) {
+                     self.set_state(i, StateVector(states.row(static_cast<Eigen::Index>(i)).transpose()));
+                 }
+             },
+             pybind11::arg("states"), "Move every sensor from an (S, 6) array of ECI states")
+        .def("set_boresight",
+             [](sensor::SensorArray& self, size_t i, const Eigen::VectorXd& boresight) {
+                 self.set_boresight(i, require_vector3_fixed(boresight, "boresight"));
+             },
+             pybind11::arg("index"), pybind11::arg("boresight"),
+             "Re-point one sensor. The vector is normalised, and the roll is carried over by\n"
+             "parallel transport so a slewing field of view does not spin about its own axis.")
+        .def("set_boresights",
+             [](sensor::SensorArray& self, const Eigen::MatrixXd& boresights) {
+                 require_row_count(boresights, self.size(), 3, "boresights");
+                 for (size_t i = 0; i < self.size(); ++i) {
+                     self.set_boresight(i, Eigen::Vector3d(boresights.row(static_cast<Eigen::Index>(i)).transpose()));
+                 }
+             },
+             pybind11::arg("boresights"), "Re-point every sensor from an (S, 3) array of ECI directions")
+        .def("set_pointing",
+             [](sensor::SensorArray& self, size_t i, const Eigen::VectorXd& boresight,
+                const Eigen::VectorXd& up) {
+                 self.set_pointing(i, require_vector3_fixed(boresight, "boresight"),
+                                   require_vector3_fixed(up, "up"));
+             },
+             pybind11::arg("index"), pybind11::arg("boresight"), pybind11::arg("up"),
+             "Re-point one sensor with an explicit roll. `up` is orthogonalised against the\n"
+             "boresight and must not be parallel to it.")
+        .def("point_at",
+             [](sensor::SensorArray& self, size_t i, const Eigen::VectorXd& target_position) {
+                 self.point_at(i, require_position_fixed(target_position, "target_position"));
+             },
+             pybind11::arg("index"), pybind11::arg("target_position"),
+             "Aim one sensor's boresight at an ECI position (3-vector or 6-D state), keeping its roll")
+        .def("set_pointed", &sensor::SensorArray::set_pointed,
+             pybind11::arg("index"), pybind11::arg("pointed"),
+             "Turn the angular field-of-view test on or off for one sensor")
+        .def("sees",
+             [](const sensor::SensorArray& self, size_t i, const Eigen::VectorXd& target) {
+                 return self.sees(i, require_position_fixed(target, "target"));
+             },
+             pybind11::arg("index"), pybind11::arg("target"),
+             "Whether sensor `index` can observe an object at this position (3-vector or 6-D state)")
+        .def("visible_sensor",
+             [](const sensor::SensorArray& self, const Eigen::VectorXd& target) {
+                 return self.visible_sensor(require_position_fixed(target, "target"));
+             },
+             pybind11::arg("target"),
+             "Lowest-indexed sensor that can observe this position, or -1 when none can")
+        .def("coverage_fractions",
+             [](const sensor::SensorArray& self, const Track& track) {
+                 std::vector<double> per_sensor;
+                 self.coverage(track, per_sensor);
+                 return to_numpy(per_sensor);
+             },
+             pybind11::arg("track"),
+             "(S,) weight-fraction of the track's particle cloud inside each sensor's volume")
+        .def("coverage_fraction",
+             [](const sensor::SensorArray& self, const Track& track) {
+                 std::vector<double> per_sensor;
+                 return self.coverage(track, per_sensor);
+             },
+             pybind11::arg("track"),
+             "Weight-fraction of the track's particle cloud inside the union of all sensor volumes.\n"
+             "This is what the filter scales P_D by in its missed-detection branch.");
+
     // Bind the main tracker class with direct constructor support
     pybind11::class_<SMC_LMB_Tracker, std::shared_ptr<SMC_LMB_Tracker>>(m, "SMC_LMB_Tracker")
         .def(pybind11::init(&make_smc_lmb_tracker),
@@ -458,7 +667,22 @@ PYBIND11_MODULE(lmb_engine, m) {
              "Constructor for SMC_LMB_Tracker with model dependencies.\n\n"
              "seed: optional integer for a reproducible resampler stream (default: std::random_device).")
         .def("predict", &SMC_LMB_Tracker::predict, "Runs the predict step for a given time delta")
-        .def("update", &SMC_LMB_Tracker::update, "Runs the update step with measurements")
+        .def("update",
+             static_cast<void (SMC_LMB_Tracker::*)(const std::vector<Measurement>&)>(&SMC_LMB_Tracker::update),
+             pybind11::arg("measurements"),
+             "Runs the update step with measurements, against a sensor that sees everything.\n"
+             "Every track is fully observable, so the effective P_D is the configured P_D and a\n"
+             "step with no measurements changes nothing.")
+        .def("update",
+             static_cast<void (SMC_LMB_Tracker::*)(const std::vector<Measurement>&,
+                                                   const sensor::SensorArray&)>(&SMC_LMB_Tracker::update),
+             pybind11::arg("measurements"), pybind11::arg("sensors"),
+             "Runs the update step against a configured set of sensors.\n\n"
+             "Each measurement is traced back through its sensor_id_, and every track's effective\n"
+             "P_D is the configured P_D scaled by the fraction of that track's particle cloud inside\n"
+             "the relevant sensor volume. A track outside every field of view keeps its existence\n"
+             "probability; a step in which no sensor reported anything is applied as a pure missed\n"
+             "detection. Raises ValueError if a sensor_id_ is not in the array.")
         .def("get_tracks", &get_tracks_copy, "Gets the current list of tracks")
         .def("set_tracks", &SMC_LMB_Tracker::set_tracks, "Sets the initial list of tracks for the filter")
         .def("compute_association_likelihood", &SMC_LMB_Tracker::compute_association_likelihood, "Compute the association likelihood for a track and measurement");

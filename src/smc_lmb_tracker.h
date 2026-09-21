@@ -17,6 +17,7 @@
 #include "datatypes.h"
 #include "models.h"
 #include "assignment.h"
+#include "sensor_fov.h"
 
 /**
  * @brief Sequential Monte Carlo Labeled Multi-Bernoulli Tracker
@@ -50,7 +51,62 @@ private:
     std::vector<char> assoc_used_;                      //!< Whether any hypothesis chose that measurement
     std::vector<double> mixture_weights_;               //!< Per-particle posterior mixture weights
 
+    // Field-of-view coverage for the current update, on the same reuse-across-calls footing as the
+    // buffers above. They are rewritten by prepare_coverage() before anything reads them.
+    std::vector<double> coverage_per_sensor_;           //!< q[track][sensor], flat, num_tracks * num_sensors_
+    std::vector<double> coverage_union_;                //!< Per-track weight fraction inside ANY sensor's volume
+    std::vector<double> coverage_scratch_;              //!< One track's row, as SensorArray::coverage fills it
+    std::vector<int> meas_sensor_;                      //!< Sensor behind each measurement; -1 = no sensor array
+    size_t num_sensors_ = 0;                            //!< Sensors in the array driving the current update
+
     void ensure_models_configured() const;
+
+    //! Shared body of both update() overloads. sensors == nullptr selects the historical
+    //! omniscient-sensor behaviour, in which every coverage fraction is exactly 1.0.
+    void update_impl(const std::vector<Measurement>& measurements, const sensor::SensorArray* sensors);
+
+    /**
+     * @brief Fill coverage_* and meas_sensor_ for one update step.
+     *
+     * Throws when a measurement's sensor_id_ is not in the array: guessing would silently score
+     * the association with the wrong sensor's coverage fraction.
+     */
+    void prepare_coverage(const std::vector<Track>& tracks,
+                          const std::vector<Measurement>& measurements,
+                          const sensor::SensorArray* sensors);
+
+    //! Existence update for a step in which no sensor reported anything. Every particle weight is
+    //! scaled by the same (1 - P_D_eff), so the normalised cloud does not move and nothing is
+    //! resampled -- which also leaves resample_rng_ untouched.
+    void apply_missed_detection_only(std::vector<Track>& tracks);
+
+    //! Drop tracks whose existence probability fell below prune_threshold_, in place.
+    void prune_tracks(std::vector<Track>& tracks);
+
+    /**
+     * @brief Effective P_D for track i being detected by the sensor that produced measurement j.
+     *
+     * The configured P_D scaled by the fraction of the track's cloud inside that sensor's volume,
+     * so a track that cannot be where that sensor is looking cannot claim its measurement.
+     */
+    double detection_probability(size_t track_index, size_t meas_index) const {
+        const int sensor_index = meas_sensor_[meas_index];
+        if (sensor_index < 0) {
+            return p_detection_;
+        }
+        return p_detection_ *
+               coverage_per_sensor_[track_index * num_sensors_ + static_cast<size_t>(sensor_index)];
+    }
+
+    /**
+     * @brief Effective P_D for track i being detected by anybody, used by the missed-detection branch.
+     *
+     * Uses the union coverage, so a track outside every field of view has P_D_eff = 0 and its
+     * existence probability is left exactly where it was rather than decaying while unobservable.
+     */
+    double miss_detection_probability(size_t track_index) const {
+        return p_detection_ * coverage_union_[track_index];
+    }
 
     /**
      * @brief Offset of one (track, measurement) block inside association_weights_
@@ -121,9 +177,26 @@ public:
      * based on new sensor measurements, and creates new tracks from unused
      * measurements.
      * 
+     * This overload keeps the historical behaviour in which the sensor sees everything: every
+     * track is fully observable, so the effective P_D is the configured P_D, and a step with no
+     * measurements changes nothing.
+     *
      * @param measurements Vector of new sensor measurements to process
      */
     void update(const std::vector<Measurement>& measurements);
+
+    /**
+     * @brief Run the update step against a configured set of sensors
+     *
+     * Each measurement is traced back through its sensor_id_ to the sensor that produced it, and
+     * the effective detection probability of every track is the configured P_D scaled by the
+     * fraction of that track's particle cloud inside the relevant sensor volume. A step in which
+     * no sensor reported anything is still informative and is applied as a pure missed detection.
+     *
+     * @param measurements Vector of new sensor measurements to process
+     * @param sensors The sensors, with the pointing they had for this step
+     */
+    void update(const std::vector<Measurement>& measurements, const sensor::SensorArray& sensors);
 
     /**
      * @brief Get the current tracks

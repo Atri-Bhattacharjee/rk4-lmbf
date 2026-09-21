@@ -47,7 +47,8 @@ def expect_raises(chk: Checker, exc_type, fn, label: str, message_contains: str)
 def check_names(chk: Checker) -> None:
     module_names = ("Measurement", "LosObservation", "AdaptiveBirthModel", "InOrbitSensorModel", "tangent_basis",
                     "exp_map", "log_map", "parallel_transport", "observe", "to_cartesian", "perturbed",
-                    "local_residual", "angular_coordinates", "from_angles_and_rates", "MEAS_DIM", "VALIDATION_ENABLED")
+                    "local_residual", "angular_coordinates", "from_angles_and_rates", "MEAS_DIM", "VALIDATION_ENABLED",
+                    "SensorFovConfig", "SensorArray", "SENSOR_MAX_HALF_ANGLE", "SENSOR_DEFAULT_HALF_ANGLE")
     for name in module_names:
         chk.ok(hasattr(lmb, name), f"lmb_engine.{name} missing")
     chk.ok(lmb.MEAS_DIM == 6, f"MEAS_DIM must be 6, got {lmb.MEAS_DIM}")
@@ -180,10 +181,54 @@ def check_helpers_signatures(chk: Checker) -> None:
            "identity transport")
 
 
+def check_sensor_array_surface(chk: Checker) -> None:
+    """Pin the sensor/field-of-view surface Python drives every timestep."""
+    config_names = ("min_range", "max_range", "half_width", "half_height")
+    for name in config_names:
+        chk.ok(hasattr(lmb.SensorFovConfig, name), f"SensorFovConfig.{name} missing")
+
+    array_names = ("add", "add_unpointed", "size", "index_of", "id", "state", "boresight", "up",
+                   "width_axis", "pointed", "set_state", "set_states", "set_boresight",
+                   "set_boresights", "set_pointing", "point_at", "set_pointed", "sees",
+                   "visible_sensor", "coverage_fractions", "coverage_fraction", "fov_config")
+    for name in array_names:
+        chk.ok(hasattr(lmb.SensorArray, name), f"SensorArray.{name} missing")
+
+    chk.ok(0.0 < lmb.SENSOR_DEFAULT_HALF_ANGLE < lmb.SENSOR_MAX_HALF_ANGLE,
+           "SENSOR_DEFAULT_HALF_ANGLE must sit inside (0, SENSOR_MAX_HALF_ANGLE)")
+    chk.ok(abs(lmb.SENSOR_MAX_HALF_ANGLE - np.pi / 2) < 1e-15,
+           "SENSOR_MAX_HALF_ANGLE must be pi/2")
+
+    # A default config paired with add_unpointed is the omniscient sensor: keep that documented
+    # contract executable, since every existing driver and fixture depends on it.
+    sensors = lmb.SensorArray()
+    chk.ok(len(sensors) == 0, "SensorArray() must default to an empty array")
+    sensors.add_unpointed("sensor_0", np.zeros(6))
+    chk.ok(sensors.sees(0, np.array([1.0e12, -3.0e11, 7.0e10])),
+           "a default unpointed sensor must see anything at any range")
+    chk.ok(sensors.visible_sensor(np.array([1.0e12, -3.0e11, 7.0e10])) == 0,
+           "visible_sensor must resolve the default unpointed sensor")
+
+    # update is overloaded; both arities must be reachable from Python.
+    doc = (lmb.SMC_LMB_Tracker.update.__doc__ or "")
+    chk.ok("measurements: list" in doc.replace("List", "list") or "measurements" in doc,
+           "SMC_LMB_Tracker.update must document its arguments")
+    chk.ok(doc.count("update(") >= 2,
+           f"SMC_LMB_Tracker.update must expose both overloads, docstring was:\n{doc}")
+
+    index = sensors.add("pointed", np.zeros(6), np.array([0.0, 0.0, 2.0]))
+    chk.ok(index == 1, "add must return the new sensor's index")
+    chk.ok(np.allclose(np.asarray(sensors.boresight(1)), [0.0, 0.0, 1.0]),
+           "add must normalise the boresight")
+    chk.ok(sensors.index_of("pointed") == 1 and sensors.index_of("absent") == -1,
+           "index_of must resolve known ids and return -1 otherwise")
+
+
 def main() -> None:
     chk = Checker()
     steps = [
         ("names", lambda: check_names(chk)),
+        ("sensor array surface", lambda: check_sensor_array_surface(chk)),
         ("sensor ctor", lambda: check_sensor_ctor(chk)),
         ("birth ctor", lambda: check_birth_ctor(chk)),
         ("measurement API", lambda: check_measurement_roundtrip(chk)),
