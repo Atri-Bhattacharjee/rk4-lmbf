@@ -66,11 +66,11 @@ DEFAULT_RTOL = 1e-12
 #
 # Cause 1 is not a rounding difference and no tolerance absorbs it: a different stream is a
 # different draw from the same distribution. Measured over these cases, changing only the C++ stream
-# moves a scenario's mean OSPA by a factor of 0.3 to 2 and individual per-step values by several
+# moves a scenario's mean GOSPA by a factor of 0.3 to 2 and individual per-step values by several
 # hundred percent, while the birth cloud's mean moves by the sampling error of the birth covariance
 # over ``num_particles`` from the very first step. So off the reference platform this test compares
-# only what is reproducible anywhere (PORTABLE_INT_FIELDS exactly, mean OSPA below
-# PORTABLE_MEAN_OSPA_CEILING, and the run-to-run self-check), and the numerical gate becomes the
+# only what is reproducible anywhere (PORTABLE_INT_FIELDS exactly, mean GOSPA below
+# PORTABLE_MEAN_GOSPA_CEILING, and the run-to-run self-check), and the numerical gate becomes the
 # distributional one in test_statistical_equivalence.py, which ci-test.sh and ci-test.ps1 run off the
 # reference platform for exactly this reason.
 REFERENCE_PLATFORM = "linux"
@@ -80,16 +80,26 @@ REFERENCE_MACHINES = ("x86_64", "amd64")
 # measurement noise in ``run_once.generate_measurements`` -- and MT19937 plus NumPy's own
 # distributions are portable, so this one has to hold on every platform. Every other digest field is
 # downstream of the C++ RNG or of floating-point ordering.
-PORTABLE_INT_FIELDS = ("num_measurements",)
+PORTABLE_INT_FIELDS = ("num_measurements", "num_truths")
 
-# One scenario's mean OSPA is a single draw with a ~30% coefficient of variation, so comparing it
-# against the fixture's value is not a useful gate: shifting only the C++ stream moves the ratio over
-# 0.29-1.95 across these five cases, and the 48-run baseline in statistical_baseline.npz spans
-# 0.39-1.60 of its own mean. Any band tight enough to mean something would flake. So portable mode
+# One scenario's mean GOSPA is a single draw, so comparing it against the fixture's value is not a
+# useful gate. Under the OSPA predecessor the coefficient of variation was ~30% and the 48-run
+# baseline spanned 0.39-1.60 of its own mean; under GOSPA at this cutoff it is 8.5% and 0.74-1.17,
+# but that tightening is clipping, not precision -- most steps are pinned at the maximum attainable
+# value, so the spread that remains is mostly the unclipped minority. Either way no band tight
+# enough to mean something would be safe here. So portable mode
 # asserts only that the filter has not stopped tracking -- a run that loses its tracks pins every
-# step at OSPA_CUTOFF -- and the distributional comparison is left to test_statistical_equivalence.py,
-# which has 48 runs per arm to do it properly.
-PORTABLE_MEAN_OSPA_CEILING = 0.9 * hs.OSPA_CUTOFF
+# step at the maximum attainable GOSPA -- and the distributional comparison is left to
+# test_statistical_equivalence.py, which has 48 runs per arm to do it properly.
+#
+# The gate is the fraction of steps that produced an accepted track/truth pair, not a fraction of
+# the cutoff: unnormalised GOSPA is unbounded by c and grows as sqrt(cardinality), so "mean below
+# 0.9 * c" is not a meaningful statement about it. A mean-saturation threshold does not work either
+# -- at 200 particles this harness errs by more than c at most steps, so a healthy run already sits
+# at 0.66-0.88 mean saturation with nothing between it and 1.0. hs.gospa_tracking_fraction separates
+# cleanly instead: 0.35-0.83 across these five cases, and 0.0 for a filter that has stopped
+# tracking. The floor lives in harness_scenario.py so every lost-track gate shares one number.
+PORTABLE_TRACKING_FRACTION_FLOOR = hs.TRACKING_FRACTION_FLOOR
 
 
 def is_reference_platform() -> bool:
@@ -169,7 +179,7 @@ def write_fixtures() -> None:
         print(
             f"  wrote {path.relative_to(hs.REPO_ROOT)}  "
             f"steps={config.num_steps} particles={config.num_particles} k_best={config.k_best} "
-            f"track_rows={digest.track_mean.shape[0]} mean_ospa={digest.ospa.mean():.1f}"
+            f"track_rows={digest.track_mean.shape[0]} mean_gospa={digest.gospa.mean():.1f}"
         )
     print(f"Wrote {sum(len(seeds) for _, seeds in CASES.values())} golden fixtures.")
 
@@ -237,8 +247,8 @@ def main() -> int:
     if portable:
         print(
             f"  the fixtures are bitwise only on {REFERENCE_PLATFORM}/{'|'.join(REFERENCE_MACHINES)}; "
-            f"gating on {', '.join(PORTABLE_INT_FIELDS)}, mean OSPA below "
-            f"{PORTABLE_MEAN_OSPA_CEILING:.0f} m and run-to-run repeatability "
+            f"gating on {', '.join(PORTABLE_INT_FIELDS)}, GOSPA tracking fraction above "
+            f"{PORTABLE_TRACKING_FRACTION_FLOOR:.2f} and run-to-run repeatability "
             "(see the PLATFORM GATING block in this file)"
         )
     for case_name, config, seed in iter_cases():
@@ -258,12 +268,13 @@ def main() -> int:
         )
 
         if portable:
-            candidate_mean = float(candidate.ospa.mean())
+            candidate_tracking = hs.gospa_tracking_fraction(candidate)
+            reference_tracking = hs.gospa_tracking_fraction(reference)
             checker.ok(
-                candidate_mean < PORTABLE_MEAN_OSPA_CEILING,
-                f"[{case_name} seed {seed}] mean OSPA {candidate_mean:.1f} m is at the "
-                f"{hs.OSPA_CUTOFF:.0f} m cutoff (fixture: {reference.ospa.mean():.1f} m); the filter "
-                "is not tracking on this platform",
+                candidate_tracking > PORTABLE_TRACKING_FRACTION_FLOOR,
+                f"[{case_name} seed {seed}] only {candidate_tracking:.3f} of steps produced an "
+                f"accepted track/truth pair (fixture: {reference_tracking:.3f}); the filter is not "
+                "tracking on this platform",
             )
 
         if not args.no_selfcheck:
@@ -276,13 +287,13 @@ def main() -> int:
             )
 
         # A digest full of zeros or NaNs would silently satisfy the comparison above.
-        checker.ok(candidate.ospa.size == config.num_steps, f"[{case_name} seed {seed}] wrong OSPA length")
-        checker.ok(bool((candidate.ospa >= 0.0).all()), f"[{case_name} seed {seed}] negative OSPA")
-        checker.ok(bool(np.isfinite(candidate.ospa).all()), f"[{case_name} seed {seed}] non-finite OSPA")
+        checker.ok(candidate.gospa.size == config.num_steps, f"[{case_name} seed {seed}] wrong GOSPA length")
+        checker.ok(bool((candidate.gospa >= 0.0).all()), f"[{case_name} seed {seed}] negative GOSPA")
+        checker.ok(bool(np.isfinite(candidate.gospa).all()), f"[{case_name} seed {seed}] non-finite GOSPA")
         checker.ok(candidate.track_mean.shape[0] > 0, f"[{case_name} seed {seed}] digest recorded no tracks")
         print(
             f"  [{case_name} seed {seed}] steps={config.num_steps} k_best={config.k_best} "
-            f"track_rows={candidate.track_mean.shape[0]} mean_ospa={candidate.ospa.mean():.1f} matched"
+            f"track_rows={candidate.track_mean.shape[0]} mean_gospa={candidate.gospa.mean():.1f} matched"
         )
         if portable:
             # Not gated on, but printed so a platform's drift is visible in the CI log rather than

@@ -28,6 +28,16 @@ CLUTTER_INTENSITY = 1e-15
 PRUNE_THRESHOLD = 0.001
 K_BEST = 2
 
+# GOSPA cutoff c, metres. Read from the engine (src/metrics.h) rather than re-declared, so the
+# drivers and the test harness cannot drift apart on the metric's parameters.
+GOSPA_CUTOFF = lmb_engine.GOSPA_DEFAULT_CUTOFF
+# An unnormalised GOSPA value is meaningless without its parameters, so every axis label and
+# printed summary carries them.
+GOSPA_PARAMS = (
+    f"unnormalised, c = {GOSPA_CUTOFF / 1000:.0f} km, "
+    f"p = {lmb_engine.GOSPA_ORDER_P:.0f}, alpha = {lmb_engine.GOSPA_ALPHA:.0f}"
+)
+
 NOISE_DECAY_RATE = 0.001
 NOISE_MIN_SCALE = 0.001
 
@@ -164,7 +174,7 @@ def compute_track_mean(track):
     return np.asarray(track.mean_state(), dtype=np.float64).reshape(6)
 
 
-def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
+def run_single_simulation(verbose=False, collect_track_errors=True, seed=None, collect_components=False):
     """
     Run one SMC-LMB simulation.
 
@@ -173,9 +183,15 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
         collect_track_errors: When False, skip Object-1 component-error work (single-run path).
         seed: Optional integer. When set, seeds NumPy and the filter/birth/resampler RNGs so a
             run is reproducible. Default None keeps the historical random_device behaviour.
+        collect_components: When True, also accumulate the per-step GOSPA decomposition. This adds
+            a third return value; the default two-tuple shape is pinned by
+            tests/test_run_once_api_surface.py and must not change.
 
     Returns:
-        (ospa_results, track_error_history)
+        (gospa_results, track_error_history), or
+        (gospa_results, track_error_history, components) when collect_components is True.
+        ``components`` is a dict of float lists keyed "localisation", "missed", "false_positive",
+        each a p-th-power cost (m^p) that sums exactly to gospa**p.
     """
     if seed is not None:
         np.random.seed(seed)
@@ -220,7 +236,8 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
 
     active_ground_truths = []
     sensor_state = SENSOR_STATE.copy()
-    ospa_results = []
+    gospa_results = []
+    gospa_components = {"localisation": [], "missed": [], "false_positive": []}
     track_error_history = []
 
     if verbose:
@@ -276,16 +293,22 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
             else:
                 track_error_history.append(np.zeros(6))
 
-        if len(truth_states) > 0:
-            ospa = lmb_engine.calculate_ospa_distance(
+        # No "if truth_states" guard: with GOSPA, m tracks against zero truths is c*sqrt(m/2) of
+        # false-track cost, not zero. The engine handles n == 0 by construction.
+        if collect_components:
+            breakdown = lmb_engine.calculate_gospa_components(tracks, truth_states, GOSPA_CUTOFF)
+            gospa = breakdown.total
+            gospa_components["localisation"].append(breakdown.localisation)
+            gospa_components["missed"].append(breakdown.missed)
+            gospa_components["false_positive"].append(breakdown.false_positive)
+        else:
+            gospa = lmb_engine.calculate_gospa_distance(
                 tracks,
                 truth_states,
-                100000.0,
+                GOSPA_CUTOFF,
             )
-        else:
-            ospa = 0.0
 
-        ospa_results.append(ospa)
+        gospa_results.append(gospa)
 
         if verbose and (step % 10 == 0 or step in [0, 30, 50]):
             track_probs = [t.existence_probability() for t in tracks]
@@ -295,15 +318,15 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
             print(
                 f"  [Step {step:3d}] t={current_time:6.0f}s | "
                 f"Tracks: {len(tracks):2d} | Truths: {len(active_ground_truths)} | "
-                f"Meas: {len(measurements)} | OSPA: {ospa:8.1f}m | "
+                f"Meas: {len(measurements)} | GOSPA: {gospa:8.1f}m | "
                 f"r=[{prob_str}]"
             )
 
     if verbose:
         print("-" * 60)
         print("\nFinal Results:")
-        print(f"  Final OSPA: {ospa_results[-1]:.1f} m")
-        print(f"  Mean OSPA (last 20 steps): {np.mean(ospa_results[-20:]):.1f} m")
+        print(f"  Final GOSPA: {gospa_results[-1]:.1f} m")
+        print(f"  Mean GOSPA (last 20 steps): {np.mean(gospa_results[-20:]):.1f} m")
         tracks = tracker.get_tracks()
         print("\nTrack Summary:")
         for i, track in enumerate(tracks):
@@ -315,7 +338,9 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
                 f"|pos|={pos_mag:.1f} km, |vel|={vel_mag:.2f} km/s"
             )
 
-    return ospa_results, track_error_history
+    if collect_components:
+        return gospa_results, track_error_history, gospa_components
+    return gospa_results, track_error_history
 
 
 # =============================================================================
@@ -343,14 +368,14 @@ def resolve_max_workers(max_workers: int | None = None) -> int:
 def _monte_carlo_worker(payload: tuple[int, int]) -> tuple[int, np.ndarray, np.ndarray | None]:
     """Top-level worker for ProcessPoolExecutor (must be picklable under spawn)."""
     run_index, seed = payload
-    ospa, errors = run_single_simulation(
+    gospa, errors = run_single_simulation(
         verbose=False,
         collect_track_errors=(run_index == 0),
         seed=int(seed),
     )
-    ospa_arr = np.asarray(ospa, dtype=np.float64)
+    gospa_arr = np.asarray(gospa, dtype=np.float64)
     err_arr = np.asarray(errors, dtype=np.float64) if run_index == 0 else None
-    return int(run_index), ospa_arr, err_arr
+    return int(run_index), gospa_arr, err_arr
 
 
 def run_monte_carlo(
@@ -367,7 +392,7 @@ def run_monte_carlo(
     always comes from run 0. ``max_workers == 1`` (or LMB_NUM_WORKERS=1) is a serial fallback.
 
     Returns:
-        all_ospa: shape (num_runs, NUM_STEPS)
+        all_gospa: shape (num_runs, NUM_STEPS)
         representative_errors: shape (NUM_STEPS, 6) from run 0
         run_seeds: per-run seeds used
     """
@@ -391,26 +416,26 @@ def run_monte_carlo(
     results_by_index: list[np.ndarray | None] = [None] * num_runs
     representative_errors: np.ndarray | None = None
 
-    def _store(run_index: int, ospa: np.ndarray, errors: np.ndarray | None) -> None:
+    def _store(run_index: int, gospa: np.ndarray, errors: np.ndarray | None) -> None:
         nonlocal representative_errors
-        results_by_index[run_index] = ospa
+        results_by_index[run_index] = gospa
         if run_index == 0:
             representative_errors = errors
         if on_run_complete is not None:
-            on_run_complete(run_index, ospa)
+            on_run_complete(run_index, gospa)
 
     if workers == 1:
         for payload in payloads:
-            run_index, ospa, errors = _monte_carlo_worker(payload)
-            _store(run_index, ospa, errors)
+            run_index, gospa, errors = _monte_carlo_worker(payload)
+            _store(run_index, gospa, errors)
     else:
         # spawn avoids forking a process that already loaded the native extension / OpenMP.
         ctx = mp.get_context("spawn")
         with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as executor:
             futures = {executor.submit(_monte_carlo_worker, payload): payload[0] for payload in payloads}
             for future in as_completed(futures):
-                run_index, ospa, errors = future.result()
-                _store(run_index, ospa, errors)
+                run_index, gospa, errors = future.result()
+                _store(run_index, gospa, errors)
 
     if any(item is None for item in results_by_index) or representative_errors is None:
         raise RuntimeError("Monte Carlo batch did not produce a complete result set")
@@ -429,6 +454,8 @@ __all__ = [
     "CLUTTER_INTENSITY",
     "PRUNE_THRESHOLD",
     "K_BEST",
+    "GOSPA_CUTOFF",
+    "GOSPA_PARAMS",
     "NOISE_DECAY_RATE",
     "NOISE_MIN_SCALE",
     "TRUTH_SIGMAS",

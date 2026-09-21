@@ -29,6 +29,7 @@ from simulation_common import (
     NUM_STEPS,
     DT,
     NUM_PARTICLES,
+    GOSPA_PARAMS,
     resolve_max_workers,
     run_monte_carlo,
 )
@@ -71,10 +72,10 @@ def main():
     print("\nRunning Monte Carlo simulations...")
     completed = {"n": 0}
 
-    def handle_complete(run_index, ospa_results):
+    def handle_complete(run_index, gospa_results):
         completed["n"] += 1
         print(
-            f"Run {run_index + 1}/{NUM_MONTE_CARLO} complete - Final OSPA: {ospa_results[-1]:.1f}m "
+            f"Run {run_index + 1}/{NUM_MONTE_CARLO} complete - Final GOSPA: {gospa_results[-1]:.1f}m "
             f"({completed['n']}/{NUM_MONTE_CARLO} finished)"
         )
 
@@ -84,13 +85,13 @@ def main():
         max_workers=max_workers,
         on_run_complete=handle_complete,
     )
-    mean_ospa = np.mean(all_run_data, axis=0)
+    mean_gospa = np.mean(all_run_data, axis=0)
 
     print("\n" + "-" * 60)
     print("Monte Carlo Statistics:")
-    print(f"  Mean Final OSPA: {np.mean(all_run_data[:, -1]):.1f} m")
-    print(f"  Std Final OSPA: {np.std(all_run_data[:, -1]):.1f} m")
-    print(f"  Mean OSPA (last 20 steps, averaged): {np.mean(mean_ospa[-20:]):.1f} m")
+    print(f"  Mean Final GOSPA: {np.mean(all_run_data[:, -1]):.1f} m")
+    print(f"  Std Final GOSPA: {np.std(all_run_data[:, -1]):.1f} m")
+    print(f"  Mean GOSPA (last 20 steps, averaged): {np.mean(mean_gospa[-20:]):.1f} m")
     print("-" * 60)
 
     print("\nGenerating Figure 1 (Individual Runs)...")
@@ -107,8 +108,8 @@ def main():
             label=label,
         )
     ax1.set_xlabel("Time Step", fontsize=12)
-    ax1.set_ylabel("OSPA Distance (m)", fontsize=12)
-    ax1.set_title(f"OSPA Distance Plot of {NUM_MONTE_CARLO} Runs", fontsize=14)
+    ax1.set_ylabel("GOSPA (m)", fontsize=12)
+    ax1.set_title(f"GOSPA over {NUM_MONTE_CARLO} Runs\n{GOSPA_PARAMS}", fontsize=13)
     ax1.legend(loc="upper right")
     ax1.grid(True, alpha=0.3)
     ax1.set_xlim([0, NUM_STEPS - 1])
@@ -122,18 +123,18 @@ def main():
     fig2, ax2 = plt.subplots(figsize=(10, 6))
     ax2.plot(
         time_axis,
-        mean_ospa,
+        mean_gospa,
         color="k",
         linewidth=2.0,
         label=f"Average of {NUM_MONTE_CARLO} Runs",
     )
     ax2.set_xlabel("Time Step", fontsize=12)
-    ax2.set_ylabel("Average OSPA Distance (m)", fontsize=12)
-    ax2.set_title(f"Average OSPA Performance Across {NUM_MONTE_CARLO} Runs", fontsize=14)
+    ax2.set_ylabel("Average GOSPA (m)", fontsize=12)
+    ax2.set_title(f"Average GOSPA Across {NUM_MONTE_CARLO} Runs\n{GOSPA_PARAMS}", fontsize=13)
     ax2.legend(loc="upper right")
     ax2.grid(True, alpha=0.3)
     ax2.set_xlim([0, NUM_STEPS - 1])
-    ax2.set_ylim([0, np.max(mean_ospa) * 1.1])
+    ax2.set_ylim([0, np.max(mean_gospa) * 1.1])
     plt.tight_layout()
     output_path_2 = os.path.join(os.path.dirname(__file__), "run_figure_2_average_performance.png")
     plt.savefig(output_path_2, dpi=150)
@@ -170,7 +171,7 @@ def main():
 
     plt.show()
     print("\nMonte Carlo analysis complete.")
-    return all_run_data, mean_ospa
+    return all_run_data, mean_gospa
 
 
 if __name__ == "__main__":

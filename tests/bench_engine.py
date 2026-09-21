@@ -261,9 +261,14 @@ def run_benchmarks(config: BenchConfig) -> dict:
     )
 
     median_ms, min_ms = time_operation(
-        lambda: lmb.calculate_ospa_distance(updated, truth_states, hs.OSPA_CUTOFF), config
+        lambda: lmb.calculate_gospa_distance(updated, truth_states, hs.GOSPA_CUTOFF), config
     )
-    record("calculate_ospa_distance", median_ms, min_ms, "")
+    record("calculate_gospa_distance", median_ms, min_ms, "")
+
+    median_ms, min_ms = time_operation(
+        lambda: lmb.calculate_gospa_components(updated, truth_states, hs.GOSPA_CUTOFF), config
+    )
+    record("calculate_gospa_components", median_ms, min_ms, "same work plus the decomposition")
 
     return {
         "config": {

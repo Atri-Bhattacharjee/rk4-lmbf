@@ -42,12 +42,16 @@ import run_once  # noqa: E402
 lmb = run_once.lmb_engine
 
 FIXTURE_DIR = TESTS_DIR / "fixtures"
-OSPA_CUTOFF = 100000.0
+# GOSPA cutoff c, metres, read from the engine (src/metrics.h) so the harness and the drivers
+# cannot drift apart. Note this harness runs 200 particles and so errs by tens of kilometres:
+# a large share of steps sit at or beyond c and clip. That is accepted -- the bitwise
+# regression signal lives in track_mean, which is unclipped.
+GOSPA_CUTOFF = lmb.GOSPA_DEFAULT_CUTOFF
 
 # Integer digest fields must match exactly even in --rtol mode: they encode track identity,
 # cardinality and pruning decisions, none of which may drift for a floating-point reason.
-INT_FIELDS = ("cardinality", "num_measurements", "track_step", "track_birth", "track_index")
-FLOAT_FIELDS = ("ospa", "track_r", "track_mean", "track_cov_trace", "track_weight_sum")
+INT_FIELDS = ("cardinality", "num_truths", "num_measurements", "track_step", "track_birth", "track_index")
+FLOAT_FIELDS = ("gospa", "track_r", "track_mean", "track_cov_trace", "track_weight_sum")
 
 
 @dataclass(frozen=True)
@@ -85,8 +89,9 @@ class Digest:
 
     master_seed: int
     config: ScenarioConfig
-    ospa: np.ndarray
+    gospa: np.ndarray
     cardinality: np.ndarray
+    num_truths: np.ndarray
     num_measurements: np.ndarray
     track_step: np.ndarray
     track_birth: np.ndarray
@@ -118,6 +123,56 @@ class Digest:
                 config=ScenarioConfig(num_steps=num_steps, num_particles=num_particles, k_best=k_best),
                 **fields,
             )
+
+
+def gospa_upper_bound(cardinality, num_truths, cutoff: float = GOSPA_CUTOFF) -> np.ndarray:
+    """Tight per-step upper bound on unnormalised GOSPA.
+
+    The clipped assignment sum is at most ``min(m,n) * c**p`` and the penalty is
+    ``(c**p / 2) * |m - n|``; since ``2*min(m,n) + |m - n| == m + n`` this collapses to
+    ``c * sqrt((m + n) / 2)``. Attained exactly when every pair is beyond the cutoff.
+    """
+    m = np.asarray(cardinality, dtype=np.float64)
+    n = np.asarray(num_truths, dtype=np.float64)
+    return cutoff * np.sqrt((m + n) / 2.0)
+
+
+def gospa_saturation(digest: "Digest", cutoff: float = GOSPA_CUTOFF) -> np.ndarray:
+    """Per-step GOSPA as a fraction of the maximum attainable, in [0, 1].
+
+    This replaces the "mean metric below 0.9 * cutoff" lost-track gates that OSPA allowed.
+    Unnormalised GOSPA is not bounded by the cutoff and grows as sqrt(cardinality), so a fraction
+    of c is not a meaningful ceiling; this ratio is both cutoff- and cardinality-independent and
+    survives a retune of either.
+    """
+    bound = gospa_upper_bound(digest.cardinality, digest.num_truths, cutoff)
+    return np.divide(
+        digest.gospa, bound, out=np.zeros_like(digest.gospa, dtype=np.float64), where=bound > 0.0
+    )
+
+
+# Floor for gospa_tracking_fraction, shared by every lost-track gate in the suite.
+#
+# A filter that has stopped tracking scores exactly 0.0, by construction. Healthy runs measured on
+# the reference platform: 0.35-0.83 across the five golden cases, and ~0.28 for the harsher 40-step
+# 200-particle scenario in test_end_to_end.py (individual runs as low as 0.175). 0.05 sits well
+# clear of both while still being unreachable for a dead filter.
+TRACKING_FRACTION_FLOOR = 0.05
+
+
+def gospa_tracking_fraction(digest: "Digest", cutoff: float = GOSPA_CUTOFF) -> float:
+    """Fraction of steps at which at least one track was paired with a truth inside the cutoff.
+
+    GOSPA attains its upper bound exactly when every pair is dropped, so a saturation below 1
+    means the step had an accepted pair. A filter that has stopped tracking reports 0.0 here, by
+    construction, which makes this a real lost-track detector.
+
+    A *mean* threshold cannot do that job at this cutoff. The harness runs 200 particles and errs
+    by more than c at most steps, so a healthy run already sits at ~0.66-0.88 mean saturation
+    against a ceiling of 1.0 -- no headroom to put a threshold in. This statistic keeps a healthy
+    run at 0.35-0.83 and a dead one at 0.0.
+    """
+    return float((gospa_saturation(digest, cutoff) < 1.0 - 1e-12).mean())
 
 
 def particle_arrays(track) -> tuple[np.ndarray, np.ndarray]:
@@ -193,8 +248,9 @@ def run_scenario(
     sensor_state = run_once.SENSOR_STATE.copy()
     active_truths: list[tuple[int, np.ndarray]] = []
 
-    ospa = np.zeros(config.num_steps, dtype=np.float64)
+    gospa = np.zeros(config.num_steps, dtype=np.float64)
     cardinality = np.zeros(config.num_steps, dtype=np.int64)
+    num_truths = np.zeros(config.num_steps, dtype=np.int64)
     num_measurements = np.zeros(config.num_steps, dtype=np.int64)
     track_step: list[int] = []
     track_birth: list[int] = []
@@ -240,10 +296,11 @@ def run_scenario(
         truth_states = [state.copy() for (_, state) in active_truths]
 
         cardinality[step] = len(tracks)
+        num_truths[step] = len(truth_states)
         num_measurements[step] = len(measurements)
-        ospa[step] = (
-            lmb.calculate_ospa_distance(tracks, truth_states, OSPA_CUTOFF) if truth_states else 0.0
-        )
+        # No "if truth_states" guard: with GOSPA, tracks against zero truths is false-track cost,
+        # not zero. The engine handles n == 0 by construction.
+        gospa[step] = lmb.calculate_gospa_distance(tracks, truth_states, GOSPA_CUTOFF)
 
         for track in tracks:
             mean, cov_trace, weight_sum = summarize_track(track)
@@ -268,8 +325,9 @@ def run_scenario(
     return Digest(
         master_seed=master_seed,
         config=config,
-        ospa=ospa,
+        gospa=gospa,
         cardinality=cardinality,
+        num_truths=num_truths,
         num_measurements=num_measurements,
         track_step=np.asarray(track_step, dtype=np.int64),
         track_birth=np.asarray(track_birth, dtype=np.int64),

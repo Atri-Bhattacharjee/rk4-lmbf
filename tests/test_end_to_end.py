@@ -6,7 +6,7 @@ rotation invariant, so:
   * deterministic part: the likelihood of the truth particle against each measurement agrees to 1e-9
     relative between the two scenes at every step;
   * statistical part: with the propagator/resampler RNGs random_device-seeded, 5 runs per scene must give
-    mean-OSPA samples that overlap within 3 sqrt(s1^2/5 + s2^2/5) + 5% of the unrotated mean, with zero
+    mean-GOSPA samples that overlap within 3 sqrt(s1^2/5 + s2^2/5) + 5% of the unrotated mean, with zero
     NaNs and the correct final cardinality in every run.
 """
 
@@ -25,6 +25,7 @@ sys.path.insert(0, str(TESTS_DIR.parent / "python"))
 sys.path.insert(0, str(TESTS_DIR))
 
 import run_once  # noqa: E402
+import harness_scenario as hs  # noqa: E402
 import reference_geometry as ref  # noqa: E402
 
 lmb = run_once.lmb_engine
@@ -32,7 +33,7 @@ lmb = run_once.lmb_engine
 NUM_STEPS = 40
 NUM_PARTICLES = 200
 NUM_RUNS = 5
-OSPA_CUTOFF = 100000.0
+GOSPA_CUTOFF = hs.GOSPA_CUTOFF
 BASE_SEED = 20260908
 
 
@@ -99,18 +100,22 @@ def make_tracker(birth_seed: int):
 
 def run_tracker(measurement_stream, truths_per_step, birth_seed: int):
     tracker = make_tracker(birth_seed)
-    ospa = np.empty(NUM_STEPS)
+    gospa = np.empty(NUM_STEPS)
+    bound = np.empty(NUM_STEPS)
     for step in range(NUM_STEPS):
         if step > 0:
             tracker.predict(run_once.DT)
         tracker.update(measurement_stream[step])
         tracks = tracker.get_tracks()
         truth_states = [state for _, state in truths_per_step[step]]
-        ospa[step] = lmb.calculate_ospa_distance(tracks, truth_states, OSPA_CUTOFF) if truth_states else 0.0
+        # No truth guard: GOSPA scores tracks against zero truths as false-track cost, not zero.
+        gospa[step] = lmb.calculate_gospa_distance(tracks, truth_states, GOSPA_CUTOFF)
+        bound[step] = hs.gospa_upper_bound(len(tracks), len(truth_states), GOSPA_CUTOFF)
     tracks = tracker.get_tracks()
     means = np.array([run_once.compute_track_mean(t) for t in tracks]) if tracks else np.zeros((0, 6))
     confirmed = sum(1 for t in tracks if t.existence_probability() > 0.5)
-    return ospa, means, confirmed
+    saturation = np.divide(gospa, bound, out=np.zeros_like(gospa), where=bound > 0.0)
+    return gospa, means, confirmed, saturation
 
 
 def check_deterministic_likelihood(chk: Checker, q, stream, rotated_stream, truths_per_step) -> None:
@@ -154,6 +159,7 @@ def main() -> None:
 
     base_means = []
     rot_means = []
+    base_tracking = []
     for run in range(NUM_RUNS):
         seed = BASE_SEED + run
         stream = generate_measurement_stream(truths_per_step, sensor_per_step, seed)
@@ -166,13 +172,17 @@ def main() -> None:
         expected_cardinality = len(truths_per_step[-1])
         for label, measurement_stream, truths, sink in (("unrotated", stream, truths_per_step, base_means),
                                                         ("rotated", rotated_stream, rotated_truths, rot_means)):
-            ospa, means, confirmed = run_tracker(measurement_stream, truths, birth_seed=seed)
-            chk.ok(np.all(np.isfinite(ospa)), f"[{label} run {run}] NaN/Inf in OSPA")
+            gospa, means, confirmed, saturation = run_tracker(measurement_stream, truths, birth_seed=seed)
+            chk.ok(np.all(np.isfinite(gospa)), f"[{label} run {run}] NaN/Inf in GOSPA")
             chk.ok(np.all(np.isfinite(means)), f"[{label} run {run}] NaN/Inf in a track mean")
             chk.ok(confirmed == expected_cardinality,
                    f"[{label} run {run}] {confirmed} confirmed tracks, expected {expected_cardinality}")
-            sink.append(float(np.mean(ospa)))
-            print(f"  [{label} run {run}] mean OSPA {sink[-1]:.1f} m, final {ospa[-1]:.1f} m, confirmed {confirmed}")
+            sink.append(float(np.mean(gospa)))
+            tracking = float(np.mean(saturation < 1.0 - 1e-12))
+            if label == "unrotated":
+                base_tracking.append(tracking)
+            print(f"  [{label} run {run}] mean GOSPA {sink[-1]:.1f} m "
+                  f"(tracking fraction {tracking:.3f}), final {gospa[-1]:.1f} m, confirmed {confirmed}")
 
     base = np.array(base_means)
     rot = np.array(rot_means)
@@ -180,10 +190,18 @@ def main() -> None:
     s2 = rot.std(ddof=1)
     bound = 3.0 * np.sqrt(s1**2 / NUM_RUNS + s2**2 / NUM_RUNS) + 0.05 * base.mean()
     delta = abs(base.mean() - rot.mean())
-    print(f"  unrotated mean OSPA {base.mean():.1f} +- {s1:.1f}; rotated {rot.mean():.1f} +- {s2:.1f}; "
+    print(f"  unrotated mean GOSPA {base.mean():.1f} +- {s1:.1f}; rotated {rot.mean():.1f} +- {s2:.1f}; "
           f"|delta| {delta:.1f} <= {bound:.1f}")
-    chk.ok(delta <= bound, f"rotated/unrotated mean OSPA differ by {delta:.1f} m > bound {bound:.1f} m")
-    chk.ok(base.mean() < OSPA_CUTOFF / 2, f"unrotated mean OSPA {base.mean():.1f} m is at the cutoff; tracker is not tracking")
+    chk.ok(delta <= bound, f"rotated/unrotated mean GOSPA differ by {delta:.1f} m > bound {bound:.1f} m")
+    # Lost-track gate. Not a fraction of the cutoff (unnormalised GOSPA is not bounded by it) and
+    # not a mean saturation (at 200 particles a healthy run already sits near 1.0, leaving no
+    # headroom). The fraction of steps that produced an accepted track/truth pair is 0.0 by
+    # construction for a filter that has stopped tracking. Matches
+    # hs.TRACKING_FRACTION_FLOOR, shared with test_golden_invariance.py.
+    mean_tracking = float(np.mean(base_tracking))
+    chk.ok(mean_tracking > hs.TRACKING_FRACTION_FLOOR,
+           f"only {mean_tracking:.3f} of steps produced an accepted track/truth pair; "
+           "tracker is not tracking")
 
     if chk.count <= 0:
         raise AssertionError("no assertions executed")

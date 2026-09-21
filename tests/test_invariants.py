@@ -117,11 +117,15 @@ def check_run(checker: Checker, config: hs.ScenarioConfig, seed: int) -> None:
 
     digest = hs.run_scenario(seed, config, observer=observer)
 
-    checker.ok(bool(np.isfinite(digest.ospa).all()), f"{label}: non-finite OSPA")
-    checker.ok(bool((digest.ospa >= 0.0).all()), f"{label}: negative OSPA")
+    checker.ok(bool(np.isfinite(digest.gospa).all()), f"{label}: non-finite GOSPA")
+    checker.ok(bool((digest.gospa >= 0.0).all()), f"{label}: negative GOSPA")
+    # Unnormalised GOSPA is NOT bounded by the cutoff -- it grows as sqrt(cardinality). The tight
+    # bound is c * sqrt((m + n) / 2), attained when every pair is beyond the cutoff.
+    bound = hs.gospa_upper_bound(digest.cardinality, digest.num_truths)
     checker.ok(
-        bool((digest.ospa <= hs.OSPA_CUTOFF).all()),
-        f"{label}: OSPA exceeds the cutoff {hs.OSPA_CUTOFF} (max {digest.ospa.max()})",
+        bool((digest.gospa <= bound * (1.0 + 1e-12)).all()),
+        f"{label}: GOSPA exceeds c*sqrt((m+n)/2) (worst ratio "
+        f"{np.max(digest.gospa / np.where(bound > 0, bound, 1.0)):.6f})",
     )
     checker.ok(
         bool(np.isfinite(digest.track_cov_trace).all() & (digest.track_cov_trace >= 0.0).all()),

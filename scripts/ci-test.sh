@@ -13,6 +13,9 @@ fi
 python -c "import sys; sys.path.insert(0, 'python'); from lmb_engine_loader import import_lmb_engine; m = import_lmb_engine(); print('ok', m.__file__, 'validation' if m.VALIDATION_ENABLED else 'no-validation')"
 python tests/test_two_body_propagator_multistep.py
 python tests/assignments.py
+# Pure arithmetic, sub-second. Runs early so a broken metric fails here rather than after
+# the multi-minute golden and statistical stages.
+python tests/test_gospa_metric.py
 python tests/test_los_geometry.py
 python tests/test_local_residual_cached_basis.py
 python tests/test_validation_dimensions.py
@@ -38,7 +41,7 @@ python tests/test_end_to_end.py
 
 # test_statistical_equivalence.py replaces the bitwise gate off the reference platform, where the
 # STL's random distributions draw a different stream from the same seed and no tolerance on the
-# golden digest is meaningful. It compares mean-OSPA distributions over 48 independent scenarios per
+# golden digest is meaningful. It compares mean-GOSPA distributions over 48 independent scenarios per
 # arm, which is the right question for a stream difference. On the reference platform the bitwise
 # gate already covers it, so it is skipped there; in Debug it costs minutes, so it belongs against
 # Release.

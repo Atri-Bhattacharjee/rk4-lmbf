@@ -25,14 +25,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from simulation_common import *  # noqa: F401,F403
-from simulation_common import NUM_STEPS, DT, NUM_PARTICLES, run_single_simulation
+from simulation_common import NUM_STEPS, DT, NUM_PARTICLES, GOSPA_PARAMS, run_single_simulation
 
 
 def main():
     """
     Single simulation driver.
 
-    Runs one simulation and generates an OSPA distance plot (solid black line).
+    Runs one simulation and generates an GOSPA distance plot (solid black line).
     """
     print("=" * 60)
     print("SMC-LMB Single Run Analysis")
@@ -43,32 +43,53 @@ def main():
     print("=" * 60)
 
     print("\nRunning simulation...")
-    ospa_results, _ = run_single_simulation(verbose=False, collect_track_errors=False)
+    gospa_results, _, components = run_single_simulation(
+        verbose=False, collect_track_errors=False, collect_components=True
+    )
 
-    print(f"Run complete - Final OSPA: {ospa_results[-1]:.1f}m")
-    print(f"  Mean OSPA (last 20 steps): {np.mean(ospa_results[-20:]):.1f} m")
+    print(f"Run complete - Final GOSPA: {gospa_results[-1]:.1f}m")
+    print(f"  Mean GOSPA (last 20 steps): {np.mean(gospa_results[-20:]):.1f} m")
+    print(f"  Metric: GOSPA, {GOSPA_PARAMS}")
 
-    print("\nGenerating OSPA plot...")
+    print("\nGenerating GOSPA plot...")
 
+    # Stacked in the p-th-power domain, where the three components are exactly additive and sum to
+    # GOSPA**p. Unnormalised GOSPA steps up whenever an object is born -- it grows as sqrt(k) with
+    # cardinality even under perfect tracking -- so plotting the total alone reads as degradation.
+    # Stacking makes the cardinality contribution explicit instead.
     fig, ax = plt.subplots(figsize=(10, 6))
     time_axis = np.arange(NUM_STEPS)
-    ax.plot(time_axis, ospa_results, color="k", linewidth=2.0, label="OSPA Distance")
+    localisation = np.asarray(components["localisation"], dtype=np.float64)
+    missed = np.asarray(components["missed"], dtype=np.float64)
+    false_positive = np.asarray(components["false_positive"], dtype=np.float64)
+
+    ax.stackplot(
+        time_axis,
+        localisation,
+        missed,
+        false_positive,
+        labels=["Localisation", "Missed truths", "False tracks"],
+        colors=["#4c72b0", "#dd8452", "#c44e52"],
+        alpha=0.85,
+    )
+    ax.plot(time_axis, np.asarray(gospa_results) ** 2, color="k", linewidth=2.0,
+            label="Total (GOSPA$^2$)")
     ax.set_xlabel("Time Step", fontsize=12)
-    ax.set_ylabel("OSPA Distance (m)", fontsize=12)
-    ax.set_title("OSPA Distance Plot", fontsize=14)
+    ax.set_ylabel("GOSPA$^2$ cost (m$^2$)", fontsize=12)
+    ax.set_title(f"GOSPA error decomposition\n{GOSPA_PARAMS}", fontsize=13)
     ax.legend(loc="upper right")
     ax.grid(True, alpha=0.3)
     ax.set_xlim([0, NUM_STEPS - 1])
-    ax.set_ylim([0, np.max(ospa_results) * 1.1])
+    ax.set_ylim([0, np.max(np.asarray(gospa_results) ** 2) * 1.1])
     plt.tight_layout()
 
-    output_path = os.path.join(os.path.dirname(__file__), "figure_ospa_single_run.png")
+    output_path = os.path.join(os.path.dirname(__file__), "figure_gospa_single_run.png")
     plt.savefig(output_path, dpi=150)
     print(f"  Saved: {output_path}")
     plt.show()
 
     print("\nSingle run analysis complete.")
-    return ospa_results
+    return gospa_results
 
 
 if __name__ == "__main__":

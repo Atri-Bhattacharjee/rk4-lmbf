@@ -150,7 +150,7 @@ source venv/bin/activate
 python python/run_once.py
 ```
 
-Writes `python/figure_ospa_single_run.png`.
+Writes `python/figure_gospa_single_run.png`.
 
 ### Monte Carlo simulation
 
@@ -161,9 +161,11 @@ python python/run.py
 
 Runs 20 Monte Carlo trials and writes PNG figures under `python/`:
 
-- `figure_1_individual_runs.png`
-- `figure_2_average_performance.png`
-- `figure_3_component_error.png`
+- `run_figure_1_individual_runs.png`
+- `run_figure_2_average_performance.png`
+- `run_figure_3_component_error.png`
+
+(`python/2026_ieee_aerospace.py` writes the same three without the `run_` prefix.)
 
 ### Paper reproduction
 
@@ -176,6 +178,35 @@ LMB_ENGINE_VERBOSE=1 python python/run_once.py
 ```
 
 Both Monte Carlo scripts honour `LMB_NUM_RUNS` (e.g. `LMB_NUM_RUNS=1 python python/run.py` for a quick smoke run).
+
+## Accuracy metric
+
+Tracking accuracy is measured with **GOSPA** (Generalized Optimal Sub-Pattern Assignment;
+Rahmathullah, Garcia-Fernandez & Svensson, FUSION 2017), implemented in `src/metrics.cpp` and
+exposed as `lmb_engine.calculate_gospa_distance` / `calculate_gospa_components`.
+
+| Parameter | Value | Note |
+|-----------|-------|------|
+| `p` | 2 | compile-time constant, not an argument |
+| `alpha` | 2 | fixed — the error decomposition is only valid at 2 |
+| `c` (cutoff) | 10 km | `lmb_engine.GOSPA_DEFAULT_CUTOFF`, the single source in the repo |
+| base distance | position only (first 3 components), metres | |
+| normalisation | none | |
+
+Two consequences worth knowing before reading a number:
+
+- **It is unnormalised**, so it grows as `sqrt(k)` with the number of objects and is *not* bounded
+  by `c`. The tight bound is `c * sqrt((m + n) / 2)`. Expect the curve to step up at each birth
+  even under perfect tracking; `python/run_once.py` plots the decomposition stacked so that the
+  cardinality contribution is visible rather than mistaken for degradation.
+- **At `alpha = 2` it decomposes exactly** into localisation, missed-truth and false-track costs,
+  which sum to `GOSPA**p`. That is the reason it replaced OSPA here: OSPA folds localisation and
+  cardinality error into one number, so it can say that two sensor-tasking policies differ but not
+  how. `calculate_gospa_components` returns the breakdown.
+
+The cutoff is scaled for the production driver (10k particles, ~2.6 km mean error, ~2% of steps at
+the cutoff). The 200-particle test harness errs by more than `c` at most steps, which weakens
+`tests/test_statistical_equivalence.py` — see the KNOWN WEAKNESS block in that file.
 
 ## Measurement model
 
@@ -263,7 +294,7 @@ python tests/test_golden_invariance.py --exact       # force bitwise
 python tests/test_golden_invariance.py --rtol 1e-9   # tolerant, for a deliberate FP-order change
 python tests/test_golden_invariance.py --portable    # force the platform-independent subset
 python tests/test_golden_invariance.py --write       # regenerate the fixtures
-python tests/test_statistical_equivalence.py         # 48 seeds/arm, Welch t + KS on mean OSPA
+python tests/test_statistical_equivalence.py         # 48 seeds/arm, Welch t + KS on mean GOSPA
 python tests/bench_engine.py --json before.json      # record hot-path timings and peak RSS
 python tests/bench_engine.py --compare before.json   # diff against a recorded set
 ./scripts/gate.sh                                    # Release + Debug suites, statistics, benchmark
@@ -273,7 +304,7 @@ python tests/bench_engine.py --compare before.json   # diff against a recorded s
 #### Bitwise reproduction is per-platform
 
 **Standing rule for CI/CD:** never require bitwise identity on macOS (or any non-reference
-runner). New tests that pin absolute float digests, OSPA byte heads, or `np.array_equal` against a
+runner). New tests that pin absolute float digests, GOSPA byte heads, or `np.array_equal` against a
 Linux-captured fixture must gate on the reference platform and use portable / `rtol` / statistical
 checks everywhere else — including the macOS GitHub Actions job. Bitwise gates belong only on
 x86-64 Linux / libstdc++.
@@ -344,7 +375,7 @@ rk4-lmbf/
 │   └── validation.h
 ├── python/
 │   ├── lmb_engine_loader.py    # locates & imports compiled extension
-│   ├── run_once.py             # single-run simulation + OSPA plot
+│   ├── run_once.py             # single-run simulation + GOSPA plot
 │   ├── run.py                  # Monte Carlo simulation (20 runs)
 │   ├── 2026_ieee_aerospace.py  # paper config (K_BEST=100)
 │   └── lmb_engine/             # built extension output (.so / .pyd)
