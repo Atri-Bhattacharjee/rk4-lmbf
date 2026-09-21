@@ -45,10 +45,10 @@
       "min_ms": 0.2333209995413199,
       "note": "3x6, 100 hypotheses returned"
     },
-    "calculate_ospa_distance": {
+    "calculate_gospa_distance": {
       "median_ms": 0.051297000027261674,
       "min_ms": 0.05092700303066522,
-      "note": ""
+      "note": "timing captured under the OSPA predecessor; the assignment work is identical and GOSPA does one fewer sqrt per pair"
     }
   },
   "peak_rss_mb": 132.45703125

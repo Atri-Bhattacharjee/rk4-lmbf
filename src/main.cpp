@@ -473,10 +473,45 @@ PYBIND11_MODULE(lmb_engine, m) {
     m.def("solve_assignment", &solve_assignment, pybind11::arg("cost_matrix"), pybind11::arg("k_best"),
           "Solves the assignment problem and returns K-best hypotheses.");
 
-    // Bind the calculate_ospa_distance function
-    m.def("calculate_ospa_distance", &calculate_ospa_distance,
-          "Calculates the OSPA distance between estimated tracks and ground truths",
+    // --- GOSPA metric (see src/metrics.h) ---
+    // Exposed as module attributes so every Python harness reads one number rather than
+    // re-declaring its own literal.
+    m.attr("GOSPA_DEFAULT_CUTOFF") = kGospaDefaultCutoff;
+    m.attr("GOSPA_ORDER_P") = kGospaOrder;
+    m.attr("GOSPA_ALPHA") = kGospaAlpha;
+
+    pybind11::class_<GospaComponents>(m, "GospaComponents",
+        "alpha=2 GOSPA decomposition.\n\n"
+        "localisation/missed/false_positive are p-th-power costs (m^p) and sum EXACTLY to\n"
+        "total**p; the roots are not additive. total is in metres.")
+        .def_readonly("localisation", &GospaComponents::localisation_cost)
+        .def_readonly("missed", &GospaComponents::missed_cost)
+        // Not "false": that is a Python keyword, and the attribute would only be reachable
+        // through getattr().
+        .def_readonly("false_positive", &GospaComponents::false_cost)
+        .def_readonly("total", &GospaComponents::total)
+        .def_readonly("num_assigned", &GospaComponents::num_assigned)
+        .def_readonly("num_missed", &GospaComponents::num_missed)
+        .def_readonly("num_false", &GospaComponents::num_false)
+        .def_readonly("associations", &GospaComponents::associations)
+        .def("__repr__", [](const GospaComponents& g) {
+            return "<GospaComponents total=" + std::to_string(g.total) +
+                   " assigned=" + std::to_string(g.num_assigned) +
+                   " missed=" + std::to_string(g.num_missed) +
+                   " false=" + std::to_string(g.num_false) + ">";
+        });
+
+    m.def("calculate_gospa_distance", &calculate_gospa_distance,
+          "Unnormalised GOSPA (p=2, alpha=2) in metres between estimated tracks and ground\n"
+          "truths, position-only base distance. Not bounded by the cutoff; the tight bound is\n"
+          "cutoff * sqrt((len(tracks) + len(ground_truths)) / 2).",
           pybind11::arg("tracks"),
           pybind11::arg("ground_truths"),
-          pybind11::arg("cutoff"));
+          pybind11::arg("cutoff") = kGospaDefaultCutoff);
+
+    m.def("calculate_gospa_components", &calculate_gospa_components,
+          "GOSPA with its localisation / missed / false-track decomposition.",
+          pybind11::arg("tracks"),
+          pybind11::arg("ground_truths"),
+          pybind11::arg("cutoff") = kGospaDefaultCutoff);
 }

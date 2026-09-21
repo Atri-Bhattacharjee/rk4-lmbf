@@ -5,13 +5,13 @@ Some optimizations cannot be bitwise: Phase 2 changes the summation order of the
 granularity of the resampling walk, and Phase 5 hoists a ``normal_distribution`` out of a loop,
 which shifts the propagator's random stream. For those, "unchanged" has to mean "draws from the
 same distribution", so this harness runs many independent scenarios per arm and compares the
-resulting mean-OSPA distributions.
+resulting mean-GOSPA distributions.
 
 Three comparisons must all pass:
 
-1. Welch's t-test on per-run mean OSPA (location), ``p > alpha`` (default 0.01).
-2. Two-sample KS test on per-run mean OSPA (whole distribution, not just its mean), ``p > alpha``.
-3. A per-step Welch test on the mean-OSPA curve, Bonferroni-corrected across steps. A phase that
+1. Welch's t-test on per-run mean GOSPA (location), ``p > alpha`` (default 0.01).
+2. Two-sample KS test on per-run mean GOSPA (whole distribution, not just its mean), ``p > alpha``.
+3. A per-step Welch test on the mean-GOSPA curve, Bonferroni-corrected across steps. A phase that
    shifts only, say, the convergence transient would pass 1 and 2 while failing this.
 
 The baseline is generated once from the pre-change build and committed. Regenerating it discards
@@ -24,6 +24,16 @@ comparison rejects a true null ``alpha`` of the time, so the 0.01 that is right 
 one-off phase check would fail a few percent of CI runs on a platform that is merely different.
 ci-test.sh and ci-test.ps1 pass a smaller value, which still fails a genuinely broken port by many
 orders of magnitude.
+
+KNOWN WEAKNESS -- this gate is less powerful than it looks. GOSPA clips every distance at the
+cutoff, and this harness runs 200 particles, so it errs by enough that a large share of steps sit
+at or beyond the cutoff and collapse onto the same clipped value. That compresses the mean-GOSPA
+distribution and costs the three comparisons real power to distinguish a broken port from a healthy
+one. The weakness was accepted deliberately when the metric moved from OSPA to GOSPA, rather than
+keeping a second wider cutoff just for the tests. Treat a pass here as weak evidence, and do not
+add new gates that depend on this signal alone. Note this compounds a separate known blind spot:
+neither this suite nor the golden digest can detect an error in the association-cost scaling
+(kappa, P_D) -- see tests/test_clutter_scaling.py.
 
 Usage:
     python tests/test_statistical_equivalence.py            # compare against the fixture
@@ -69,19 +79,19 @@ def scenario_seeds(num_seeds: int) -> list[int]:
 
 
 def collect_arm(num_seeds: int, config: hs.ScenarioConfig) -> tuple[np.ndarray, np.ndarray]:
-    """Run one arm. Returns ``(mean_ospa_per_run, ospa_curves)``."""
+    """Run one arm. Returns ``(mean_gospa_per_run, gospa_curves)``."""
     curves = np.zeros((num_seeds, config.num_steps), dtype=np.float64)
     for row, seed in enumerate(scenario_seeds(num_seeds)):
-        curves[row, :] = hs.run_scenario(seed, config).ospa
+        curves[row, :] = hs.run_scenario(seed, config).gospa
     return curves.mean(axis=1), curves
 
 
 def write_baseline(num_seeds: int) -> None:
-    mean_ospa, curves = collect_arm(num_seeds, STAT_CONFIG)
+    mean_gospa, curves = collect_arm(num_seeds, STAT_CONFIG)
     BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         BASELINE_PATH,
-        mean_ospa=mean_ospa,
+        mean_gospa=mean_gospa,
         curves=curves,
         config=np.array(
             [STAT_CONFIG.num_steps, STAT_CONFIG.num_particles, STAT_CONFIG.k_best], dtype=np.int64
@@ -90,7 +100,7 @@ def write_baseline(num_seeds: int) -> None:
     )
     print(
         f"  wrote {BASELINE_PATH.relative_to(hs.REPO_ROOT)}  runs={num_seeds} "
-        f"mean={mean_ospa.mean():.1f} m  sd={mean_ospa.std(ddof=1):.1f} m"
+        f"mean={mean_gospa.mean():.1f} m  sd={mean_gospa.std(ddof=1):.1f} m"
     )
     print("Baseline written. Record the regeneration and its reason in the commit message.")
 
@@ -131,7 +141,7 @@ def main() -> int:
         )
 
     with np.load(BASELINE_PATH) as data:
-        baseline_mean = data["mean_ospa"]
+        baseline_mean = data["mean_gospa"]
         baseline_curves = data["curves"]
         baseline_config = hs.ScenarioConfig(*(int(value) for value in data["config"]))
         baseline_seed_source = int(data["seed_source"][0])
@@ -151,7 +161,7 @@ def main() -> int:
     )
 
     candidate_mean, candidate_curves = collect_arm(args.seeds, STAT_CONFIG)
-    checker.ok(bool(np.isfinite(candidate_mean).all()), "candidate arm produced a non-finite mean OSPA")
+    checker.ok(bool(np.isfinite(candidate_mean).all()), "candidate arm produced a non-finite mean GOSPA")
 
     t_statistic, degrees_of_freedom, t_p = st.welch_t_test(baseline_mean, candidate_mean)
     ks_statistic, ks_p = st.ks_2samp(baseline_mean, candidate_mean)
@@ -160,7 +170,7 @@ def main() -> int:
     delta = float(candidate_mean.mean() - baseline_mean.mean())
     effect_size = delta / pooled_sd if pooled_sd > 0.0 else 0.0
 
-    print(f"mean-OSPA distributions over {args.seeds} runs per arm")
+    print(f"mean-GOSPA distributions over {args.seeds} runs per arm")
     print(f"  baseline   {baseline_mean.mean():9.1f} m  sd {baseline_mean.std(ddof=1):8.1f} m")
     print(f"  candidate  {candidate_mean.mean():9.1f} m  sd {candidate_mean.std(ddof=1):8.1f} m")
     print(f"  delta      {delta:9.1f} m  (Cohen's d {effect_size:+.3f})")
@@ -169,12 +179,12 @@ def main() -> int:
 
     checker.ok(
         t_p > alpha,
-        f"Welch t-test rejects equality of mean OSPA: t={t_statistic:+.4f}, df={degrees_of_freedom:.1f}, "
+        f"Welch t-test rejects equality of mean GOSPA: t={t_statistic:+.4f}, df={degrees_of_freedom:.1f}, "
         f"p={t_p:.6f} <= {alpha:g} (delta {delta:.1f} m, Cohen's d {effect_size:+.3f})",
     )
     checker.ok(
         ks_p > alpha,
-        f"KS test rejects equality of the mean-OSPA distribution: D={ks_statistic:.4f}, "
+        f"KS test rejects equality of the mean-GOSPA distribution: D={ks_statistic:.4f}, "
         f"p={ks_p:.6f} <= {alpha:g}",
     )
 
@@ -193,7 +203,7 @@ def main() -> int:
     )
     checker.ok(
         worst_p > step_threshold,
-        f"per-step mean-OSPA curve differs at step {worst_step}: p={worst_p:.3e} <= {step_threshold:.3e} "
+        f"per-step mean-GOSPA curve differs at step {worst_step}: p={worst_p:.3e} <= {step_threshold:.3e} "
         f"(baseline {baseline_curves[:, worst_step].mean():.1f} m, "
         f"candidate {candidate_curves[:, worst_step].mean():.1f} m)",
     )

@@ -41,6 +41,17 @@ CLUTTER_INTENSITY = 1e-15 # False alarm rate per unit measurement volume
 PRUNE_THRESHOLD = 0.001  # Existence probability threshold for track pruning
 K_BEST = 100             # Number of K-best assignment hypotheses
 
+# --- Metric Parameters ---
+# GOSPA cutoff c, metres. Read from the engine (src/metrics.h) rather than re-declared here:
+# this harness is deliberately independent *code*, but it must not report a differently
+# parameterised metric under the same name as the other drivers.
+GOSPA_CUTOFF = lmb_engine.GOSPA_DEFAULT_CUTOFF
+# An unnormalised GOSPA value is meaningless without its parameters, so labels carry them.
+GOSPA_PARAMS = (
+    f"unnormalised, c = {GOSPA_CUTOFF / 1000:.0f} km, "
+    f"p = {lmb_engine.GOSPA_ORDER_P:.0f}, alpha = {lmb_engine.GOSPA_ALPHA:.0f}"
+)
+
 # --- Process Noise Annealing ---
 # Exponential decay of process noise as tracks mature
 # alpha(age) = NOISE_MIN_SCALE + (1 - NOISE_MIN_SCALE) * exp(-NOISE_DECAY_RATE * age)
@@ -294,7 +305,7 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
     Run a single SMC-LMB filter simulation.
     
     This function initializes all models and tracker from scratch,
-    runs the full simulation, and returns the OSPA results along with
+    runs the full simulation, and returns the GOSPA results along with
     component-wise error history for Object 1 (for Figure 3).
     
     Args:
@@ -303,8 +314,8 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
         seed: Optional integer. When set, seeds NumPy and the filter/birth/resampler RNGs.
         
     Returns:
-        tuple: (ospa_results, track_error_history)
-            - ospa_results: OSPA distance at each time step (length NUM_STEPS)
+        tuple: (gospa_results, track_error_history)
+            - gospa_results: GOSPA distance at each time step (length NUM_STEPS)
             - track_error_history: 6D error vectors for Object 1 (shape NUM_STEPS x 6)
     """
     if seed is not None:
@@ -370,7 +381,7 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
     active_ground_truths = []
     
     # Results storage
-    ospa_results = []
+    gospa_results = []
     track_error_history = []  # 6D error vectors for Object 1 (for Figure 3)
     
     # -------------------------------------------------------------------------
@@ -427,7 +438,7 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
         # ---------------------------------------------------------------------
         tracks = tracker.get_tracks()
         
-        # Extract truth states for OSPA calculation
+        # Extract truth states for GOSPA calculation
         truth_states = [state.copy() for (_, state) in active_ground_truths]
         
         # ---------------------------------------------------------------------
@@ -462,16 +473,15 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
         # ---------------------------------------------------------------------
         # F. METRIC CALCULATION
         # ---------------------------------------------------------------------
-        if len(truth_states) > 0:
-            ospa = lmb_engine.calculate_ospa_distance(
-                tracks, 
-                truth_states, 
-                100000.0  # cutoff distance in meters
-            )
-        else:
-            ospa = 0.0
+        # No "if truth_states" guard: with GOSPA, m tracks against zero truths is c*sqrt(m/2) of
+        # false-track cost, not zero. The engine handles n == 0 by construction.
+        gospa = lmb_engine.calculate_gospa_distance(
+            tracks,
+            truth_states,
+            GOSPA_CUTOFF,
+        )
         
-        ospa_results.append(ospa)
+        gospa_results.append(gospa)
         
         # ---------------------------------------------------------------------
         # G. LOGGING (every 10 steps + birth events)
@@ -485,7 +495,7 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
             
             print(f"  [Step {step:3d}] t={current_time:6.0f}s | "
                   f"Tracks: {len(tracks):2d} | Truths: {len(active_ground_truths)} | "
-                  f"Meas: {len(measurements)} | OSPA: {ospa:8.1f}m | "
+                  f"Meas: {len(measurements)} | GOSPA: {gospa:8.1f}m | "
                   f"r=[{prob_str}]")
     
     # -------------------------------------------------------------------------
@@ -495,8 +505,8 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
     if verbose:
         print("-" * 60)
         print("\nFinal Results:")
-        print(f"  Final OSPA: {ospa_results[-1]:.1f} m")
-        print(f"  Mean OSPA (last 20 steps): {np.mean(ospa_results[-20:]):.1f} m")
+        print(f"  Final GOSPA: {gospa_results[-1]:.1f} m")
+        print(f"  Mean GOSPA (last 20 steps): {np.mean(gospa_results[-20:]):.1f} m")
         
         # Track-by-track summary
         tracks = tracker.get_tracks()
@@ -508,7 +518,7 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
             print(f"  Track {i+1}: r={track.existence_probability():.3f}, "
                   f"|pos|={pos_mag:.1f} km, |vel|={vel_mag:.2f} km/s")
     
-    return ospa_results, track_error_history
+    return gospa_results, track_error_history
 
 
 # =============================================================================
@@ -530,14 +540,14 @@ def _ieee_resolve_max_workers():
 def _ieee_monte_carlo_worker(payload):
     """Top-level worker for ProcessPoolExecutor (picklable under spawn)."""
     run_index, seed = payload
-    ospa, errors = run_single_simulation(
+    gospa, errors = run_single_simulation(
         verbose=False,
         collect_track_errors=(run_index == 0),
         seed=int(seed),
     )
-    ospa_arr = np.asarray(ospa, dtype=np.float64)
+    gospa_arr = np.asarray(gospa, dtype=np.float64)
     err_arr = np.asarray(errors, dtype=np.float64) if run_index == 0 else None
-    return int(run_index), ospa_arr, err_arr
+    return int(run_index), gospa_arr, err_arr
 
 
 def main():
@@ -580,21 +590,21 @@ def main():
     finished = 0
     payloads = [(i, run_seeds[i]) for i in range(NUM_MONTE_CARLO)]
 
-    def _store(run_index, ospa_results, track_error_history):
+    def _store(run_index, gospa_results, track_error_history):
         nonlocal representative_errors, finished
-        results_by_index[run_index] = ospa_results
+        results_by_index[run_index] = gospa_results
         if run_index == 0:
             representative_errors = track_error_history
         finished += 1
         print(
-            f"Run {run_index + 1}/{NUM_MONTE_CARLO} complete - Final OSPA: {ospa_results[-1]:.1f}m "
+            f"Run {run_index + 1}/{NUM_MONTE_CARLO} complete - Final GOSPA: {gospa_results[-1]:.1f}m "
             f"({finished}/{NUM_MONTE_CARLO} finished)"
         )
 
     if max_workers == 1:
         for payload in payloads:
-            run_index, ospa_results, track_error_history = _ieee_monte_carlo_worker(payload)
-            _store(run_index, ospa_results, track_error_history)
+            run_index, gospa_results, track_error_history = _ieee_monte_carlo_worker(payload)
+            _store(run_index, gospa_results, track_error_history)
     else:
         ctx = mp.get_context("spawn")
         with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
@@ -603,8 +613,8 @@ def main():
                 for payload in payloads
             }
             for future in as_completed(futures):
-                run_index, ospa_results, track_error_history = future.result()
-                _store(run_index, ospa_results, track_error_history)
+                run_index, gospa_results, track_error_history = future.result()
+                _store(run_index, gospa_results, track_error_history)
 
     # Convert to 2D numpy array: shape (NUM_MONTE_CARLO, NUM_STEPS), ordered by run index
     all_run_data = np.stack(results_by_index, axis=0)
@@ -613,14 +623,14 @@ def main():
     # Phase 2: Statistical Calculation
     # -------------------------------------------------------------------------
     
-    # Compute column-wise mean (average OSPA at each time step)
-    mean_ospa = np.mean(all_run_data, axis=0)
+    # Compute column-wise mean (average GOSPA at each time step)
+    mean_gospa = np.mean(all_run_data, axis=0)
     
     print("\n" + "-" * 60)
     print("Monte Carlo Statistics:")
-    print(f"  Mean Final OSPA: {np.mean(all_run_data[:, -1]):.1f} m")
-    print(f"  Std Final OSPA: {np.std(all_run_data[:, -1]):.1f} m")
-    print(f"  Mean OSPA (last 20 steps, averaged): {np.mean(mean_ospa[-20:]):.1f} m")
+    print(f"  Mean Final GOSPA: {np.mean(all_run_data[:, -1]):.1f} m")
+    print(f"  Std Final GOSPA: {np.std(all_run_data[:, -1]):.1f} m")
+    print(f"  Mean GOSPA (last 20 steps, averaged): {np.mean(mean_gospa[-20:]):.1f} m")
     print("-" * 60)
     
     # -------------------------------------------------------------------------
@@ -645,8 +655,8 @@ def main():
                  label=label)
     
     ax1.set_xlabel('Time Step', fontsize=12)
-    ax1.set_ylabel('OSPA Distance (m)', fontsize=12)
-    ax1.set_title(f'OSPA Distance Plot of {NUM_MONTE_CARLO} Runs', fontsize=14)
+    ax1.set_ylabel('GOSPA (m)', fontsize=12)
+    ax1.set_title(f'GOSPA over {NUM_MONTE_CARLO} Runs\n{GOSPA_PARAMS}', fontsize=13)
     ax1.legend(loc='upper right')
     ax1.grid(True, alpha=0.3)
     ax1.set_xlim([0, NUM_STEPS - 1])
@@ -667,19 +677,19 @@ def main():
     
     fig2, ax2 = plt.subplots(figsize=(10, 6))
     
-    # Plot mean OSPA
-    ax2.plot(time_axis, mean_ospa, 
+    # Plot mean GOSPA
+    ax2.plot(time_axis, mean_gospa, 
              color='k',  # Black
              linewidth=2.0,
              label=f'Average of {NUM_MONTE_CARLO} Runs')
     
     ax2.set_xlabel('Time Step', fontsize=12)
-    ax2.set_ylabel('Average OSPA Distance (m)', fontsize=12)
-    ax2.set_title(f'Average OSPA Performance Across {NUM_MONTE_CARLO} Runs', fontsize=14)
+    ax2.set_ylabel('Average GOSPA (m)', fontsize=12)
+    ax2.set_title(f'Average GOSPA Across {NUM_MONTE_CARLO} Runs\n{GOSPA_PARAMS}', fontsize=13)
     ax2.legend(loc='upper right')
     ax2.grid(True, alpha=0.3)
     ax2.set_xlim([0, NUM_STEPS - 1])
-    ax2.set_ylim([0, np.max(mean_ospa) * 1.1])
+    ax2.set_ylim([0, np.max(mean_gospa) * 1.1])
     
     plt.tight_layout()
     
@@ -738,7 +748,7 @@ def main():
     plt.show()
     
     print("\nMonte Carlo analysis complete.")
-    return all_run_data, mean_ospa
+    return all_run_data, mean_gospa
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ if (Test-Path "venv") {
 python -c "import sys; sys.path.insert(0, 'python'); from lmb_engine_loader import import_lmb_engine; import_lmb_engine(); print('ok')"
 python tests/test_two_body_propagator_multistep.py
 python tests/assignments.py
+python tests/test_gospa_metric.py
 python tests/test_los_geometry.py
 python tests/test_local_residual_cached_basis.py
 python tests/test_validation_dimensions.py
@@ -33,7 +34,7 @@ python tests/test_end_to_end.py
 
 # test_statistical_equivalence.py replaces the bitwise gate here, since Windows is never the
 # reference platform: the STL's random distributions may draw a different stream from the same seed
-# and no tolerance on the golden digest is meaningful. It compares mean-OSPA distributions over 48
+# and no tolerance on the golden digest is meaningful. It compares mean-GOSPA distributions over 48
 # independent scenarios per arm. It costs minutes in Debug, so it is skipped there and belongs
 # against Release.
 if ($env:LMB_ENGINE_BUILD -eq "Debug") {

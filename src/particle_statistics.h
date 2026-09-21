@@ -4,7 +4,7 @@
  * @file particle_statistics.h
  * @brief Weighted summary statistics of a track's particle cloud.
  *
- * These were previously duplicated: a private `mean_state` inside metrics.cpp for OSPA, and a
+ * These were previously duplicated: a private `mean_state` inside metrics.cpp for the metric, and a
  * NumPy reimplementation inside each Python driver's `compute_track_mean`. The Python copy cost
  * about 13 ms per step for three 10,000-particle tracks, almost all of it pybind11 object churn.
  *
@@ -42,7 +42,7 @@ struct WeightedAccumulation {
 /**
  * @brief Accumulate sum(x_p * w_p) and sum(w_p) in particle order.
  *
- * The iteration order and the shape of the accumulation are load-bearing: calculate_ospa_distance
+ * The iteration order and the shape of the accumulation are load-bearing: calculate_gospa_distance
  * is gated on producing bitwise-identical results, so this must stay exactly the loop that used to
  * live in metrics.cpp.
  */
@@ -73,10 +73,12 @@ inline double weight_sum(const Track& track) {
 }
 
 /**
- * @brief Weighted mean using the OSPA contract: the zero vector when the cloud is empty or carries
- *        exactly zero total weight.
+ * @brief Weighted mean using the metric contract: the zero vector when the cloud is empty or
+ *        carries exactly zero total weight.
  *
- * calculate_ospa_distance depends on this, so the arithmetic must not change.
+ * calculate_gospa_distance depends on this, so the arithmetic must not change. It reads only the
+ * first three components, but the full six-component contract stays gated by
+ * tests/test_particle_statistics.py and must not be weakened on that basis.
  */
 inline StateVector weighted_mean(const Track& track) {
     const std::vector<Particle>& particles = track.particles();

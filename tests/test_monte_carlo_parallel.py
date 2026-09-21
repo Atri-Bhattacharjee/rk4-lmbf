@@ -80,45 +80,45 @@ def main() -> int:
 
     print(f"serial Monte Carlo  runs={NUM_RUNS} master_seed={MASTER_SEED}")
     t0 = time.perf_counter()
-    serial_ospa, serial_errors, serial_seeds = sc.run_monte_carlo(
+    serial_gospa, serial_errors, serial_seeds = sc.run_monte_carlo(
         NUM_RUNS, master_seed=MASTER_SEED, max_workers=1
     )
     serial_s = time.perf_counter() - t0
     checker.ok(serial_seeds == seeds, "serial run used the expected derived seeds")
-    checker.ok(serial_ospa.shape == (NUM_RUNS, sc.NUM_STEPS), f"serial OSPA shape {serial_ospa.shape}")
+    checker.ok(serial_gospa.shape == (NUM_RUNS, sc.NUM_STEPS), f"serial GOSPA shape {serial_gospa.shape}")
     checker.ok(serial_errors.shape == (sc.NUM_STEPS, 6), f"serial errors shape {serial_errors.shape}")
 
     print(f"parallel Monte Carlo  runs={NUM_RUNS} workers=2")
     t0 = time.perf_counter()
-    parallel_ospa, parallel_errors, parallel_seeds = sc.run_monte_carlo(
+    parallel_gospa, parallel_errors, parallel_seeds = sc.run_monte_carlo(
         NUM_RUNS, master_seed=MASTER_SEED, max_workers=2
     )
     parallel_2_s = time.perf_counter() - t0
     checker.ok(parallel_seeds == seeds, "parallel(2) run used the expected derived seeds")
-    arrays_match(checker, serial_ospa, parallel_ospa, "parallel(2) OSPA vs serial", exact=exact)
+    arrays_match(checker, serial_gospa, parallel_gospa, "parallel(2) GOSPA vs serial", exact=exact)
     arrays_match(
         checker, serial_errors, parallel_errors, "parallel(2) representative_errors vs serial", exact=exact
     )
 
     print(f"parallel Monte Carlo  runs={NUM_RUNS} workers=4")
-    parallel4_ospa, parallel4_errors, parallel4_seeds = sc.run_monte_carlo(
+    parallel4_gospa, parallel4_errors, parallel4_seeds = sc.run_monte_carlo(
         NUM_RUNS, master_seed=MASTER_SEED, max_workers=4
     )
     checker.ok(parallel4_seeds == seeds, "parallel(4) run used the expected derived seeds")
-    arrays_match(checker, serial_ospa, parallel4_ospa, "parallel(4) OSPA vs serial", exact=exact)
+    arrays_match(checker, serial_gospa, parallel4_gospa, "parallel(4) GOSPA vs serial", exact=exact)
     arrays_match(
         checker, serial_errors, parallel4_errors, "parallel(4) representative_errors vs serial", exact=exact
     )
-    arrays_match(checker, parallel_ospa, parallel4_ospa, "parallel OSPA across worker counts", exact=exact)
+    arrays_match(checker, parallel_gospa, parallel4_gospa, "parallel GOSPA across worker counts", exact=exact)
 
-    direct_ospa, direct_errors = sc.run_single_simulation(
+    direct_gospa, direct_errors = sc.run_single_simulation(
         verbose=False, collect_track_errors=True, seed=seeds[0]
     )
     arrays_match(
         checker,
-        serial_ospa[0],
-        np.asarray(direct_ospa, dtype=np.float64),
-        "run 0 OSPA vs direct seeded simulation",
+        serial_gospa[0],
+        np.asarray(direct_gospa, dtype=np.float64),
+        "run 0 GOSPA vs direct seeded simulation",
         exact=exact,
     )
     arrays_match(
