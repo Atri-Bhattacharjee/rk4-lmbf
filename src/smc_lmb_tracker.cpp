@@ -225,6 +225,17 @@ void SMC_LMB_Tracker::update_impl(const std::vector<Measurement>& measurements,
             const auto& measurement = measurements[j];
             double* assoc = association_weights_.data() + association_block_offset(i, j, num_meas);
 
+            if (!pair_is_observable(i, j)) {
+                // No particle of this track is inside the volume of the sensor that produced this
+                // measurement, so the pair is impossible and Step 3 will price it at INF_COST no
+                // matter what L is. Skip the O(num_particles) likelihood pass. The block is already
+                // zero from the assign() above; the mixture coefficient for it is
+                // P_D_eff * L / kappa with P_D_eff == 0, so a zero block and a zero L reproduce
+                // what the full pass fed in, without spending a 6-D Gaussian per particle on it.
+                likelihood_matrix(i, j) = 0.0;
+                continue;
+            }
+
             double total_likelihood = 0.0;
 
             for (size_t p = 0; p < num_particles; ++p) {
@@ -272,14 +283,15 @@ void SMC_LMB_Tracker::update_impl(const std::vector<Measurement>& measurements,
         // Detection costs (left block: columns 0 to num_meas-1)
         for (size_t j = 0; j < num_meas; ++j) {
             const double p_detect = detection_probability(i, j);
-            if (num_sensors_ > 0 && p_detect <= 0.0) {
+            if (!pair_is_observable(i, j)) {
                 // None of this track's particles are where that sensor is looking, so it cannot
                 // have produced that measurement. Say so outright, as the off-diagonal miss entries
                 // do. Leaning on the 1e-12 floor instead would leave the association a tiny but
                 // non-zero hypothesis weight, which is enough to drift the existence probability of
-                // a track nobody can see. The num_sensors_ guard keeps the floor in place on the
-                // path with no sensor array, where P_D_eff is the configured P_D and a zero can
-                // only come from a likelihood that underflowed.
+                // a track nobody can see. Step 2 skipped this pair's likelihood pass on the same
+                // predicate, so likelihood_matrix(i, j) is 0 here rather than a value to ignore.
+                // Without a sensor array pair_is_observable is always true, so the floor below
+                // stays in place on that path, where a zero can only be an underflowed likelihood.
                 cost_matrix(i, j) = INF_COST;
                 continue;
             }

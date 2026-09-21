@@ -435,6 +435,61 @@ def check_seeded_scenario(chk: Checker) -> None:
 
 
 # ---------------------------------------------------------------------------------------------
+# B7: pairs no sensor can explain are skipped, and contribute exactly nothing
+# ---------------------------------------------------------------------------------------------
+
+
+def check_impossible_pairs_are_inert(chk: Checker) -> None:
+    """Track A lives only in the east lobe, track B only in the north lobe.
+
+    The cross pairs (A, north measurement) and (B, east measurement) are impossible, so update()
+    skips their likelihood pass and prices them at INF_COST. With the cross pairs out of play the
+    two tracks decouple: the joint hypotheses factorise, so each track's posterior existence must
+    equal a single-track reference that never saw the other track's measurement. Anything a
+    skipped pair leaked into the mixture -- a stale L, an unzeroed association block, a NaN --
+    would move that number.
+
+    Existence sits within ~1e-7 of 1 here (L / kappa is huge), so the comparison is made on the
+    complement 1 - r, which is where a leak would actually show up.
+    """
+    sensors = two_lobe_sensors()
+    track_a = make_track(split_cloud(32, 0), existence=0.6)
+    track_b = make_track(split_cloud(0, 32), existence=0.7)
+    east = make_measurement((RANGE + 2000.0, 1500.0, 0.0), state((0.0, 0.0, 0.0)), "east")
+    north = make_measurement((1500.0, RANGE + 2000.0, 0.0), state((0.0, 0.0, 0.0)), "north")
+
+    chk.close(sensors.coverage_fractions(track_a)[0], 1.0, "scaffolding: A wholly in the east lobe")
+    chk.close(sensors.coverage_fractions(track_a)[1], 0.0, "scaffolding: A invisible to north")
+    chk.close(sensors.coverage_fractions(track_b)[1], 1.0, "scaffolding: B wholly in the north lobe")
+    chk.close(sensors.coverage_fractions(track_b)[0], 0.0, "scaffolding: B invisible to east")
+
+    tracker = make_tracker()
+    tracker.set_tracks([track_a, track_b])
+    likelihood_a = tracker.compute_association_likelihood(track_a, east)
+    likelihood_b = tracker.compute_association_likelihood(track_b, north)
+    chk.ok(likelihood_a > 0.0 and likelihood_b > 0.0,
+           "scaffolding: each track must have a non-zero likelihood for its own measurement")
+
+    expected_a = expected_existence(0.6, [likelihood_a], [P_DETECTION], P_DETECTION)
+    expected_b = expected_existence(0.7, [likelihood_b], [P_DETECTION], P_DETECTION)
+
+    tracker.update([east, north], sensors)
+    updated = tracker.get_tracks()
+    chk.ok(len(updated) == 2, f"both tracks must survive and nothing may be born, got {len(updated)}")
+
+    for track, expected, name in ((updated[0], expected_a, "A"), (updated[1], expected_b, "B")):
+        actual = track.existence_probability()
+        chk.ok(np.isfinite(actual) and 0.0 <= actual <= 1.0,
+               f"track {name} existence must be a probability, got {actual!r}")
+        chk.close(1.0 - actual, 1.0 - expected,
+                  f"track {name} must match a single-track reference that never saw the other "
+                  "track's measurement", rtol=1e-6)
+        weights = np.asarray(track.particle_weights())
+        chk.ok(np.all(np.isfinite(weights)) and abs(weights.sum() - 1.0) < 1e-12,
+               f"track {name} must keep a normalised, finite cloud")
+
+
+# ---------------------------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -447,6 +502,7 @@ def main() -> None:
         ("B4 legacy equivalence", check_legacy_equivalence),
         ("B5 sensor resolution errors", check_sensor_resolution_errors),
         ("B6 seeded scenario", check_seeded_scenario),
+        ("B7 impossible pairs are inert", check_impossible_pairs_are_inert),
     ):
         before = chk.count
         fn(chk)

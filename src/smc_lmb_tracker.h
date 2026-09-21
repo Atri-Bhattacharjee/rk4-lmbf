@@ -99,6 +99,19 @@ private:
     }
 
     /**
+     * @brief Whether track i could have produced measurement j at all.
+     *
+     * False exactly when a sensor array is in play and none of the track's particles are inside the
+     * volume of the sensor that produced j, i.e. detection_probability(i, j) == 0. Such a pair is
+     * impossible, so update_impl skips its likelihood pass and writes INF_COST into the cost matrix.
+     * This is the single predicate for both, so the two cannot disagree. Always true without a
+     * sensor array (num_sensors_ == 0), where nothing is ever skipped.
+     */
+    bool pair_is_observable(size_t track_index, size_t meas_index) const {
+        return num_sensors_ == 0 || detection_probability(track_index, meas_index) > 0.0;
+    }
+
+    /**
      * @brief Effective P_D for track i being detected by anybody, used by the missed-detection branch.
      *
      * Uses the union coverage, so a track outside every field of view has P_D_eff = 0 and its
