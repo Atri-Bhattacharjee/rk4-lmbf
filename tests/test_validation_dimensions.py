@@ -224,12 +224,68 @@ def test_tracker_update_validates() -> None:
     check(len(tracker.get_tracks()) == 1, "tracker must birth one track from one valid measurement")
 
 
+def test_sensor_array_dimension_rejections() -> None:
+    """Dimension and finiteness of everything Python hands the sensor array each timestep."""
+    sensors = lmb.SensorArray(lmb.SensorFovConfig())
+    sensors.add("sensor-a", SENSOR, np.array([1.0, 0.0, 0.0]))
+
+    expect_value_error(lambda: sensors.add("sensor-b", np.zeros(5), np.array([1.0, 0.0, 0.0])), "state")
+    expect_value_error(lambda: sensors.add("sensor-b", np.zeros(7), np.array([1.0, 0.0, 0.0])), "state")
+    expect_value_error(lambda: sensors.add("sensor-b", np.full(6, np.inf), np.array([1.0, 0.0, 0.0])), "state")
+    expect_value_error(lambda: sensors.add("sensor-b", SENSOR, np.zeros(2)), "boresight")
+    expect_value_error(lambda: sensors.add("sensor-b", SENSOR, np.zeros(6)), "boresight")
+    expect_value_error(lambda: sensors.add("sensor-b", SENSOR, np.full(3, np.nan)), "boresight")
+
+    expect_value_error(lambda: sensors.set_state(0, np.zeros(3)), "state")
+    expect_value_error(lambda: sensors.set_state(0, np.full(6, np.nan)), "state")
+    expect_value_error(lambda: sensors.set_boresight(0, np.zeros(4)), "boresight")
+    expect_value_error(lambda: sensors.set_boresight(0, np.zeros(3)), "boresight")
+    expect_value_error(lambda: sensors.set_pointing(0, np.array([1.0, 0.0, 0.0]), np.zeros(3)), "up")
+    expect_value_error(lambda: sensors.set_pointing(0, np.array([1.0, 0.0, 0.0]),
+                                                    np.array([3.0, 0.0, 0.0])), "up")
+    expect_value_error(lambda: sensors.point_at(0, np.zeros(4)), "target_position")
+    expect_value_error(lambda: sensors.point_at(0, np.full(3, np.nan)), "target_position")
+    expect_value_error(lambda: sensors.sees(0, np.zeros(4)), "target")
+
+    # A rejected call must not have half-applied itself.
+    check(len(sensors) == 1, "rejected adds must not grow the array")
+    check(np.allclose(np.asarray(sensors.boresight(0)), [1.0, 0.0, 0.0]),
+          "rejected pointing calls must leave the boresight alone")
+    check(np.allclose(np.asarray(sensors.state(0)), SENSOR),
+          "rejected set_state calls must leave the state alone")
+
+
+def test_tracker_update_resolves_sensors() -> None:
+    """update(measurements, sensors) must refuse a measurement it cannot attribute."""
+    propagator = lmb.TwoBodyPropagator(np.zeros((6, 6)))
+    sensor_model = lmb.InOrbitSensorModel(*np.diag(COVARIANCE))
+    birth_model = lmb.AdaptiveBirthModel(50, 0.5, BIRTH_COVARIANCE, seed=3)
+    tracker = lmb.SMC_LMB_Tracker(propagator, sensor_model, birth_model, 0.99, 2, 0.001, 1e-9, 0.99, 0.0, 1.0)
+
+    sensors = lmb.SensorArray(lmb.SensorFovConfig())
+    sensors.add_unpointed("sensor-a", SENSOR)
+
+    # A birth step (no tracks yet) does not consult the array, so seed a track first.
+    tracker.update([valid_measurement()], sensors)
+    check(len(tracker.get_tracks()) == 1, "one valid measurement must birth one track")
+
+    stray = valid_measurement()
+    stray.sensor_id_ = "sensor-z"
+    expect_value_error(lambda: tracker.update([stray], sensors), "sensor-z")
+
+    bad = valid_measurement()
+    bad.range_ = -5.0
+    expect_value_error(lambda: tracker.update([bad], sensors), "range_")
+
+
 def main() -> None:
     test_valid_measurement_passes()
     test_measurement_field_rejections()
     test_assignment_dimension_rejections()
     test_model_constructor_rejections()
     test_tracker_update_validates()
+    test_sensor_array_dimension_rejections()
+    test_tracker_update_resolves_sensors()
     check(assertion_count > 0, "no assertions executed")
     print(f"PASS: test_validation_dimensions ({assertion_count} assertions, validation_enabled={lmb.VALIDATION_ENABLED})")
 

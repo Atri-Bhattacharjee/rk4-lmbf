@@ -221,6 +221,10 @@ A measurement is a line-of-sight observation, not an azimuth/elevation tuple:
 | `covariance_` | 6x6 | Noise covariance in the **local tangent frame** of `los_` |
 | `sensor_state_` | 6-vector | Sensor ECI state `[x, y, z, vx, vy, vz]` |
 
+`sensor_id_` is no longer decorative: with a `SensorArray` it is what ties a measurement back to the
+sensor that produced it, and therefore to the field of view the association is scored against. See
+[Sensors, pointing and field of view](#sensors-pointing-and-field-of-view).
+
 The exact conversion is `r = r_s + range * los`, `v = v_s + range_rate * los + range * los_rate`
 (`Measurement.fromCartesian` / `Measurement.toCartesian`), which is smooth everywhere on the sphere: there is
 no azimuth/elevation singularity, no angle wrapping and no `cos(el)` division anywhere in the filter.
@@ -269,6 +273,8 @@ python tests/assignments.py
 python tests/test_los_geometry.py          # sphere geometry primitives vs independent references
 python tests/test_validation_dimensions.py # input validation and error messages
 python tests/test_sensor_likelihood.py     # likelihood vs NumPy reference, rotation invariance, chi-square
+python tests/test_sensor_fov.py            # visibility predicate vs an atan2 reference, pointing, coverage
+python tests/test_fov_detection_probability.py  # FOV-scaled P_D vs an independent existence-update reference
 python tests/test_adaptive_birth_model.py  # birth covariance recovery and spread statistics
 python tests/test_bindings_api.py          # Python API surface
 python tests/statistics_helpers.py         # self-test of the Welch/KS implementations
@@ -335,6 +341,124 @@ reason (at `--alpha 1e-4`, since it runs on every PR). On the reference platform
 python -c "import sys; sys.path.insert(0, 'python'); from lmb_engine_loader import import_lmb_engine; import_lmb_engine(); print('ok')"
 ```
 
+## Sensors, pointing and field of view
+
+A sensor is a 6-D ECI state plus an orientation. Several can be active at once, each with its own
+pointing, and Python is expected to re-point them at every timestep. Range bounds and the angular
+half-widths are **global**: they live on the `SensorFovConfig` the `SensorArray` holds, and every
+sensor in that array shares them.
+
+```python
+fov = lmb_engine.SensorFovConfig(
+    min_range=0.0,                      # m, inclusive
+    max_range=2.5e7,                    # m, inclusive (default +inf)
+    half_width=np.deg2rad(3.0),         # rad, about the frame's width axis
+    half_height=np.deg2rad(1.5),        # rad, about the frame's height axis
+)
+
+sensors = lmb_engine.SensorArray(fov)
+sensors.add("sensor_0", state_0, boresight_0)   # pointed
+sensors.add_unpointed("survey", state_1)        # range-only, ignores the FOV
+
+for step in range(num_steps):
+    sensors.set_state(0, propagated_state)      # or sensors.set_states(all_states)   (S, 6)
+    sensors.point_at(0, target_position)        # or sensors.set_boresight(0, direction)
+    ...
+    tracker.update(measurements, sensors)
+```
+
+### The visibility predicate
+
+For a pointed sensor, `(width, height, boresight)` is a right-handed orthonormal triad with
+`height = up` and `width = up x boresight`, so `width x height = boresight`. A target at relative
+position `d = r_target - r_sensor` is visible when
+
+```
+min_range <= |d| <= max_range
+d . boresight > 0
+|d . width|  <= (d . boresight) * tan(half_width)
+|d . height| <= (d . boresight) * tan(half_height)
+```
+
+That is a rectangular pyramid in the tangent-plane (pinhole) convention, the natural shape for a
+focal-plane detector. Half-angles must lie in `(0, pi/2)`; the two tangents are cached whenever the
+config changes, so the hot path does no trigonometry per particle and there is no `acos`. An
+**unpointed** sensor skips the three angular lines entirely and is bounded by range alone.
+
+`SensorArray.sees` is the single source of truth for this test. The simulation side calls it to
+decide whether a ground-truth object produces a measurement at all, and the filter calls it on
+every particle, so the two cannot drift apart.
+
+### Pointing
+
+| Call | Effect |
+|------|--------|
+| `set_boresight(i, b)` | Re-point. `b` is normalised; the roll is carried over by parallel transport (`los::parallelTransport`), the minimal rotation, so a slewing footprint does not spin about its own axis. |
+| `set_pointing(i, b, up)` | Re-point with an explicit roll. `up` is orthogonalised against `b` and must not be parallel to it. |
+| `point_at(i, position)` | Aim at an ECI position (3-vector or 6-D state), keeping the roll. |
+| `set_state(i, s)` / `set_states(S, 6)` | Move the sensors. |
+| `set_boresights((S, 3))` | Re-point every sensor in one call. |
+| `set_pointed(i, bool)` | Turn the angular test on or off for one sensor. |
+
+A near-antipodal flip leaves nothing to transport and falls back to the deterministic
+`los::tangentBasis` frame. Both `add` and every pointing call are atomic: a rejected call leaves
+the array exactly as it was.
+
+### Effective detection probability
+
+This is the part that changes the filter's arithmetic. For a track `i` and sensor `s`, let `q[i][s]`
+be the **weight-fraction of that track's particle cloud inside sensor s's volume**, and `q_union[i]`
+the fraction inside the union of every volume (accumulated as a real union, so it stays `<= 1` even
+if two sensors overlap). The configured `P_D` is then scaled by those fractions:
+
+```
+pd_det(i, j) = P_D * q[i][sensor that produced measurement j]     # detection cost, mixture coefficient
+pd_miss(i)   = P_D * q_union[i]                                   # missed-detection cost and coefficient
+```
+
+Three consequences:
+
+- **A track outside every field of view stops decaying.** `q_union = 0` gives `pd_miss = 0`, so the
+  miss coefficient is `1` and the Bernoulli update returns the existence probability unchanged —
+  exactly, not approximately. Nobody was looking, so nothing was learned.
+- **A track invisible to sensor s cannot claim s's measurements.** `q[i][s] = 0` makes that
+  association impossible, written into the cost matrix as `INF_COST` rather than left to the `1e-12`
+  floor, which would otherwise leave it a tiny hypothesis weight.
+- **A step in which no sensor reported anything is informative.** `update(measurements, sensors)`
+  applies the miss-only update rather than returning early, so a sensor that stared at a track and
+  saw nothing costs that track existence. The cloud is untouched: every particle weight is scaled by
+  the same `1 - pd_miss`, so nothing is resampled and the resampler's RNG stream is left alone.
+
+Measurements are traced back to their sensor through `Measurement.sensor_id_`, which must match an
+id in the array. A `sensor_id_` the array does not know is a `ValueError`, not a guess — guessing
+would score the association against the wrong volume.
+
+Query the same quantities from Python with `sensors.coverage_fractions(track)` (shape `(S,)`) and
+`sensors.coverage_fraction(track)` (the union).
+
+### Back-compatibility and the disjointness assumption
+
+`tracker.update(measurements)` — the single-argument overload — is unchanged: every track is fully
+observable, the effective `P_D` is the configured `P_D`, and an empty step is still a no-op. On that
+path every coverage fraction is exactly `1.0` and `x * 1.0 == x` in IEEE-754, so the arithmetic is
+bit-for-bit what it was; `tests/test_golden_invariance.py` is the gate on that. The same holds for a
+`SensorArray` built from a default `SensorFovConfig` plus `add_unpointed`, which is what
+`python/run.py`, `python/run_once.py` and `python/2026_ieee_aerospace.py` use.
+
+**Sensor volumes are assumed disjoint.** The filter is not built to have one object reported by two
+sensors in the same step, and nothing here tries to. `visible_sensor` breaks a tie by returning the
+lowest index; `python/run_multisensor.py` counts and reports violations rather than hiding them.
+
+### Multi-sensor demo
+
+```bash
+python python/run_multisensor.py        # LMB_MULTISENSOR_STEPS, LMB_MULTISENSOR_PARTICLES
+```
+
+Two bounded, pointed sensors re-aimed every step against three objects, so something is always
+unobservable — its track holds its existence probability flat while it is. Writes
+`python/figure_multisensor.png`.
+
 ## Project layout
 
 ```
@@ -364,6 +488,7 @@ rk4-lmbf/
 │   ├── los_geometry.h          # tangent basis, exp/log maps, transport, observe/toCartesian
 │   ├── adaptive_birth_model.{h,cpp}
 │   ├── in_orbit_sensor_model.{h,cpp}
+│   ├── sensor_fov.h            # sensor pointing, rectangular FOV, per-track coverage fractions
 │   ├── two_body_propagator.{h,cpp}
 │   ├── assignment.{h,cpp}      # K-best data association (Munkres LAP)
 │   ├── metrics.{h,cpp}
@@ -378,6 +503,7 @@ rk4-lmbf/
 │   ├── run_once.py             # single-run simulation + GOSPA plot
 │   ├── run.py                  # Monte Carlo simulation (20 runs)
 │   ├── 2026_ieee_aerospace.py  # paper config (K_BEST=100)
+│   ├── run_multisensor.py      # multi-sensor pointed FOV demo
 │   └── lmb_engine/             # built extension output (.so / .pyd)
 │       ├── Release/            # recommended built extension
 │       ├── Debug/
@@ -389,6 +515,8 @@ rk4-lmbf/
 │   ├── test_los_geometry.py
 │   ├── test_validation_dimensions.py
 │   ├── test_sensor_likelihood.py
+│   ├── test_sensor_fov.py      # pointing and visibility geometry
+│   ├── test_fov_detection_probability.py  # FOV-scaled P_D in the filter
 │   ├── test_adaptive_birth_model.py
 │   ├── test_bindings_api.py
 │   ├── test_end_to_end.py

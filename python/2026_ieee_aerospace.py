@@ -137,6 +137,11 @@ V_CIRCULAR = np.sqrt(MU_EARTH / ORBIT_RADIUS)  # ~7672 m/s
 # Sensor at Earth's center (for mathematical testing)
 SENSOR_STATE = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
+# Unbounded in range and, via add_unpointed below, not constrained by a field of view either.
+# That is the omniscient sensor this configuration has always assumed, so the paper's numbers are
+# unaffected by the sensor rework.
+SENSOR_FOV = lmb_engine.SensorFovConfig()
+
 # Define 3 ground truth objects with staggered births
 # Format: (object_id, birth_step, initial_state_vector)
 # Each initial state is [x, y, z, vx, vy, vz] in meters and m/s
@@ -226,6 +231,22 @@ def propagate_truth_state(propagator, state_vector, dt):
     return np.array(propagated.state_vector)
 
 
+def build_sensor_array(fov_config=None):
+    """The one-sensor array this configuration uses: a single unpointed sensor at SENSOR_STATE."""
+    sensors = lmb_engine.SensorArray(SENSOR_FOV if fov_config is None else fov_config)
+    sensors.add_unpointed("sensor_0", SENSOR_STATE)
+    return sensors
+
+
+def _as_sensor_array(sensors):
+    """Accept a SensorArray, or a bare 6-D sensor state for callers that predate them."""
+    if isinstance(sensors, lmb_engine.SensorArray):
+        return sensors
+    array = lmb_engine.SensorArray(lmb_engine.SensorFovConfig())
+    array.add_unpointed("sensor_0", np.asarray(sensors, dtype=np.float64).reshape(6))
+    return array
+
+
 def generate_measurements(active_truths, sensor_state, current_time):
     """
     Simulate sensor measurements from active ground truth objects.
@@ -236,17 +257,30 @@ def generate_measurements(active_truths, sensor_state, current_time):
     3. Add Gaussian noise using TRUTH sigmas in the local tangent frame of the true direction
     4. Attach the FILTER covariance (inflated) in the same frame and ordering
     
+    An object is only reported when some sensor can observe it, and it is reported as a
+    measurement of that sensor -- stamped with its id and state, which is what lets the filter
+    score the association against the right field of view.
+    
     Args:
         active_truths: List of (object_id, state_vector) tuples
-        sensor_state: 6D sensor state vector
+        sensor_state: a SensorArray, or a 6D sensor state vector (wrapped into a one-sensor
+            unbounded, unpointed array)
         current_time: Current simulation time
         
     Returns:
         list: List of lmb_engine.Measurement objects
     """
+    sensors = build_sensor_array() if sensor_state is None else _as_sensor_array(sensor_state)
     measurements = []
     
     for obj_id, truth_state in active_truths:
+        # Visibility gate: an object nobody can observe produces nothing, and does not consume a
+        # detection roll either. SensorArray.sees is the same predicate the filter applies to the
+        # particle clouds, so the two sides cannot disagree about what is observable.
+        sensor_index = sensors.visible_sensor(truth_state)
+        if sensor_index < 0:
+            continue
+        
         # Detection roll
         if np.random.random() > P_DETECTION:
             # Missed detection - skip this object
@@ -255,11 +289,11 @@ def generate_measurements(active_truths, sensor_state, current_time):
         # Exact observation of the truth, then TRUTH-sigma noise applied in the local tangent frame
         # [d_range, d_range_rate, d_theta1, d_theta2, d_omega1, d_omega2] (sphere exponential map for the
         # direction, parallel transport for the angular rate). This is where the actual sensor precision enters.
-        measurement = lmb_engine.Measurement.fromCartesian(truth_state, sensor_state).perturbed(
-            np.random.normal(size=6) * TRUTH_SIGMAS
-        )
+        measurement = lmb_engine.Measurement.fromCartesian(
+            truth_state, sensors.state(sensor_index)
+        ).perturbed(np.random.normal(size=6) * TRUTH_SIGMAS)
         measurement.timestamp_ = current_time
-        measurement.sensor_id_ = "sensor_0"
+        measurement.sensor_id_ = sensors.id(sensor_index)
         
         # CRITICAL: Set covariance using FILTER sigmas (inflated)
         # This tells the filter "my data is rough" -> wide acceptance gate
@@ -379,6 +413,7 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
     
     # Active ground truth objects: list of (object_id, state_vector)
     active_ground_truths = []
+    sensors = build_sensor_array()
     
     # Results storage
     gospa_results = []
@@ -418,7 +453,7 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
         # ---------------------------------------------------------------------
         measurements = generate_measurements(
             active_ground_truths, 
-            SENSOR_STATE, 
+            sensors, 
             current_time
         )
         
@@ -431,7 +466,7 @@ def run_single_simulation(verbose=False, collect_track_errors=True, seed=None):
         if step > 0:
             tracker.predict(DT)
             
-        tracker.update(measurements)
+        tracker.update(measurements, sensors)
         
         # ---------------------------------------------------------------------
         # E. DATA EXTRACTION
