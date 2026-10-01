@@ -18,6 +18,10 @@ python tests/test_local_residual_cached_basis.py
 # than as a mystery in the golden stage.
 python tests/test_sensor_fov.py
 python tests/test_fov_detection_probability.py
+python tests/test_existence_enumeration.py
+python tests/test_clutter_scaling.py
+python tests/test_lazy_propagation.py
+python tests/test_regularization.py
 python tests/test_validation_dimensions.py
 python tests/test_sensor_likelihood.py
 python tests/test_adaptive_birth_model.py

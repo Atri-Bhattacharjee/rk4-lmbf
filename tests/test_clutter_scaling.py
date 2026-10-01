@@ -1,8 +1,8 @@
 """The clutter intensity kappa must enter the detection cost exactly once.
 
 Step 2 of ``update`` stores the raw weighted-average likelihood ``L = sum_p w_p g(z|x_p)`` in
-``likelihood_matrix``; Step 3 forms the detection cost ``-ln(P_D * L / kappa)`` and Step 5a the
-mixture coefficient ``P_D * L / kappa``. Each consumer applies its own single ``1/kappa``.
+``likelihood_matrix``; Step 3 forms the detection cost ``-ln(r * P_D * L / kappa)`` and nothing
+else applies kappa (the mixture coefficients are the hypothesis marginals, which already carry it).
 
 Regression guarded here: ``likelihood_matrix`` used to hold ``L/kappa`` (the division sat in the
 per-particle loop), while Step 3 divided by kappa *again*, so the cost matrix encoded
@@ -10,10 +10,11 @@ per-particle loop), while Step 3 divided by kappa *again*, so the cost matrix en
 not on the missed-detection column, so it moves the detection/miss crossover by a factor of kappa
 and skews hypothesis weights by ``kappa^-d`` in the number of detections ``d``.
 
-The crossover is the sharp, observable consequence. With one track and one measurement the
-augmented cost matrix is ``[detect_cost, miss_cost]``, and detection wins exactly when
+The crossover is the sharp, observable consequence. With one track of existence r and one
+measurement the augmented cost matrix is ``[detect_cost, miss_cost]`` with the LMB factors
+``r P_D L / kappa`` and ``1 - r P_D``, and detection wins exactly when
 
-    P_D * L / kappa > 1 - P_D        i.e.   kappa < kappa* = P_D * L / (1 - P_D)
+    r P_D L / kappa > 1 - r P_D      i.e.   kappa < kappa* = r P_D L / (1 - r P_D)
 
 The doubled-kappa form instead flips at ``kappa < sqrt(kappa*)``. Those differ by orders of
 magnitude for the small kappa this filter is configured with, so a sweep separates them cleanly.
@@ -90,6 +91,9 @@ def sample_cloud(rng: np.random.Generator, target: np.ndarray) -> np.ndarray:
     return target[None, :] + offsets
 
 
+EXISTENCE = 0.8
+
+
 def make_track(cloud: np.ndarray) -> "lmb.Track":
     particles = []
     for state in cloud:
@@ -97,7 +101,7 @@ def make_track(cloud: np.ndarray) -> "lmb.Track":
         particle.state_vector = state
         particle.weight = 1.0 / len(cloud)
         particles.append(particle)
-    return lmb.Track(lmb.TrackLabel(), 0.8, particles)
+    return lmb.Track(lmb.TrackLabel(), EXISTENCE, particles)
 
 
 def build_tracker(clutter_intensity: float, seed: int = FIXED_SEED):
@@ -152,12 +156,12 @@ def main() -> int:
     rng = np.random.default_rng(FIXED_SEED)
     cloud, measurement, likelihood = build_case(rng)
 
-    kappa_star = P_DETECTION * likelihood / (1.0 - P_DETECTION)
+    kappa_star = EXISTENCE * P_DETECTION * likelihood / (1.0 - EXISTENCE * P_DETECTION)
     kappa_star_buggy = np.sqrt(kappa_star)
 
     print("clutter scaling")
     print(f"  L (raw association likelihood) = {likelihood:.6e}")
-    print(f"  predicted crossover, single kappa  kappa* = P_D*L/(1-P_D) = {kappa_star:.6e}")
+    print(f"  predicted crossover, single kappa  kappa* = rP_D L/(1-rP_D) = {kappa_star:.6e}")
     print(f"  predicted crossover, doubled kappa sqrt(kappa*)          = {kappa_star_buggy:.6e}")
 
     chk.ok(np.isfinite(likelihood) and likelihood > 0.0,

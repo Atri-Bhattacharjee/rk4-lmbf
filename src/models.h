@@ -11,6 +11,7 @@
  */
 
 #include "datatypes.h"
+#include <optional>
 #include <vector>
 
 /**
@@ -40,6 +41,21 @@ public:
      * @return Particle The propagated particle with updated state
      */
     virtual Particle propagate(const Particle& particle, double dt, double current_time, double noise_scale = 1.0) const = 0;
+
+    /**
+     * @brief Conservative bound on how far process noise can move a particle's position over an
+     *        interval, at noise_scale = 1, however the interval is split into propagate() calls.
+     *
+     * Lazy propagation in SMC_LMB_Tracker uses it to decide whether a track it has not propagated
+     * yet could already be inside a sensor volume. Returning nullopt says the noise model is not
+     * time-consistent, so no such bound exists, and lazy propagation refuses to run with it.
+     *
+     * @param interval Length of the interval in seconds (>= 0)
+     */
+    virtual std::optional<double> noise_displacement_bound(double interval) const {
+        (void)interval;
+        return std::nullopt;
+    }
 };
 
 /**

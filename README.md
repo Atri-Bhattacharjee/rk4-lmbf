@@ -406,44 +406,59 @@ the array exactly as it was.
 
 ### Effective detection probability
 
-This is the part that changes the filter's arithmetic. For a track `i` and sensor `s`, let `q[i][s]`
-be the **weight-fraction of that track's particle cloud inside sensor s's volume**, and `q_union[i]`
-the fraction inside the union of every volume (accumulated as a real union, so it stays `<= 1` even
-if two sensors overlap). The configured `P_D` is then scaled by those fractions:
+This is the part that changes the filter's arithmetic. The detection probability is
+**state-dependent**: `P_D(x) = P_D * visible(x)`, where `visible(x)` asks whether a particle at `x`
+is inside some sensor's volume. For a track `i` with normalised particle weights `w_p`, existence
+`r_i`, and a measurement `j` produced by sensor `s(j)`, the update's hypothesis factors are the LMB
+ones (Reuter, Vo, Vo & Dietmayer, *The Labeled Multi-Bernoulli Filter*, IEEE TSP 2014):
 
 ```
-pd_det(i, j) = P_D * q[i][sensor that produced measurement j]     # detection cost, mixture coefficient
-pd_miss(i)   = P_D * q_union[i]                                   # missed-detection cost and coefficient
+L_ij       = sum_p w_p * [particle p visible to s(j)] * g_j(x_p)     # only what that sensor can see
+eta_i(j)   = r_i * P_D * L_ij / kappa                                # track i produced measurement j
+eta_i(0)   = 1 - r_i * P_D * q_union[i]                              # not detected: missed, or absent
+rho_i      = r_i (1 - P_D q_union[i]) / (1 - r_i P_D q_union[i])     # existence given "not detected"
+r_i'       = sum_j c_ij + c_i0 * rho_i                               # c = hypothesis-weight marginals
 ```
 
-Three consequences:
+`q_union[i]` is the weight-fraction of the cloud inside any volume. The posterior cloud mixes the
+detection posteriors (each normalised over the visible particles) with the miss posterior, which
+reweights every particle by `1 - P_D(x_p)` — so the part of a cloud a sensor looked at and saw
+nothing in is **emptied out**, not just discounted in existence. The marginals `c_ij`, `c_i0`
+already carry the `eta` factors; nothing multiplies them by `P_D * L / kappa` again.
+`tests/test_existence_enumeration.py` checks all of this against an exhaustive enumeration of the
+joint hypotheses (`tests/lmb_reference.py`).
 
-- **A track outside every field of view stops decaying.** `q_union = 0` gives `pd_miss = 0`, so the
-  miss coefficient is `1` and the Bernoulli update returns the existence probability unchanged —
-  exactly, not approximately. Nobody was looking, so nothing was learned.
-- **A track invisible to sensor s cannot claim s's measurements.** `q[i][s] = 0` makes that
-  association impossible, written into the cost matrix as `INF_COST` rather than left to the `1e-12`
-  floor, which would otherwise leave it a tiny hypothesis weight.
+Consequences:
+
+- **A track outside every field of view is left out of the update entirely.** Its only hypothesis
+  is "not detected" with `P_D(x) = 0` everywhere on its cloud, whose posterior is its prior — so it
+  keeps its existence probability and cloud exactly, and it never enters the ranked assignment. The
+  assignment is therefore the size of the handful of tracks near a sensor, not the catalogue.
+- **A track invisible to sensor s cannot claim s's measurements.** Those pairs are written into the
+  cost matrix as `INF_COST` and skip their likelihood pass.
 - **A step in which no sensor reported anything is informative.** `update(measurements, sensors)`
-  applies the miss-only update rather than returning early, so a sensor that stared at a track and
-  saw nothing costs that track existence. The cloud is untouched: every particle weight is scaled by
-  the same `1 - pd_miss`, so nothing is resampled and the resampler's RNG stream is left alone.
+  applies the miss-only update to every observable track rather than returning early.
 
 Measurements are traced back to their sensor through `Measurement.sensor_id_`, which must match an
 id in the array. A `sensor_id_` the array does not know is a `ValueError`, not a guess — guessing
 would score the association against the wrong volume.
 
-Query the same quantities from Python with `sensors.coverage_fractions(track)` (shape `(S,)`) and
-`sensors.coverage_fraction(track)` (the union).
+Query the coverage from Python with `sensors.coverage_fractions(track)` (shape `(S,)`) and
+`sensors.coverage_fraction(track)` (the union). `SensorArray.coverage` skips sensors that cannot
+reach a cloud's bounding sphere before its per-particle pass, which changes no result.
 
 ### Back-compatibility and the disjointness assumption
 
-`tracker.update(measurements)` — the single-argument overload — is unchanged: every track is fully
-observable, the effective `P_D` is the configured `P_D`, and an empty step is still a no-op. On that
-path every coverage fraction is exactly `1.0` and `x * 1.0 == x` in IEEE-754, so the arithmetic is
-bit-for-bit what it was; `tests/test_golden_invariance.py` is the gate on that. The same holds for a
-`SensorArray` built from a default `SensorFovConfig` plus `add_unpointed`, which is what
-`python/run.py`, `python/run_once.py` and `python/2026_ieee_aerospace.py` use.
+`tracker.update(measurements)` — the single-argument overload — treats every track as fully
+observable and an empty step as a no-op. A `SensorArray` built from a default `SensorFovConfig` plus
+`add_unpointed` (what `python/run.py`, `python/run_once.py` and `python/2026_ieee_aerospace.py` use)
+reproduces that path bit for bit: full coverage is reported as exactly `1.0`.
+
+The committed golden fixtures still pass bitwise after the existence/mixture correction above, but
+not because the arithmetic is unchanged: at `P_D = 0.999999999` and `kappa = 1e-15` one hypothesis
+always carries all the weight and every existence probability saturates at `1.0`, where the old and
+the corrected formulas agree. The goldens are blind to association scaling for the same reason, which
+is why the enumeration test exists.
 
 **Sensor volumes are assumed disjoint.** The filter is not built to have one object reported by two
 sensors in the same step, and nothing here tries to. `visible_sensor` breaks a tie by returning the
@@ -458,6 +473,71 @@ python python/run_multisensor.py        # LMB_MULTISENSOR_STEPS, LMB_MULTISENSOR
 Two bounded, pointed sensors re-aimed every step against three objects, so something is always
 unobservable — its track holds its existence probability flat while it is. Writes
 `python/figure_multisensor.png`.
+
+## Lazy propagation and time-consistent process noise
+
+`TwoBodyPropagator(Q, seed, noise_reference_dt=None)` keeps the historical per-call noise: `Q` is
+added in full on every `propagate()`, whatever `dt` is. Pass `noise_reference_dt=T` and `Q` is read
+as the covariance accumulated over `T` seconds of continuous white noise on `[r, v]` with `r' = v`;
+a step of `dt` then draws from
+
+```
+Qd(dt) = [ Dpp dt + (Dpv + Dvp) dt²/2 + Dvv dt³/3 ,  Dpv dt + Dvv dt²/2 ]      D = Q / T
+         [ Dvp dt + Dvv dt²/2                     ,  Dvv dt              ]
+```
+
+so sixty 1 s steps and one 60 s step spread a cloud alike. Velocity noise now also diffuses into
+position within a step, so a `Q` tuned for the per-call model at `dt = T` spreads clouds faster
+under this one — retune when switching.
+
+`tracker.set_lazy_propagation(True, max_pending=60.0)` (requires the time-consistent model) makes
+`predict(dt)` advance only the clock and the survival probability. A track's cloud is propagated
+
+- when `update(measurements, sensors)` finds that some particle of it could be inside a sensor
+  volume (a conservative test on the cloud's bounding spheres, the gravity terms over the lag, and
+  the propagator's `noise_displacement_bound`);
+- when it has lagged the clock by `max_pending` seconds, in substeps of at most `max_pending`;
+- on `tracker.synchronize()`.
+
+`get_tracks()` may therefore return tracks that lag the clock: read `track.propagated_time()`, or
+call `synchronize()` first. `tracker.track_summary()` returns labels, existence, propagation times
+and (optionally) mean states as NumPy arrays without copying any particle cloud.
+
+The bounding-sphere test is only as tight as the cloud: a cloud smeared along its orbit has a
+bounding sphere that nearly always reaches some sensor, and is then propagated at the fine step.
+
+### Regularization
+
+`tracker.set_regularization(True, bandwidth_scale=1.0, ess_threshold=0.5)` jitters a freshly
+resampled cloud whenever its posterior effective sample size fell below `ess_threshold * N`:
+`x <- m + a (x - m) + h L eps`, with `m`, `L L^T` the weighted posterior mean and covariance,
+`a = sqrt(1 - h^2)` (Liu & West kernel shrinkage: mean and covariance are kept, so repeated
+resampling does not inflate the cloud) and `h` the regularized-particle-filter bandwidth
+`bandwidth_scale * (4 / (N (d + 2)))^(1/(d+4))`, `d = 6` (Musso, Oudjane & Le Gland 2001). It
+restores the diversity resampling destroys. It cannot rescue a posterior that has collapsed onto
+one particle -- a one-particle posterior has no spread to jitter with -- which is what a
+near-full-state measurement at close range does to a 1000-particle cloud.
+`tracker.set_record_diagnostics(True)` / `tracker.take_diagnostics()` expose the ESS and detection
+mass of every posterior, which is how to see that happening.
+
+## Ring scenario: many sensors, sampled debris
+
+```bash
+python python/run_ring.py                          # 100 sensors, 1000 objects, 2 orbits, 1000 particles
+python python/run_ring.py --orbits 5 --particles 2000 --seed 7
+python python/evaluation_plots.py python/results/ring_seed20260930/ring_log.npz   # re-plot a run
+```
+
+`N` range-only sensors on a circular equatorial 800 km orbit (20 km range) against objects sampled
+per run from `python/data/eci_800km-altitude_20km-range_randomized_phase.csv`, on a 1 s clock with
+lazy propagation. Truth, sensors and detection are propagated in NumPy with the engine's RK4 model.
+Filter tuning is imported from `simulation_common` and is **not** tuned for this geometry; retune
+in the `RingConfig` block of `python/run_ring.py`. Outputs go to `python/results/ring_seed<seed>/`
+(gitignored): `ring_log.npz`, `summary.json`, and eight figures with CSV twins — GOSPA and its
+decomposition, cardinality, per-object track error, error against time since last detection, track
+lifecycles, tracking fraction, position NEES against the χ²(3) band, and a run summary (detections
+per sensor, pass outcomes, wall time per phase). Everything is scored against objects detected at
+least once.
 
 ## Project layout
 
@@ -504,6 +584,9 @@ rk4-lmbf/
 │   ├── run.py                  # Monte Carlo simulation (20 runs)
 │   ├── 2026_ieee_aerospace.py  # paper config (K_BEST=100)
 │   ├── run_multisensor.py      # multi-sensor pointed FOV demo
+│   ├── run_ring.py             # N-sensor equatorial ring vs sampled debris (lazy propagation)
+│   ├── evaluation_plots.py     # figures + CSV tables for a ring run
+│   ├── data/                   # debris catalogue samples (ECI states)
 │   └── lmb_engine/             # built extension output (.so / .pyd)
 │       ├── Release/            # recommended built extension
 │       ├── Debug/
@@ -516,7 +599,12 @@ rk4-lmbf/
 │   ├── test_validation_dimensions.py
 │   ├── test_sensor_likelihood.py
 │   ├── test_sensor_fov.py      # pointing and visibility geometry
-│   ├── test_fov_detection_probability.py  # FOV-scaled P_D in the filter
+│   ├── test_fov_detection_probability.py  # FOV-dependent P_D in the filter
+│   ├── lmb_reference.py        # exhaustive-enumeration reference for one LMB update
+│   ├── test_existence_enumeration.py      # update() against that reference
+│   ├── test_clutter_scaling.py # kappa enters the detection cost exactly once
+│   ├── test_lazy_propagation.py           # time-consistent noise, lazy == eager
+│   ├── test_regularization.py  # kernel jitter keeps posterior moments, restores diversity
 │   ├── test_adaptive_birth_model.py
 │   ├── test_bindings_api.py
 │   ├── test_end_to_end.py

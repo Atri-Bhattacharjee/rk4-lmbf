@@ -1,17 +1,19 @@
-"""Tests for the field-of-view-scaled detection probability in src/smc_lmb_tracker.cpp.
+"""Tests for the field-of-view-dependent detection probability in src/smc_lmb_tracker.cpp.
 
-The filter's effective detection probability is the configured P_D scaled by the fraction of a
-track's particle cloud that a sensor can actually see:
+The filter's detection probability is state-dependent, P_D(x) = P_D * visible(x), where visible(x)
+asks whether the particle at x is inside a sensor volume:
 
-    pd_det(i, j)  = P_D * q[i][sensor that produced measurement j]
-    pd_miss(i)    = P_D * q_union[i]
+    detection factor   eta_i(j) = r_i P_D <p_i, 1_{visible to sensor(j)} g_j> / kappa
+    undetected factor  eta_i(0) = 1 - r_i P_D q_union[i]
+
+so a measurement is scored only against the particles of a track that the producing sensor can
+actually see, and a track nobody can see neither claims measurements nor loses existence.
 
 None of the intermediate quantities are exposed, so these tests go after the one observable the
-math fully determines: the posterior existence probability. ``expected_existence`` below is an
-independent NumPy reimplementation of the per-track update -- cost matrix, log-sum-exp over the
-hypotheses, mixture collapse, Bernoulli update -- driven by the *public* likelihood and coverage
-accessors. It never calls the tracker, so agreement is evidence about the C++ formula rather than
-a restatement of it.
+math fully determines: the posterior existence probability. The reference is
+tests/lmb_reference.py, an exhaustive enumeration of the joint hypotheses built on the public
+likelihood and visibility primitives. It never calls the tracker, so agreement is evidence about
+the C++ formula rather than a restatement of it.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ sys.path.insert(0, str(TESTS_DIR))
 
 from lmb_engine_loader import import_lmb_engine  # noqa: E402
 import harness_scenario as hs  # noqa: E402
+import lmb_reference as ref  # noqa: E402
 
 lmb = import_lmb_engine()
 
@@ -74,44 +77,15 @@ class Checker:
 # ---------------------------------------------------------------------------------------------
 
 
-def expected_existence(r, likelihoods, pd_det, pd_miss, kappa=CLUTTER_INTENSITY, k_best=K_BEST):
-    """Posterior existence probability of a single track, rebuilt from scratch in NumPy.
-
-    Mirrors the documented formulation: an augmented 1 x (M+1) cost matrix, k-best assignment,
-    log-sum-exp hypothesis weights, then the mixture collapsed onto its distinct associations. The
-    per-particle vectors drop out of the total: each measurement's normalised association weights
-    sum to 1, and so do the (normalised) particle weights, so sum_weights is just the sum of the
-    association coefficients plus the miss coefficient.
-    """
-    likelihoods = np.asarray(likelihoods, dtype=np.float64)
-    pd_det = np.asarray(pd_det, dtype=np.float64)
-    num_meas = likelihoods.size
-
-    cost = np.full((1, num_meas + 1), 1e9, dtype=np.float64)
-    for j in range(num_meas):
-        cost[0, j] = -np.log(max(pd_det[j] * likelihoods[j] / kappa, 1e-12))
-    cost[0, num_meas] = -np.log(max(1.0 - pd_miss, 1e-12))
-
-    hypotheses = lmb.solve_assignment(cost, k_best)
-    log_weights = np.array([-h.weight for h in hypotheses], dtype=np.float64)
-    normalised = np.exp(log_weights - log_weights.max())
-    normalised /= normalised.sum()
-
-    coefficients = np.zeros(num_meas, dtype=np.float64)
-    miss_coefficient = 0.0
-    for hypothesis, weight in zip(hypotheses, normalised):
-        association = hypothesis.associations[0]
-        if 0 <= association < num_meas:
-            coefficients[association] += weight
-        elif association == -1 or num_meas <= association < num_meas + 1:
-            miss_coefficient += weight
-
-    for j in range(num_meas):
-        coefficients[j] *= pd_det[j] * likelihoods[j] / kappa
-    miss_coefficient *= 1.0 - pd_miss
-
-    sum_weights = float(coefficients.sum() + miss_coefficient)
-    return (r * sum_weights) / (1.0 - r + r * sum_weights)
+def expected_existence(positions, measurements, sensors, existence=0.6, kappa=CLUTTER_INTENSITY):
+    """Posterior existence of a single track with a uniform-weight cloud at `positions`."""
+    positions = np.asarray(positions, dtype=np.float64)
+    states = np.concatenate([positions, np.zeros_like(positions)], axis=1)
+    weights = np.full(len(positions), 1.0 / len(positions))
+    sensor_model = lmb.InOrbitSensorModel(*FILTER_SIGMAS**2)
+    result = ref.posterior(lmb, sensor_model, [ref.TrackInput(existence, states, weights)],
+                           measurements, sensors, P_DETECTION, kappa)
+    return float(result.existence[0])
 
 
 def expected_existence_miss_only(r, pd_miss):
@@ -179,7 +153,7 @@ def split_cloud(num_east, num_north):
 
 
 # ---------------------------------------------------------------------------------------------
-# B1: the effective P_D of a detection is the fraction inside THAT sensor's volume
+# B1: a detection is scored only on the particles THAT sensor can see
 # ---------------------------------------------------------------------------------------------
 
 
@@ -202,16 +176,13 @@ def check_detection_uses_the_right_sensor(chk: Checker) -> None:
         likelihood = tracker.compute_association_likelihood(track, measurement)
         chk.ok(likelihood > 0.0, "scaffolding: the measurement must have a non-zero likelihood")
 
-        reference = expected_existence(
-            r=track.existence_probability(),
-            likelihoods=[likelihood],
-            pd_det=[P_DETECTION * expected_q],
-            pd_miss=P_DETECTION * 1.0,   # the cloud is wholly inside the union of the two volumes
-        )
+        reference = expected_existence(positions, [measurement], sensors,
+                                       existence=track.existence_probability())
 
         tracker.update([measurement], sensors)
         chk.close(tracker.get_tracks()[0].existence_probability(), reference,
-                  f"a measurement from '{sensor_id}' must be scored with q={expected_q}")
+                  f"a measurement from '{sensor_id}' (q={expected_q}) must be scored on that "
+                  "sensor's visible particles")
 
     # The two attributions must actually differ, or the test above proves nothing.
     east = make_tracker()
@@ -228,7 +199,7 @@ def check_detection_uses_the_right_sensor(chk: Checker) -> None:
 
 
 # ---------------------------------------------------------------------------------------------
-# B2: partial coverage scales P_D on the missed-detection branch too
+# B2: partial coverage: visible particles for the detection, P_D * q_union for the miss
 # ---------------------------------------------------------------------------------------------
 
 
@@ -248,15 +219,13 @@ def check_partial_coverage(chk: Checker) -> None:
     measurement = make_measurement((RANGE + 2000.0, 1500.0, 0.0), state((0.0, 0.0, 0.0)), "east")
     likelihood = tracker.compute_association_likelihood(track, measurement)
 
-    reference = expected_existence(
-        r=track.existence_probability(),
-        likelihoods=[likelihood],
-        pd_det=[P_DETECTION * 0.4],
-        pd_miss=P_DETECTION * 0.4,
-    )
+    chk.ok(likelihood > 0.0, "scaffolding: the measurement must have a non-zero likelihood")
+    reference = expected_existence(positions, [measurement], sensors,
+                                   existence=track.existence_probability())
     tracker.update([measurement], sensors)
     chk.close(tracker.get_tracks()[0].existence_probability(), reference,
-              "a half-covered track must use P_D * q on both the detection and the miss branch")
+              "a partly covered track must score the detection on its visible particles and "
+              "the miss with P_D * q_union")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -470,8 +439,8 @@ def check_impossible_pairs_are_inert(chk: Checker) -> None:
     chk.ok(likelihood_a > 0.0 and likelihood_b > 0.0,
            "scaffolding: each track must have a non-zero likelihood for its own measurement")
 
-    expected_a = expected_existence(0.6, [likelihood_a], [P_DETECTION], P_DETECTION)
-    expected_b = expected_existence(0.7, [likelihood_b], [P_DETECTION], P_DETECTION)
+    expected_a = expected_existence(split_cloud(32, 0), [east], sensors, existence=0.6)
+    expected_b = expected_existence(split_cloud(0, 32), [north], sensors, existence=0.7)
 
     tracker.update([east, north], sensors)
     updated = tracker.get_tracks()
@@ -496,7 +465,7 @@ def main() -> None:
     chk = Checker()
     print("fov-scaled detection probability")
     for name, fn in (
-        ("B1 detection uses the producing sensor's coverage", check_detection_uses_the_right_sensor),
+        ("B1 detection scored on the producing sensor's visible particles", check_detection_uses_the_right_sensor),
         ("B2 partial coverage", check_partial_coverage),
         ("B3 empty steps", check_empty_step),
         ("B4 legacy equivalence", check_legacy_equivalence),

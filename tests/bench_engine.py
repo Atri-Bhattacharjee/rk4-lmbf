@@ -172,17 +172,22 @@ def build_steady_state(config: BenchConfig):
 
 
 def build_cost_matrix(tracker, tracks, measurements) -> np.ndarray:
-    """Reproduce the tracker's augmented N x (M+N) cost matrix so the solver is timed on real data."""
+    """Reproduce the tracker's augmented N x (M+N) cost matrix so the solver is timed on real data.
+
+    Omniscient sensor, so every particle is visible: detection factor r P_D L / kappa, undetected
+    factor 1 - r P_D (see SMC_LMB_Tracker::update_impl, Step 3).
+    """
     num_tracks, num_meas = len(tracks), len(measurements)
     cost = np.full((num_tracks, num_meas + num_tracks), 1e9, dtype=np.float64)
-    miss_cost = -np.log(max(1.0 - run_once.P_DETECTION, 1e-12))
+    floor = np.finfo(np.float64).tiny
     for i, track in enumerate(tracks):
+        r = track.existence_probability()
         for j, measurement in enumerate(measurements):
             likelihood = tracker.compute_association_likelihood(track, measurement)
             cost[i, j] = -np.log(
-                max(run_once.P_DETECTION * likelihood / run_once.CLUTTER_INTENSITY, 1e-12)
+                max(r * run_once.P_DETECTION * likelihood / run_once.CLUTTER_INTENSITY, floor)
             )
-        cost[i, num_meas + i] = miss_cost
+        cost[i, num_meas + i] = -np.log(max(1.0 - r * run_once.P_DETECTION, floor))
     return cost
 
 
