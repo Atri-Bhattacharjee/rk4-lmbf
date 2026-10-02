@@ -54,11 +54,13 @@ class Checker:
 # 1. The algebraic identity
 # --------------------------------------------------------------------------------------------
 
-def enumerated_reference(hyp_weight, assoc, norm_weights, likelihood, p_detection, particle_weight):
-    """The pre-grouping form: one entry per (hypothesis, particle), summed per particle.
+def enumerated_reference(hyp_weight, assoc, norm_weights, rho, miss_density):
+    """The ungrouped form: one entry per (hypothesis, particle), summed per particle.
 
-    Mirrors the old inner loop exactly, including the miss branch and the fall-through for an
-    association index that belongs to neither range.
+    A hypothesis assigning the track measurement j contributes its weight times that association's
+    normalised posterior vector; one leaving it undetected contributes its weight times rho (the
+    existence given "not detected") times the normalised miss density. Mirrors the engine's
+    fall-through for an association index that belongs to neither range.
     """
     num_meas = norm_weights.shape[0]
     num_particles = norm_weights.shape[1]
@@ -66,17 +68,21 @@ def enumerated_reference(hyp_weight, assoc, norm_weights, likelihood, p_detectio
     contributing = 0
     for h, j in enumerate(assoc):
         if 0 <= j < num_meas:
-            totals += norm_weights[j] * hyp_weight[h] * p_detection * likelihood[j]
+            totals += norm_weights[j] * hyp_weight[h]
             contributing += 1
         elif j == -1 or j >= num_meas:  # every miss column shares one formula
-            totals += particle_weight * hyp_weight[h] * (1.0 - p_detection)
+            totals += miss_density * hyp_weight[h] * rho
             contributing += 1
         # anything else contributes nothing, exactly as the engine's fall-through does
     return totals, contributing
 
 
-def grouped(hyp_weight, assoc, norm_weights, likelihood, p_detection, particle_weight):
-    """The grouped form the engine now implements: collapse hypotheses, then one pass per bucket."""
+def grouped(hyp_weight, assoc, norm_weights, rho, miss_density):
+    """The grouped form the engine implements: collapse hypotheses, then one pass per bucket.
+
+    The bucket coefficients are the hypothesis-weight marginals themselves. They already carry
+    the eta factors of the cost matrix, so nothing multiplies them by P_D * L / kappa again.
+    """
     num_meas = norm_weights.shape[0]
     coefficients = np.zeros(num_meas)
     used = np.zeros(num_meas, dtype=bool)
@@ -92,15 +98,13 @@ def grouped(hyp_weight, assoc, norm_weights, likelihood, p_detection, particle_w
             miss_coefficient += hyp_weight[h]
             miss_used = True
             contributing += 1
-    coefficients *= p_detection * likelihood
-    miss_coefficient *= 1.0 - p_detection
 
     totals = np.zeros(norm_weights.shape[1])
     for j in range(num_meas):          # ascending, matching the engine's fixed summation order
         if used[j]:
             totals += coefficients[j] * norm_weights[j]
     if miss_used:
-        totals += miss_coefficient * particle_weight
+        totals += miss_coefficient * rho * miss_density
     return totals, contributing
 
 
@@ -117,18 +121,17 @@ def check_worked_example(chk: Checker) -> None:
     chk.ok(np.allclose(expected, [0.828, 0.810, 0.702], rtol=0, atol=1e-12),
            f"worked example arithmetic drifted: {expected}")
 
-    # Route it through both implementations with p_detection and likelihood folded into the scales.
+    # Route it through both implementations; no hypothesis is a miss here.
     norm_weights = np.vstack([first, second])
-    likelihood = np.array([1.0, 1.0])
-    p_detection = 1.0
+    rho = 0.5
     hyp_weight = np.array([0.72, 0.54, 0.18, 0.90])
     assoc = np.array([0, 0, 0, 1])
-    particle_weight = np.full(3, 1.0 / 3.0)
+    miss_density = np.full(3, 1.0 / 3.0)
 
     ref_totals, ref_contributing = enumerated_reference(
-        hyp_weight, assoc, norm_weights, likelihood, p_detection, particle_weight)
+        hyp_weight, assoc, norm_weights, rho, miss_density)
     grp_totals, grp_contributing = grouped(
-        hyp_weight, assoc, norm_weights, likelihood, p_detection, particle_weight)
+        hyp_weight, assoc, norm_weights, rho, miss_density)
 
     chk.ok(np.allclose(grp_totals, expected, rtol=GROUPING_RTOL, atol=0.0),
            f"grouped totals {grp_totals} != hand-computed {expected}")
@@ -162,14 +165,14 @@ def check_randomized_identity(chk: Checker, rng: np.random.Generator) -> None:
 
         norm_weights = rng.random((num_meas, num_particles))
         norm_weights /= norm_weights.sum(axis=1, keepdims=True)
-        likelihood = 10.0 ** rng.uniform(-6.0, 3.0, size=num_meas)
-        p_detection = float(rng.uniform(0.5, 0.999))
-        particle_weight = np.full(num_particles, 1.0 / num_particles)
+        rho = float(rng.uniform(0.0, 1.0))
+        miss_density = rng.random(num_particles)
+        miss_density /= miss_density.sum()
 
         ref_totals, ref_contributing = enumerated_reference(
-            hyp_weight, assoc, norm_weights, likelihood, p_detection, particle_weight)
+            hyp_weight, assoc, norm_weights, rho, miss_density)
         grp_totals, grp_contributing = grouped(
-            hyp_weight, assoc, norm_weights, likelihood, p_detection, particle_weight)
+            hyp_weight, assoc, norm_weights, rho, miss_density)
 
         chk.ok(ref_contributing == grp_contributing,
                f"case {case}: contributing {grp_contributing} != reference {ref_contributing}")

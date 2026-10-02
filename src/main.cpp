@@ -156,9 +156,10 @@ std::vector<Track> generate_new_tracks_validated(const AdaptiveBirthModel& birth
 }
 
 std::shared_ptr<TwoBodyPropagator> make_two_body_propagator(const Eigen::MatrixXd& process_noise_covariance,
-                                                            std::optional<uint64_t> seed) {
+                                                            std::optional<uint64_t> seed,
+                                                            std::optional<double> noise_reference_dt) {
     validation::require_covariance_6x6(process_noise_covariance, "process_noise_covariance");
-    return std::make_shared<TwoBodyPropagator>(process_noise_covariance, seed);
+    return std::make_shared<TwoBodyPropagator>(process_noise_covariance, seed, noise_reference_dt);
 }
 
 Particle propagate_validated(const TwoBodyPropagator& propagator,
@@ -213,6 +214,48 @@ std::shared_ptr<SMC_LMB_Tracker> make_smc_lmb_tracker(
 
 std::vector<Track> get_tracks_copy(const SMC_LMB_Tracker& tracker) {
     return tracker.get_tracks();
+}
+
+//! Per-track scalars (and optionally means) as NumPy arrays, without copying any particle cloud.
+pybind11::dict track_summary(const SMC_LMB_Tracker& tracker, bool with_means) {
+    const std::vector<Track>& tracks = tracker.get_tracks();
+    const auto count = static_cast<pybind11::ssize_t>(tracks.size());
+    pybind11::array_t<uint64_t> birth_time(count);
+    pybind11::array_t<int64_t> index(count);
+    pybind11::array_t<double> existence(count);
+    pybind11::array_t<double> propagated_time(count);
+    pybind11::array_t<int64_t> particle_count(count);
+    auto birth_view = birth_time.mutable_unchecked<1>();
+    auto index_view = index.mutable_unchecked<1>();
+    auto existence_view = existence.mutable_unchecked<1>();
+    auto time_view = propagated_time.mutable_unchecked<1>();
+    auto count_view = particle_count.mutable_unchecked<1>();
+    for (pybind11::ssize_t i = 0; i < count; ++i) {
+        const Track& track = tracks[static_cast<size_t>(i)];
+        birth_view(i) = track.label().birth_time;
+        index_view(i) = static_cast<int64_t>(track.label().index);
+        existence_view(i) = track.existence_probability();
+        time_view(i) = track.propagated_time();
+        count_view(i) = static_cast<int64_t>(track.particles().size());
+    }
+    pybind11::dict out;
+    out["birth_time"] = birth_time;
+    out["index"] = index;
+    out["existence"] = existence;
+    out["propagated_time"] = propagated_time;
+    out["particle_count"] = particle_count;
+    if (with_means) {
+        pybind11::array_t<double> means(std::vector<pybind11::ssize_t>{count, 6});
+        auto mean_view = means.mutable_unchecked<2>();
+        for (pybind11::ssize_t i = 0; i < count; ++i) {
+            const StateVector mean = particle_stats::mean_state(tracks[static_cast<size_t>(i)]);
+            for (int k = 0; k < 6; ++k) {
+                mean_view(i, k) = mean(k);
+            }
+        }
+        out["mean"] = means;
+    }
+    return out;
 }
 
 TrackLabel get_track_label_copy(const Track& track) {
@@ -402,6 +445,9 @@ PYBIND11_MODULE(lmb_engine, m) {
         .def(pybind11::init<const TrackLabel&, double, const std::vector<Particle>&>())
         .def("label", &get_track_label_copy)
         .def("existence_probability", &Track::existence_probability)
+        .def("propagated_time", &Track::propagated_time,
+             "Time [s] the particle cloud is valid at, or NaN if no tracker has stamped it. Under\n"
+             "lazy propagation this can lag the tracker's clock; see SMC_LMB_Tracker.synchronize.")
         .def("particles", &get_track_particles_copy)
         .def("particle_states", &get_track_particle_states,
              "Read-only (N, 6) view of the particle state vectors, aliasing the track's own memory.\n"
@@ -461,13 +507,27 @@ PYBIND11_MODULE(lmb_engine, m) {
         .def(pybind11::init(&make_two_body_propagator),
              pybind11::arg("process_noise_covariance"),
              pybind11::arg("seed") = pybind11::none(),
+             pybind11::arg("noise_reference_dt") = pybind11::none(),
              "RK4 two-body propagator with optional additive Gaussian process noise.\n\n"
-             "seed: optional integer for a reproducible noise stream (default: std::random_device).")
+             "seed: optional integer for a reproducible noise stream (default: std::random_device).\n"
+             "noise_reference_dt: None (default) adds process_noise_covariance in full on every\n"
+             "propagate() call, whatever dt is -- correct only for a fixed step. A value T reads the\n"
+             "matrix as the covariance accumulated over T seconds of continuous white noise on\n"
+             "[r, v] with r' = v, so any step length injects the consistent amount; velocity noise\n"
+             "then also diffuses into position within a step. Lazy propagation requires it.")
         .def("propagate", &propagate_validated,
              pybind11::arg("particle"),
              pybind11::arg("dt"),
              pybind11::arg("current_time"),
-             pybind11::arg("noise_scale") = 1.0);
+             pybind11::arg("noise_scale") = 1.0)
+        .def_property_readonly("noise_reference_dt", &TwoBodyPropagator::noise_reference_dt,
+             "Reference interval of the time-consistent noise model [s], or None for per-call noise")
+        .def("step_noise_covariance", &TwoBodyPropagator::step_noise_covariance, pybind11::arg("dt"),
+             "6x6 covariance of the noise one propagate(dt) call adds at noise_scale = 1")
+        .def("noise_displacement_bound", &TwoBodyPropagator::noise_displacement_bound,
+             pybind11::arg("interval"),
+             "Conservative bound [m] on how far process noise can move a position over `interval`\n"
+             "seconds, or None when the noise model is per-call (no such bound exists)");
     
     pybind11::class_<InOrbitSensorModel, ISensorModel, std::shared_ptr<InOrbitSensorModel>>(m, "InOrbitSensorModel",
         "6-D Gaussian likelihood of a measurement given a particle, evaluated in the local tangent frame of\n"
@@ -684,6 +744,96 @@ PYBIND11_MODULE(lmb_engine, m) {
              "probability; a step in which no sensor reported anything is applied as a pure missed\n"
              "detection. Raises ValueError if a sensor_id_ is not in the array.")
         .def("get_tracks", &get_tracks_copy, "Gets the current list of tracks")
+        .def("set_lazy_propagation", &SMC_LMB_Tracker::set_lazy_propagation,
+             pybind11::arg("enabled"), pybind11::arg("max_pending") = 60.0,
+             "Turn lazy propagation on or off.\n\n"
+             "With it on, predict() advances only the clock and the survival probability. A track's\n"
+             "cloud is propagated once it lags the clock by max_pending seconds (in substeps of at\n"
+             "most max_pending), when update(measurements, sensors) finds that some particle of it\n"
+             "could be inside a sensor volume, or on synchronize(). Requires a propagator built\n"
+             "with noise_reference_dt; raises ValueError otherwise. get_tracks() may then return\n"
+             "tracks that lag the clock -- call synchronize() first when you need them current.")
+        .def_property_readonly("lazy_propagation", &SMC_LMB_Tracker::lazy_propagation,
+             "Whether lazy propagation is on")
+        .def_property_readonly("max_pending", &SMC_LMB_Tracker::max_pending,
+             "Longest a track may lag the clock under lazy propagation [s]")
+        .def("set_regularization", &SMC_LMB_Tracker::set_regularization,
+             pybind11::arg("enabled"), pybind11::arg("bandwidth_scale") = 1.0,
+             pybind11::arg("ess_threshold") = 0.5,
+             "Turn the regularization (kernel jitter) step on or off.\n\n"
+             "After resampling a cloud whose posterior effective sample size fell below\n"
+             "ess_threshold * N, each particle moves as x <- m + a (x - m) + h L eps, with m, L L^T the\n"
+             "weighted posterior mean and covariance, a = sqrt(1 - h^2) (Liu & West shrinkage, which\n"
+             "keeps the mean and covariance) and h = bandwidth_scale * (4 / (N (d + 2)))^(1/(d+4)),\n"
+             "d = 6 (Musso, Oudjane & Le Gland). Restores the diversity resampling destroys.")
+        .def_property_readonly("regularization", &SMC_LMB_Tracker::regularization,
+             "Whether the regularization step is on")
+        .def("set_fused_proposal", &SMC_LMB_Tracker::set_fused_proposal,
+             pybind11::arg("enabled"), pybind11::arg("ess_min") = 20.0, pybind11::arg("neighbours") = 0,
+             pybind11::arg("fallback_ess_min") = 20.0,
+             "Turn the fused proposal on or off.\n\n"
+             "When the ordinary particle update for a (track, measurement) pair collapses (effective\n"
+             "sample size below ess_min), that pair's detection component is drawn from the overlap of\n"
+             "the track's cloud near the measured state (kernel density of its `neighbours` nearest\n"
+             "particles; 0 = max(30, 5% of the cloud)) and the measurement as a Gaussian in state\n"
+             "space, importance-weighted with the exact likelihood. Its association likelihood replaces\n"
+             "the particle sum, which underflows to zero in that regime. Clouds that reach a sensor's\n"
+             "volume with no particle inside it are scored the same way. If the fused weights collapse\n"
+             "too (ESS below fallback_ess_min), the component falls back to uniform draws from the\n"
+             "Gaussian product with a closed-form likelihood (an approximation, kept as a last resort).")
+        .def_property_readonly("fused_proposal", &SMC_LMB_Tracker::fused_proposal,
+             "Whether the fused proposal is on")
+        .def("set_record_diagnostics", &SMC_LMB_Tracker::set_record_diagnostics, pybind11::arg("enabled"),
+             "Record one entry per track per update: ESS, detection mass, whether it was regularized")
+        .def("take_diagnostics",
+             [](SMC_LMB_Tracker& self) {
+                 const auto records = self.take_diagnostics();
+                 const auto count = static_cast<pybind11::ssize_t>(records.size());
+                 pybind11::array_t<double> time(count), ess(count), detection_mass(count);
+                 pybind11::array_t<uint64_t> birth_time(count);
+                 pybind11::array_t<int64_t> index(count), num_particles(count);
+                 pybind11::array_t<bool> regularized(count);
+                 pybind11::array_t<int64_t> fused_components(count), fallback_components(count),
+                     best_measurement(count);
+                 pybind11::array_t<double> fused_ess(count), best_coefficient(count);
+                 for (pybind11::ssize_t i = 0; i < count; ++i) {
+                     const auto& r = records[static_cast<size_t>(i)];
+                     time.mutable_at(i) = r.time;
+                     ess.mutable_at(i) = r.ess;
+                     detection_mass.mutable_at(i) = r.detection_mass;
+                     birth_time.mutable_at(i) = r.birth_time;
+                     index.mutable_at(i) = static_cast<int64_t>(r.index);
+                     num_particles.mutable_at(i) = static_cast<int64_t>(r.num_particles);
+                     regularized.mutable_at(i) = r.regularized;
+                     fused_components.mutable_at(i) = r.fused_components;
+                     fallback_components.mutable_at(i) = r.fallback_components;
+                     fused_ess.mutable_at(i) = r.fused_ess;
+                     best_measurement.mutable_at(i) = r.best_measurement;
+                     best_coefficient.mutable_at(i) = r.best_coefficient;
+                 }
+                 pybind11::dict out;
+                 out["time"] = time;
+                 out["birth_time"] = birth_time;
+                 out["index"] = index;
+                 out["ess"] = ess;
+                 out["num_particles"] = num_particles;
+                 out["detection_mass"] = detection_mass;
+                 out["regularized"] = regularized;
+                 out["fused_components"] = fused_components;
+                 out["fallback_components"] = fallback_components;
+                 out["fused_ess"] = fused_ess;
+                 out["best_measurement"] = best_measurement;
+                 out["best_coefficient"] = best_coefficient;
+                 return out;
+             },
+             "Posterior records collected since the last call (then cleared), as NumPy arrays")
+        .def("synchronize", &SMC_LMB_Tracker::synchronize,
+             "Propagate every track that lags the clock up to it. A no-op when nothing lags.")
+        .def("timestamp", &SMC_LMB_Tracker::timestamp, "The filter clock [s]")
+        .def("track_summary", &track_summary, pybind11::arg("with_means") = true,
+             "Per-track arrays without copying particle clouds: birth_time, index, existence,\n"
+             "propagated_time, particle_count, and (with_means) the (N, 6) weighted mean states.\n"
+             "Means of lagging tracks are at their propagated_time, not at the clock.")
         .def("set_tracks", &SMC_LMB_Tracker::set_tracks, "Sets the initial list of tracks for the filter")
         .def("compute_association_likelihood", &SMC_LMB_Tracker::compute_association_likelihood, "Compute the association likelihood for a track and measurement");
     

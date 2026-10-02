@@ -40,11 +40,26 @@ static std::pair<std::vector<int>, double> solve_lap_munkres(const Eigen::Matrix
         return {std::vector<int>(), 0.0};
     }
     
+    // The Munkres implementation assumes non-negative costs: its row/column reduction only subtracts
+    // a positive minimum, and its first step stars exact zeros. A row holding negative costs and an
+    // exact zero (e.g. [-62, 0]) therefore keeps the zero as its "assignment". Shift every finite
+    // entry by the matrix minimum first. Each row takes exactly one column, so a constant shift
+    // cannot change which assignment is optimal; the total below is taken from the unshifted costs.
+    double shift = 0.0;
+    for (int i = 0; i < rows; ++i) {
+        for (int j = 0; j < cols; ++j) {
+            const double value = cost_matrix(i, j);
+            if (std::isfinite(value)) {
+                shift = std::min(shift, value);
+            }
+        }
+    }
+
     // Create Munkres matrix and copy data
     Matrix<double> munkres_matrix(rows, cols);
     for (int i = 0; i < rows; ++i) {
         for (int j = 0; j < cols; ++j) {
-            munkres_matrix(i, j) = cost_matrix(i, j);
+            munkres_matrix(i, j) = cost_matrix(i, j) - shift;
         }
     }
     

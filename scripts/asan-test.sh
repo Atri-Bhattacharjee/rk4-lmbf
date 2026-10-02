@@ -61,6 +61,10 @@ if [[ ${#TESTS[@]} -eq 0 ]]; then
     tests/test_local_residual_cached_basis.py
     tests/test_sensor_fov.py
     tests/test_fov_detection_probability.py
+    tests/test_existence_enumeration.py
+    tests/test_lazy_propagation.py
+    tests/test_regularization.py
+    tests/test_fused_proposal.py
     tests/test_validation_dimensions.py
     tests/test_sensor_likelihood.py
     tests/test_adaptive_birth_model.py

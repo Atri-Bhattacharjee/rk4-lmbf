@@ -246,24 +246,66 @@ public:
      * all sensor volumes, accumulated as a genuine union rather than a sum of the per-sensor
      * fractions, so it stays correct (and <= 1) even if two volumes overlap.
      *
+     * When `particle_sensor_out` is given it is resized to the particle count and holds, per
+     * particle, the lowest index of a sensor that sees it, or -1. That is the per-particle
+     * detection-probability mask the filter's update consumes.
+     *
+     * Sensors that cannot reach any particle are skipped before the particle pass: with the cloud
+     * inside a sphere of radius R about c, a sensor at s with |c - s| - R > max_range sees none of
+     * it (triangle inequality). The test is only a necessary condition for visibility, so skipping
+     * changes no result; with the default unbounded range nothing is ever skipped.
+     *
      * A cloud with no particles, or with non-positive total weight, reports zero coverage: there
      * is no evidence it is observable, and the filter's miss branch then leaves its existence
      * probability alone.
      */
-    double coverage(const Track& track, std::vector<double>& per_sensor_out) const {
+    double coverage(const Track& track, std::vector<double>& per_sensor_out,
+                    std::vector<int>* particle_sensor_out = nullptr) const {
         const size_t num_sensors = sensors_.size();
+        const std::vector<Particle>& particles = track.particles();
         per_sensor_out.assign(num_sensors, 0.0);
+        if (particle_sensor_out != nullptr) {
+            particle_sensor_out->assign(particles.size(), -1);
+        }
+
+        std::vector<size_t> candidates;
+        candidates.reserve(num_sensors);
+        if (!std::isfinite(fov_.max_range) || particles.empty()) {
+            for (size_t s = 0; s < num_sensors; ++s) {
+                candidates.push_back(s);
+            }
+        } else {
+            const CloudBound bound = track.current_cloud_bound();
+            for (size_t s = 0; s < num_sensors; ++s) {
+                const double distance = (bound.center_position - sensors_[s].state.head<3>()).norm();
+                // Slack for rounding in the centroid and the radius: a metre plus a relative term,
+                // far below anything a 6-D likelihood could resolve.
+                const double slack = 1.0 + 1e-9 * distance;
+                if (distance - bound.position_radius <= fov_.max_range + slack) {
+                    candidates.push_back(s);
+                }
+            }
+        }
 
         double weight_sum = 0.0;
         double union_weight = 0.0;
-        for (const Particle& particle : track.particles()) {
+        if (candidates.empty()) {
+            // Nothing can see any of it; the weight sum only matters for normalisation, and every
+            // fraction is zero whatever it is.
+            return 0.0;
+        }
+        for (size_t p = 0; p < particles.size(); ++p) {
+            const Particle& particle = particles[p];
             const double weight = particle.weight;
             weight_sum += weight;
             const Eigen::Vector3d position = particle.state_vector.head<3>();
             bool visible_anywhere = false;
-            for (size_t s = 0; s < num_sensors; ++s) {
+            for (size_t s : candidates) {
                 if (sees_unchecked(sensors_[s], position)) {
                     per_sensor_out[s] += weight;
+                    if (!visible_anywhere && particle_sensor_out != nullptr) {
+                        (*particle_sensor_out)[p] = static_cast<int>(s);
+                    }
                     visible_anywhere = true;
                 }
             }
@@ -274,14 +316,56 @@ public:
 
         if (!(weight_sum > 1e-12)) {
             std::fill(per_sensor_out.begin(), per_sensor_out.end(), 0.0);
+            if (particle_sensor_out != nullptr) {
+                std::fill(particle_sensor_out->begin(), particle_sensor_out->end(), -1);
+            }
             return 0.0;
         }
 
+        // A fully covered cloud reports exactly 1.0: its accumulator summed the same weights in the
+        // same order as weight_sum, but x * (1 / x) need not round to 1, and the filter relies on
+        // full coverage reproducing the omniscient-sensor path bit for bit.
         const double inv_weight_sum = 1.0 / weight_sum;
         for (double& fraction : per_sensor_out) {
-            fraction = clamp_unit(fraction * inv_weight_sum);
+            fraction = fraction == weight_sum ? 1.0 : clamp_unit(fraction * inv_weight_sum);
         }
-        return clamp_unit(union_weight * inv_weight_sum);
+        return union_weight == weight_sum ? 1.0 : clamp_unit(union_weight * inv_weight_sum);
+    }
+
+    /**
+     * @brief Whether sensor `index` could see any point of a cloud with this bounding sphere.
+     *
+     * Range-only necessary condition: |c - s| - R <= max_range (with the same rounding slack as
+     * coverage()). Always true with an unbounded range.
+     */
+    bool sphere_reaches(size_t index, const CloudBound& bound) const {
+        require_index(index);
+        if (!std::isfinite(fov_.max_range)) {
+            return true;
+        }
+        const double distance = (bound.center_position - sensors_[index].state.head<3>()).norm();
+        return distance - bound.position_radius <= fov_.max_range + 1.0 + 1e-9 * distance;
+    }
+
+    /**
+     * @brief Whether any sensor could see a point that is within `margin` of `position`.
+     *
+     * A range-only necessary condition (it ignores pointing and min_range), used by lazy
+     * propagation to decide whether a track it has not propagated could already be observable.
+     * Always true with an unbounded range.
+     */
+    bool any_sensor_within_reach(const Eigen::Vector3d& position, double margin) const {
+        if (!std::isfinite(fov_.max_range) || !std::isfinite(margin)) {
+            return !sensors_.empty();
+        }
+        const double reach = fov_.max_range + margin;
+        const double reach_sq = reach * reach;
+        for (const Sensor& sensor : sensors_) {
+            if ((position - sensor.state.head<3>()).squaredNorm() <= reach_sq) {
+                return true;
+            }
+        }
+        return false;
     }
 
 private:

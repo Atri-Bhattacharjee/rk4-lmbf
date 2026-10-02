@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <Eigen/Dense>
 #include <iostream>
+#include <cmath>
+#include <limits>
 
 #include "los_geometry.h"
 
@@ -62,6 +64,48 @@ struct Particle {
 };
 
 /**
+ * @brief Bounding spheres of a particle cloud in position and in velocity.
+ *
+ * center_* are the unweighted means; *_radius the largest distance of any particle from them.
+ * Every particle lies within position_radius of center_position, which is all the consumers rely
+ * on: a cloud resampled from this one (a subset of its particles, possibly repeated) is still
+ * inside the same spheres, so the bound stays valid through resampling and reweighting.
+ */
+struct CloudBound {
+    Eigen::Vector3d center_position = Eigen::Vector3d::Zero();
+    Eigen::Vector3d center_velocity = Eigen::Vector3d::Zero();
+    double position_radius = 0.0;
+    double velocity_radius = 0.0;
+    bool valid = false;
+};
+
+inline CloudBound compute_cloud_bound(const std::vector<Particle>& particles) {
+    CloudBound bound;
+    bound.valid = true;
+    if (particles.empty()) {
+        return bound;
+    }
+    for (const Particle& particle : particles) {
+        bound.center_position += particle.state_vector.head<3>();
+        bound.center_velocity += particle.state_vector.tail<3>();
+    }
+    const double inv_count = 1.0 / static_cast<double>(particles.size());
+    bound.center_position *= inv_count;
+    bound.center_velocity *= inv_count;
+    double position_radius_sq = 0.0;
+    double velocity_radius_sq = 0.0;
+    for (const Particle& particle : particles) {
+        position_radius_sq = std::max(
+            position_radius_sq, (particle.state_vector.head<3>() - bound.center_position).squaredNorm());
+        velocity_radius_sq = std::max(
+            velocity_radius_sq, (particle.state_vector.tail<3>() - bound.center_velocity).squaredNorm());
+    }
+    bound.position_radius = std::sqrt(position_radius_sq);
+    bound.velocity_radius = std::sqrt(velocity_radius_sq);
+    return bound;
+}
+
+/**
  * @brief Represents a single tracked object, its identity, and state uncertainty distribution
  * 
  * A track contains the unique identifier for the object and a cloud of weighted 
@@ -72,6 +116,10 @@ private:
     TrackLabel label_;                     //!< The unique, persistent label for this track
     double existence_probability_;         //!< The probability r that this track corresponds to a real object
     std::vector<Particle> particles_;     //!< The cloud of weighted particles representing the state probability density p(x)
+    //! Time the particle cloud is valid at. NaN until a tracker stamps it. Under lazy propagation a
+    //! track can lag the filter clock; see SMC_LMB_Tracker::set_lazy_propagation.
+    double propagated_time_ = std::numeric_limits<double>::quiet_NaN();
+    CloudBound cloud_bound_;               //!< Cached bounding spheres; invalidated by any cloud mutation
 
 public:
     /**
@@ -114,7 +162,23 @@ public:
      * cloud in place so the vector is not copied. Any reallocation of particles_ invalidates
      * zero-copy NumPy views that alias it.
      */
-    std::vector<Particle>& mutable_particles() { return particles_; }
+    std::vector<Particle>& mutable_particles() {
+        cloud_bound_.valid = false;
+        return particles_;
+    }
+
+    //! Time the particle cloud is valid at, or NaN if no tracker has stamped it yet.
+    double propagated_time() const { return propagated_time_; }
+    void set_propagated_time(double time) { propagated_time_ = time; }
+
+    //! Cached bounding spheres of the cloud. Check .valid; recompute with compute_cloud_bound().
+    const CloudBound& cloud_bound() const { return cloud_bound_; }
+    void set_cloud_bound(const CloudBound& bound) { cloud_bound_ = bound; }
+
+    //! The cached bound if it is valid, otherwise a freshly computed one (the cache is left alone).
+    CloudBound current_cloud_bound() const {
+        return cloud_bound_.valid ? cloud_bound_ : compute_cloud_bound(particles_);
+    }
 
     /**
      * @brief Set the existence probability
@@ -126,14 +190,20 @@ public:
      * @brief Set the particles (copy)
      * @param particles New particle cloud
      */
-    void set_particles(const std::vector<Particle>& particles) { particles_ = particles; }
+    void set_particles(const std::vector<Particle>& particles) {
+        particles_ = particles;
+        cloud_bound_.valid = false;
+    }
 
     /**
      * @brief Set the particles (move). Prefer this over the copy overload when the caller
      *        no longer needs its vector.
      * @param particles New particle cloud
      */
-    void set_particles(std::vector<Particle>&& particles) { particles_ = std::move(particles); }
+    void set_particles(std::vector<Particle>&& particles) {
+        particles_ = std::move(particles);
+        cloud_bound_.valid = false;
+    }
 };
 
 /**

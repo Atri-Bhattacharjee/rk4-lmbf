@@ -23,6 +23,14 @@ python tests/test_local_residual_cached_basis.py
 # than as a mystery in the golden stage.
 python tests/test_sensor_fov.py
 python tests/test_fov_detection_probability.py
+# The update's algebra against an exhaustive enumeration of the joint hypotheses, and the kappa
+# crossover. The golden fixtures saturate existence at 1.0 and cannot see either (seconds).
+python tests/test_existence_enumeration.py
+python tests/test_clutter_scaling.py
+# Time-consistent process noise and lazy propagation (seconds).
+python tests/test_lazy_propagation.py
+python tests/test_regularization.py
+python tests/test_fused_proposal.py
 python tests/test_validation_dimensions.py
 python tests/test_sensor_likelihood.py
 python tests/test_adaptive_birth_model.py
