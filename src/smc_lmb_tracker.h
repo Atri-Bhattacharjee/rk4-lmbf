@@ -45,6 +45,9 @@ private:
     //! off never shifts the resampler's draws.
     std::mt19937_64 regularization_rng_;
     std::normal_distribution<double> regularization_normal_{0.0, 1.0};
+    //! Fused-proposal sampling stream, separate for the same reason.
+    std::mt19937_64 fused_rng_;
+    std::normal_distribution<double> fused_normal_{0.0, 1.0};
 
     // Scratch buffers reused across update() calls so the per-step allocation count does not
     // scale with the track or measurement count. They carry no state between calls; every one is
@@ -79,6 +82,24 @@ private:
     double regularization_bandwidth_scale_ = 1.0;
     double regularization_ess_threshold_ = 0.5;
 
+    // Fused proposal (off by default; see set_fused_proposal).
+    bool fused_proposal_ = false;
+    double fused_ess_min_ = 20.0;                       //!< Ordinary-update ESS below which a pair switches
+    double fused_fallback_ess_min_ = 20.0;              //!< Fused ESS below which the Gaussian fallback is used
+    size_t fused_neighbours_ = 0;                       //!< 0 = max(30, 5% of the cloud)
+
+    //! A detection component drawn from the fused proposal rather than from the track's own cloud.
+    struct FusedComponent {
+        std::vector<Particle> particles;                //!< States, with normalised weights
+        double ess = 0.0;                               //!< ESS of those weights
+        bool fallback = false;                          //!< Gaussian fallback used (weights uniform)
+    };
+    std::vector<int> fused_index_;                      //!< Per (active track, measurement): index into fused_components_, or -1
+    std::vector<FusedComponent> fused_components_;
+    //! Per (active track, sensor): the cloud's bounding sphere reaches that sensor's volume even
+    //! though no particle is inside it. Only maintained while the fused proposal is on.
+    std::vector<char> reach_flags_;
+
 public:
     //! One posterior application (one track, one update), for diagnostics.
     struct PosteriorRecord {
@@ -89,6 +110,11 @@ public:
         size_t num_particles = 0;
         double detection_mass = 0.0;    //!< Posterior probability the track was detected this update
         bool regularized = false;
+        int fused_components = 0;       //!< Detection components drawn from the fused proposal
+        int fallback_components = 0;    //!< ... of which used the Gaussian fallback
+        double fused_ess = 0.0;         //!< Smallest fused-component ESS (0 when none)
+        int best_measurement = -1;      //!< Measurement with the largest association marginal, or -1
+        double best_coefficient = 0.0;  //!< That marginal
     };
 
 private:
@@ -99,6 +125,26 @@ private:
     //! covariance of the cloud it was drawn from.
     void regularize(std::vector<Particle>& resampled, const std::vector<Particle>& predicted,
                     const std::vector<double>& posterior_weights);
+
+    //! Systematic resampling of n particles from `source` with normalised `weights`. One draw from
+    //! resample_rng_. Output weights are 1/n.
+    std::vector<Particle> systematic_resample(const std::vector<Particle>& source,
+                                              const std::vector<double>& weights, size_t n);
+
+    /**
+     * @brief Build the detection component of (track, measurement) from the fused proposal.
+     *
+     * Used when the ordinary particle update has collapsed. The proposal is the Gaussian product of
+     * (i) a kernel density of the track's particles nearest the measured state and (ii) the
+     * measurement expressed as a Gaussian in state space; draws are importance-weighted with the
+     * exact likelihood. Returns false (leaving the ordinary result in place) when the geometry is
+     * degenerate. On success writes the association likelihood L (measurement-space units, the same
+     * quantity the particle sum estimates) and the weighted component.
+     */
+    bool build_fused_component(const Track& track, const Measurement& measurement,
+                               const MeasurementLikelihoodCache& cache, int sensor_index,
+                               const sensor::SensorArray* sensors, double& likelihood,
+                               FusedComponent& out);
 
     void ensure_models_configured() const;
 
@@ -167,7 +213,14 @@ private:
         if (sensor_index < 0) {
             return true;
         }
-        return coverage_per_sensor_[a * num_sensors_ + static_cast<size_t>(sensor_index)] > 0.0;
+        const size_t slot = a * num_sensors_ + static_cast<size_t>(sensor_index);
+        if (coverage_per_sensor_[slot] > 0.0) {
+            return true;
+        }
+        // With the fused proposal on, a cloud that reaches the volume without any particle inside
+        // it can still have produced the measurement; its density there decides, not a particle
+        // count.
+        return fused_proposal_ && reach_flags_[slot] != 0;
     }
 
     //! Whether particle p of active track `a` is inside the volume of sensor `sensor_index`.
@@ -319,6 +372,26 @@ public:
      */
     void set_regularization(bool enabled, double bandwidth_scale = 1.0, double ess_threshold = 0.5);
     bool regularization() const { return regularization_; }
+
+    /**
+     * @brief Turn the fused proposal on or off.
+     *
+     * For each (track, measurement) pair the ordinary particle update runs first. If its effective
+     * sample size is below ess_min (it has collapsed: the measurement is far sharper than the gaps
+     * between the track's particles), that pair's detection component is rebuilt from a proposal
+     * centred where the track's cloud and the measurement overlap: the Gaussian product of a kernel
+     * density of the `neighbours` particles nearest the measured state (0 = max(30, 5% of the
+     * cloud)) and the measurement as a Gaussian in state space, importance-weighted with the exact
+     * likelihood and the kernel density. Its association likelihood replaces the particle sum, which
+     * in that regime underflows to zero. A cloud whose bounding sphere reaches the sensor but has no
+     * particle inside it is scored the same way rather than ruled out. If the fused weights
+     * themselves collapse (ESS below fallback_ess_min), the component falls back to uniform draws from
+     * the Gaussian product with a closed-form likelihood -- an approximation (it fits a Gaussian to a
+     * cut-out of the cloud), kept as a last resort. Off, the filter is bit-for-bit unchanged.
+     */
+    void set_fused_proposal(bool enabled, double ess_min = 20.0, size_t neighbours = 0,
+                            double fallback_ess_min = 20.0);
+    bool fused_proposal() const { return fused_proposal_; }
 
     //! Record one PosteriorRecord per track per update (off by default).
     void set_record_diagnostics(bool enabled) { record_diagnostics_ = enabled; }

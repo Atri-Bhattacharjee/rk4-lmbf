@@ -59,7 +59,9 @@ SMC_LMB_Tracker::SMC_LMB_Tracker(std::shared_ptr<IOrbitPropagator> propagator,
             noise_min_scale_(noise_min_scale),
             resample_rng_(seed.has_value() ? *seed : std::mt19937_64::result_type(std::random_device{}())),
             regularization_rng_(seed.has_value() ? (*seed ^ 0x9E3779B97F4A7C15ULL)
-                                                 : std::mt19937_64::result_type(std::random_device{}())) {
+                                                 : std::mt19937_64::result_type(std::random_device{}())),
+            fused_rng_(seed.has_value() ? (*seed ^ 0xD1B54A32D192ED03ULL)
+                                        : std::mt19937_64::result_type(std::random_device{}())) {
     validation::require_models(propagator_, sensor_model_, birth_model_);
     validation::require_k_best(k_best_);
     validation::require_clutter_intensity(clutter_intensity_);
@@ -189,6 +191,359 @@ void SMC_LMB_Tracker::regularize(std::vector<Particle>& resampled, const std::ve
         }
         particle.state_vector = mean + shrink * (particle.state_vector - mean) + h * (root * eps);
     }
+}
+
+std::vector<Particle> SMC_LMB_Tracker::systematic_resample(const std::vector<Particle>& source,
+                                                          const std::vector<double>& weights, size_t n) {
+    std::uniform_real_distribution<double> unit_dist(0.0, 1.0);
+    std::vector<Particle> resampled_particles;
+    resampled_particles.reserve(n);
+
+    const size_t source_size = source.size();
+    const double u = unit_dist(resample_rng_) / static_cast<double>(n);
+    double cumsum = 0.0;
+    size_t idx = 0;
+
+    for (size_t p = 0; p < n; ++p) {
+        const double threshold = u + static_cast<double>(p) / static_cast<double>(n);
+
+        while (cumsum < threshold && idx < source_size) {
+            cumsum += weights[idx];
+            ++idx;
+        }
+
+        // The position in `weights` is the source index, so no side table is needed.
+        const size_t chosen_index = (idx > 0) ? idx - 1 : 0;
+
+        Particle resampled;
+        resampled.state_vector = source[chosen_index].state_vector;
+        resampled.weight = 1.0 / static_cast<double>(n);
+        resampled_particles.push_back(resampled);
+    }
+    return resampled_particles;
+}
+
+void SMC_LMB_Tracker::set_fused_proposal(bool enabled, double ess_min, size_t neighbours,
+                                         double fallback_ess_min) {
+    if (!(std::isfinite(ess_min) && ess_min >= 0.0)) {
+        throw std::invalid_argument("set_fused_proposal: ess_min must be finite and >= 0, got " +
+                                    std::to_string(ess_min));
+    }
+    if (!(std::isfinite(fallback_ess_min) && fallback_ess_min >= 0.0)) {
+        throw std::invalid_argument("set_fused_proposal: fallback_ess_min must be finite and >= 0, got " +
+                                    std::to_string(fallback_ess_min));
+    }
+    if (neighbours != 0 && neighbours < 8) {
+        throw std::invalid_argument("set_fused_proposal: neighbours must be 0 (automatic) or >= 8, got " +
+                                    std::to_string(neighbours));
+    }
+    fused_proposal_ = enabled;
+    fused_ess_min_ = ess_min;
+    fused_fallback_ess_min_ = fallback_ess_min;
+    fused_neighbours_ = neighbours;
+}
+
+namespace {
+
+using Matrix6d = Eigen::Matrix<double, 6, 6>;
+
+//! Lower-triangular factor of a symmetric positive semi-definite 6x6 matrix: Cholesky when it
+//! succeeds, otherwise an eigen square root (which handles rank deficiency).
+bool matrix_root(const Matrix6d& covariance, Matrix6d& root) {
+    Eigen::LLT<Matrix6d> llt(covariance);
+    if (llt.info() == Eigen::Success) {
+        root = llt.matrixL();
+        return true;
+    }
+    Eigen::SelfAdjointEigenSolver<Matrix6d> eigen(covariance);
+    if (eigen.info() != Eigen::Success) {
+        return false;
+    }
+    root = eigen.eigenvectors() * eigen.eigenvalues().cwiseMax(0.0).cwiseSqrt().asDiagonal();
+    return root.allFinite();
+}
+
+double log_sum_exp(const std::vector<double>& values) {
+    double peak = -std::numeric_limits<double>::infinity();
+    for (double v : values) {
+        peak = std::max(peak, v);
+    }
+    if (!std::isfinite(peak)) {
+        return peak;
+    }
+    double total = 0.0;
+    for (double v : values) {
+        total += std::exp(v - peak);
+    }
+    return peak + std::log(total);
+}
+
+}  // namespace
+
+bool SMC_LMB_Tracker::build_fused_component(const Track& track, const Measurement& measurement,
+                                            const MeasurementLikelihoodCache& cache, int sensor_index,
+                                            const sensor::SensorArray* sensors, double& likelihood,
+                                            FusedComponent& out) {
+    constexpr double kDim = 6.0;
+    constexpr double kLog2Pi = 1.8378770664093453;
+    const std::vector<Particle>& particles = track.particles();
+    const size_t n = particles.size();
+    if (n < 8) {
+        return false;
+    }
+
+    // 1. The measurement as a Gaussian in state space: x_z = h^-1(z), Sigma_z = J^-1 R J^-T with J the
+    //    Jacobian of the local measurement function at x_z, by central differences. Linearised only
+    //    over the measurement's own extent.
+    const StateVector x_z = measurement.toCartesian();
+    if (!x_z.allFinite()) {
+        return false;
+    }
+    const StateVector& sensor_state = measurement.sensor_state_;
+    auto residual = [&](const StateVector& x) {
+        return LocalMeasVector(los::localResidual(cache.measured, los::observe(x, sensor_state),
+                                                  cache.measured_basis));
+    };
+    Matrix6d jacobian;
+    const double steps[6] = {1.0, 1.0, 1.0, 1e-2, 1e-2, 1e-2};
+    for (int k = 0; k < 6; ++k) {
+        StateVector forward = x_z;
+        StateVector backward = x_z;
+        forward(k) += steps[k];
+        backward(k) -= steps[k];
+        // residual = measured - predicted, so d(predicted)/dx = -d(residual)/dx.
+        jacobian.col(k) = -(residual(forward) - residual(backward)) / (2.0 * steps[k]);
+    }
+    const double jacobian_det = jacobian.determinant();
+    if (!std::isfinite(jacobian_det) || std::abs(jacobian_det) < 1e-300) {
+        return false;
+    }
+    const Matrix6d jacobian_inv = jacobian.inverse();
+    Matrix6d sigma_z = jacobian_inv * measurement.covariance_ * jacobian_inv.transpose();
+    sigma_z = 0.5 * (sigma_z + sigma_z.transpose());
+
+    // 2. Global moments of the cloud, and its particles nearest x_z in the metric (C + Sigma_z)^-1.
+    double weight_total = 0.0;
+    StateVector mean = StateVector::Zero();
+    for (const Particle& p : particles) {
+        weight_total += p.weight;
+        mean += p.weight * p.state_vector;
+    }
+    if (!(weight_total > 0.0)) {
+        return false;
+    }
+    mean /= weight_total;
+    Matrix6d covariance = Matrix6d::Zero();
+    for (const Particle& p : particles) {
+        const StateVector d = p.state_vector - mean;
+        covariance.noalias() += (p.weight / weight_total) * d * d.transpose();
+    }
+    const Eigen::LDLT<Matrix6d> metric(covariance + sigma_z);
+    if (metric.info() != Eigen::Success) {
+        return false;
+    }
+    std::vector<std::pair<double, size_t>> distance(n);
+    for (size_t p = 0; p < n; ++p) {
+        const StateVector d = particles[p].state_vector - x_z;
+        distance[p] = {d.dot(metric.solve(d)), p};
+    }
+    size_t k_neighbours = fused_neighbours_ != 0
+        ? fused_neighbours_
+        : std::max<size_t>(30, static_cast<size_t>(std::ceil(0.05 * static_cast<double>(n))));
+    k_neighbours = std::min(k_neighbours, n);
+    std::nth_element(distance.begin(), distance.begin() + static_cast<std::ptrdiff_t>(k_neighbours - 1),
+                     distance.end());
+
+    // 3. Kernel density of the neighbourhood: p_hat(x) = sum_p (w_p / W) N(x; x_p, H), with
+    //    H = h^2 P_L (Silverman/RPF bandwidth for K points) plus a ridge at 1e-6 of the measurement's
+    //    own spread, so a collapsed neighbourhood stays a proper density.
+    double local_weight = 0.0;
+    StateVector local_mean = StateVector::Zero();
+    for (size_t i = 0; i < k_neighbours; ++i) {
+        const Particle& p = particles[distance[i].second];
+        local_weight += p.weight;
+        local_mean += p.weight * p.state_vector;
+    }
+    if (!(local_weight > 0.0)) {
+        return false;
+    }
+    local_mean /= local_weight;
+    Matrix6d local_cov = Matrix6d::Zero();
+    for (size_t i = 0; i < k_neighbours; ++i) {
+        const Particle& p = particles[distance[i].second];
+        const StateVector d = p.state_vector - local_mean;
+        local_cov.noalias() += (p.weight / local_weight) * d * d.transpose();
+    }
+    const double h = std::pow(4.0 / (static_cast<double>(k_neighbours) * (kDim + 2.0)), 1.0 / (kDim + 4.0));
+    Matrix6d ridge = Matrix6d::Zero();
+    ridge.diagonal() = 1e-6 * sigma_z.diagonal();
+    const Matrix6d bandwidth = h * h * local_cov + ridge;
+    Matrix6d bandwidth_root;
+    if (!matrix_root(bandwidth, bandwidth_root)) {
+        return false;
+    }
+    Eigen::LLT<Matrix6d> bandwidth_llt(bandwidth);
+    if (bandwidth_llt.info() != Eigen::Success) {
+        return false;
+    }
+    const Matrix6d bandwidth_l = bandwidth_llt.matrixL();
+    const double bandwidth_log_det = 2.0 * bandwidth_l.diagonal().array().log().sum();
+
+    // The kernel sum runs over every particle whose kernel can reach the measurement's footprint
+    // (within 7 sigma in the metric (Sigma_z + H)^-1), plus the neighbourhood itself. The
+    // neighbourhood only sets the kernel width; choosing the summed set by reach rather than by count
+    // keeps the density whole wherever the likelihood is non-negligible, also when the measurement is
+    // not much sharper than the cloud. Capped at kMaxKernels nearest, which only binds when the cloud
+    // is so close to the measurement's size that the ordinary update would not have collapsed.
+    constexpr double kReachSigmas = 7.0;
+    constexpr size_t kMaxKernels = 4096;
+    const Eigen::LDLT<Matrix6d> reach_metric(sigma_z + bandwidth);
+    if (reach_metric.info() != Eigen::Success) {
+        return false;
+    }
+    std::vector<std::pair<double, size_t>> reach(n);
+    for (size_t p = 0; p < n; ++p) {
+        const StateVector d = particles[p].state_vector - x_z;
+        reach[p] = {d.dot(reach_metric.solve(d)), p};
+    }
+    std::vector<char> in_kernel_set(n, 0);
+    for (size_t i = 0; i < k_neighbours; ++i) {
+        in_kernel_set[distance[i].second] = 1;
+    }
+    std::sort(reach.begin(), reach.end());
+    std::vector<size_t> kernel_set;
+    kernel_set.reserve(std::min(n, kMaxKernels));
+    for (const auto& entry : reach) {
+        if (kernel_set.size() >= kMaxKernels) {
+            break;
+        }
+        if (entry.first <= kReachSigmas * kReachSigmas || in_kernel_set[entry.second]) {
+            kernel_set.push_back(entry.second);
+        }
+    }
+
+    const size_t num_kernels = kernel_set.size();
+    std::vector<StateVector> kernel_centres(num_kernels);
+    std::vector<double> kernel_log_weight(num_kernels);
+    for (size_t i = 0; i < num_kernels; ++i) {
+        const Particle& p = particles[kernel_set[i]];
+        kernel_centres[i] = bandwidth_l.triangularView<Eigen::Lower>().solve(p.state_vector);
+        kernel_log_weight[i] = std::log(std::max(p.weight / weight_total, 1e-300)) -
+                               0.5 * kDim * kLog2Pi - 0.5 * bandwidth_log_det;
+    }
+    auto log_prior_density = [&](const StateVector& x, std::vector<double>& scratch) {
+        const StateVector y = bandwidth_l.triangularView<Eigen::Lower>().solve(x);
+        scratch.resize(num_kernels);
+        for (size_t i = 0; i < num_kernels; ++i) {
+            scratch[i] = kernel_log_weight[i] - 0.5 * (y - kernel_centres[i]).squaredNorm();
+        }
+        return log_sum_exp(scratch);
+    };
+
+    // 4. Proposal: Gaussian product of the neighbourhood (moments of its kernel density) and the
+    //    measurement, widened by 1.5 in standard deviation for defensive tails.
+    const Matrix6d prior_cov = local_cov + bandwidth;
+    const Eigen::LDLT<Matrix6d> innovation(prior_cov + sigma_z);
+    if (innovation.info() != Eigen::Success) {
+        return false;
+    }
+    const Matrix6d gain = innovation.solve(prior_cov).transpose();   // prior_cov (prior_cov + sigma_z)^-1
+    const StateVector fused_mean = local_mean + gain * (x_z - local_mean);
+    Matrix6d fused_cov = prior_cov - gain * prior_cov;
+    fused_cov = 0.5 * (fused_cov + fused_cov.transpose());
+    constexpr double kInflation = 1.5;
+    Matrix6d proposal_cov = kInflation * kInflation * fused_cov + ridge;
+    Matrix6d proposal_root;
+    if (!matrix_root(proposal_cov, proposal_root)) {
+        return false;
+    }
+    Eigen::LLT<Matrix6d> proposal_llt(proposal_cov);
+    const bool proposal_has_density = proposal_llt.info() == Eigen::Success;
+    const Matrix6d proposal_l = proposal_has_density ? Matrix6d(proposal_llt.matrixL()) : Matrix6d::Identity();
+    const double proposal_log_det = proposal_has_density ? 2.0 * proposal_l.diagonal().array().log().sum() : 0.0;
+
+    // 5. Draw, weight with prior density x exact likelihood x visibility / proposal density.
+    std::vector<StateVector> draws(n);
+    std::vector<double> log_weights(n, -std::numeric_limits<double>::infinity());
+    std::vector<double> scratch;
+    if (proposal_has_density) {
+        for (size_t m = 0; m < n; ++m) {
+            StateVector eps;
+            for (int k = 0; k < 6; ++k) {
+                eps(k) = fused_normal_(fused_rng_);
+            }
+            draws[m] = fused_mean + proposal_l * eps;
+            const bool visible = sensors == nullptr || sensor_index < 0 ||
+                                 sensors->sees(static_cast<size_t>(sensor_index), draws[m].head<3>());
+            if (!visible) {
+                continue;
+            }
+            Particle probe;
+            probe.state_vector = draws[m];
+            probe.weight = 1.0;
+            const double g = sensor_model_->calculate_likelihood(probe, measurement, cache);
+            if (!(g > 0.0)) {
+                continue;
+            }
+            const double log_q = -0.5 * eps.squaredNorm() - 0.5 * kDim * kLog2Pi - 0.5 * proposal_log_det;
+            log_weights[m] = log_prior_density(draws[m], scratch) + std::log(g) - log_q;
+        }
+    }
+    const double log_total = log_sum_exp(log_weights);
+
+    out.particles.clear();
+    out.particles.reserve(n);
+    out.fallback = false;
+    out.ess = 0.0;
+    if (std::isfinite(log_total)) {
+        double sum_sq = 0.0;
+        for (size_t m = 0; m < n; ++m) {
+            const double w = std::exp(log_weights[m] - log_total);
+            sum_sq += w * w;
+        }
+        out.ess = sum_sq > 0.0 ? 1.0 / sum_sq : 0.0;
+    }
+
+    if (std::isfinite(log_total) && out.ess >= fused_fallback_ess_min_) {
+        likelihood = std::exp(log_total - std::log(static_cast<double>(n)));
+        for (size_t m = 0; m < n; ++m) {
+            Particle particle;
+            particle.state_vector = draws[m];
+            particle.weight = std::exp(log_weights[m] - log_total);
+            out.particles.push_back(particle);
+        }
+        return std::isfinite(likelihood);
+    }
+
+    // 6. Fallback: the weights collapsed too (or the proposal had no density). Use the Gaussian
+    //    product itself -- uniform draws from N(fused_mean, fused_cov) -- and the closed-form
+    //    association likelihood (K/N of the cloud's mass) * N(x_z; local_mean, prior_cov + Sigma_z) / |det J|.
+    Matrix6d fused_root;
+    if (!matrix_root(fused_cov + ridge, fused_root)) {
+        return false;
+    }
+    const StateVector innovation_vector = x_z - local_mean;
+    const Matrix6d innovation_cov = prior_cov + sigma_z;
+    const double log_det_innovation = std::log(std::max(innovation_cov.determinant(), 1e-300));
+    const double log_closed_form = std::log(local_weight / weight_total) - 0.5 * kDim * kLog2Pi -
+                                   0.5 * log_det_innovation -
+                                   0.5 * innovation_vector.dot(innovation.solve(innovation_vector)) -
+                                   std::log(std::abs(jacobian_det));
+    likelihood = std::exp(log_closed_form);
+    const double uniform = 1.0 / static_cast<double>(n);
+    for (size_t m = 0; m < n; ++m) {
+        StateVector eps;
+        for (int k = 0; k < 6; ++k) {
+            eps(k) = fused_normal_(fused_rng_);
+        }
+        Particle particle;
+        particle.state_vector = fused_mean + fused_root * eps;
+        particle.weight = uniform;
+        out.particles.push_back(particle);
+    }
+    out.ess = static_cast<double>(n);
+    out.fallback = true;
+    return std::isfinite(likelihood);
 }
 
 void SMC_LMB_Tracker::stamp_unstamped_tracks() {
@@ -336,7 +691,21 @@ void SMC_LMB_Tracker::compute_coverage(const sensor::SensorArray* sensors) {
     coverage_union_.clear();
     particle_sensor_.clear();
     track_inv_weight_sum_.clear();
+    reach_flags_.clear();
     track_particle_offsets_.assign(1, 0);
+
+    // Sensors that produced a measurement this update: only they can make a reach-only pair.
+    std::vector<size_t> reporting_sensors;
+    const bool track_reach = fused_proposal_ && sensors != nullptr;
+    if (track_reach) {
+        for (int sensor_index : meas_sensor_) {
+            if (sensor_index >= 0 &&
+                std::find(reporting_sensors.begin(), reporting_sensors.end(),
+                          static_cast<size_t>(sensor_index)) == reporting_sensors.end()) {
+                reporting_sensors.push_back(static_cast<size_t>(sensor_index));
+            }
+        }
+    }
 
     for (size_t i = 0; i < num_tracks; ++i) {
         const Track& track = tracks[i];
@@ -348,7 +717,28 @@ void SMC_LMB_Tracker::compute_coverage(const sensor::SensorArray* sensors) {
                 continue;
             }
             union_fraction = sensors->coverage(track, coverage_scratch_, &particle_sensor_scratch_);
-            if (!(union_fraction > 0.0)) {
+
+            // Fused proposal: a cloud whose bounding sphere reaches a reporting sensor is a candidate
+            // for that sensor's measurements even with no particle inside the volume.
+            bool reaches_any = false;
+            if (track_reach) {
+                const size_t row = reach_flags_.size();
+                reach_flags_.resize(row + num_sensors_, 0);
+                if (!reporting_sensors.empty()) {
+                    const CloudBound bound = track.current_cloud_bound();
+                    for (size_t sensor_index : reporting_sensors) {
+                        if (coverage_scratch_[sensor_index] <= 0.0 &&
+                            sensors->sphere_reaches(sensor_index, bound)) {
+                            reach_flags_[row + sensor_index] = 1;
+                            reaches_any = true;
+                        }
+                    }
+                }
+                if (!(union_fraction > 0.0) && !reaches_any) {
+                    reach_flags_.resize(row);
+                }
+            }
+            if (!(union_fraction > 0.0) && !reaches_any) {
                 continue;
             }
             coverage_per_sensor_.insert(coverage_per_sensor_.end(), coverage_scratch_.begin(),
@@ -413,12 +803,28 @@ void SMC_LMB_Tracker::apply_posterior(size_t a, size_t num_meas,
     if (contributing_hypotheses == 0 || num_particles == 0) {
         return;
     }
+    // A cloud nobody could see (reach-only under the fused proposal) that took no measurement: its
+    // posterior is its prior, so there is nothing to resample.
+    if (detection_total == 0.0 && pd_mass == 0.0) {
+        return;
+    }
+
+    // Detection components drawn from the fused proposal live outside the track's own cloud; they
+    // are mixed in below, after the components that reweight the track's own particles.
+    const bool any_fused = !fused_index_.empty() && [&] {
+        for (size_t j = 0; j < num_meas; ++j) {
+            if (det_used[j] && fused_index_[a * num_meas + j] >= 0) {
+                return true;
+            }
+        }
+        return false;
+    }();
 
     // Mixture, one pass per used association. Measurements ascending, then the miss term, so the
     // summation order is fixed run to run.
     mixture_weights_.assign(num_particles, 0.0);
     for (size_t j = 0; j < num_meas; ++j) {
-        if (!det_used[j]) {
+        if (!det_used[j] || (any_fused && fused_index_[a * num_meas + j] >= 0)) {
             continue;
         }
         const double coefficient = det_coefficients[j];
@@ -438,21 +844,48 @@ void SMC_LMB_Tracker::apply_posterior(size_t a, size_t num_meas,
         }
     }
 
+    // The resampling source: the track's own particles, plus any fused components appended after
+    // them with weight coefficient * (normalised component weight).
+    const std::vector<Particle>* source = &predicted_particles;
+    std::vector<Particle> union_particles;
+    int fused_count = 0;
+    int fallback_count = 0;
+    double fused_ess = 0.0;
+    if (any_fused) {
+        union_particles = predicted_particles;
+        for (size_t j = 0; j < num_meas; ++j) {
+            const int index = det_used[j] ? fused_index_[a * num_meas + j] : -1;
+            if (index < 0) {
+                continue;
+            }
+            const FusedComponent& component = fused_components_[static_cast<size_t>(index)];
+            for (const Particle& particle : component.particles) {
+                union_particles.push_back(particle);
+                mixture_weights_.push_back(det_coefficients[j] * particle.weight);
+            }
+            fused_ess = (fused_count == 0) ? component.ess : std::min(fused_ess, component.ess);
+            ++fused_count;
+            fallback_count += component.fallback ? 1 : 0;
+        }
+        source = &union_particles;
+    }
+    const size_t source_size = source->size();
+
     double sum_weights = 0.0;
-    for (size_t p = 0; p < num_particles; ++p) {
+    for (size_t p = 0; p < source_size; ++p) {
         sum_weights += mixture_weights_[p];
     }
 
     if (sum_weights > 0.0 && std::isfinite(sum_weights)) {
         const double inv_sum = 1.0 / sum_weights;
-        for (size_t p = 0; p < num_particles; ++p) {
+        for (size_t p = 0; p < source_size; ++p) {
             mixture_weights_[p] *= inv_sum;
         }
     } else {
         // No information to go on. Equal slots make the systematic walk keep every particle
         // exactly once, which is the sensible reading of that.
-        const double uniform_weight = 1.0 / static_cast<double>(num_particles);
-        for (size_t p = 0; p < num_particles; ++p) {
+        const double uniform_weight = 1.0 / static_cast<double>(source_size);
+        for (size_t p = 0; p < source_size; ++p) {
             mixture_weights_[p] = uniform_weight;
         }
     }
@@ -460,7 +893,7 @@ void SMC_LMB_Tracker::apply_posterior(size_t a, size_t num_meas,
     double ess = 0.0;
     if (regularization_ || record_diagnostics_) {
         double sum_sq = 0.0;
-        for (size_t p = 0; p < num_particles; ++p) {
+        for (size_t p = 0; p < source_size; ++p) {
             sum_sq += mixture_weights_[p] * mixture_weights_[p];
         }
         ess = sum_sq > 0.0 ? 1.0 / sum_sq : 0.0;
@@ -468,33 +901,10 @@ void SMC_LMB_Tracker::apply_posterior(size_t a, size_t num_meas,
     const bool regularize_now = regularization_ && num_particles > 1 &&
                                 ess < regularization_ess_threshold_ * static_cast<double>(num_particles);
 
-    std::uniform_real_distribution<double> unit_dist(0.0, 1.0);
-    std::vector<Particle> resampled_particles;
-    resampled_particles.reserve(num_particles);
-
-    const double u = unit_dist(resample_rng_) / static_cast<double>(num_particles);
-    double cumsum = 0.0;
-    size_t idx = 0;
-
-    for (size_t p = 0; p < num_particles; ++p) {
-        const double threshold = u + static_cast<double>(p) / static_cast<double>(num_particles);
-
-        while (cumsum < threshold && idx < num_particles) {
-            cumsum += mixture_weights_[idx];
-            ++idx;
-        }
-
-        // The position in mixture_weights_ is the particle index, so no side table is needed.
-        const size_t chosen_index = (idx > 0) ? idx - 1 : 0;
-
-        Particle resampled;
-        resampled.state_vector = predicted_particles[chosen_index].state_vector;
-        resampled.weight = 1.0 / static_cast<double>(num_particles);
-        resampled_particles.push_back(resampled);
-    }
+    std::vector<Particle> resampled_particles = systematic_resample(*source, mixture_weights_, num_particles);
 
     if (regularize_now) {
-        regularize(resampled_particles, predicted_particles, mixture_weights_);
+        regularize(resampled_particles, *source, mixture_weights_);
     }
     if (record_diagnostics_) {
         PosteriorRecord record;
@@ -505,6 +915,15 @@ void SMC_LMB_Tracker::apply_posterior(size_t a, size_t num_meas,
         record.num_particles = num_particles;
         record.detection_mass = detection_total;
         record.regularized = regularize_now;
+        record.fused_components = fused_count;
+        record.fallback_components = fallback_count;
+        record.fused_ess = fused_ess;
+        for (size_t j = 0; j < num_meas; ++j) {
+            if (det_used[j] && det_coefficients[j] > record.best_coefficient) {
+                record.best_coefficient = det_coefficients[j];
+                record.best_measurement = static_cast<int>(j);
+            }
+        }
         diagnostics_.push_back(record);
     }
 
@@ -605,6 +1024,11 @@ void SMC_LMB_Tracker::update_impl(const std::vector<Measurement>& measurements,
     // per-track particle counts are free to differ.
     association_weights_.assign(track_particle_offsets_[num_active] * num_meas, 0.0);
     Eigen::MatrixXd likelihood_matrix = Eigen::MatrixXd::Zero(num_active, num_meas);
+    fused_components_.clear();
+    fused_index_.clear();
+    if (fused_proposal_) {
+        fused_index_.assign(num_active * num_meas, -1);
+    }
 
     for (size_t a = 0; a < num_active; ++a) {
         const auto& current_particles = tracks[active_tracks_[a]].particles();
@@ -622,6 +1046,7 @@ void SMC_LMB_Tracker::update_impl(const std::vector<Measurement>& measurements,
             double* assoc = association_weights_.data() + association_block_offset(a, j, num_meas);
 
             double total_likelihood = 0.0;
+            double total_squared = 0.0;
             size_t visible_count = 0;
             for (size_t p = 0; p < num_particles; ++p) {
                 if (!particle_visible_to(a, p, sensor_index)) {
@@ -634,11 +1059,30 @@ void SMC_LMB_Tracker::update_impl(const std::vector<Measurement>& measurements,
                 const double updated_weight = current_particle.weight * inv_weight_sum * particle_likelihood;
                 assoc[p] = updated_weight;
                 total_likelihood += updated_weight;
+                total_squared += updated_weight * updated_weight;
             }
 
             // Raw L, with neither P_D nor kappa: Step 3 applies each exactly once, and nothing else
             // multiplies by them.
             likelihood_matrix(a, j) = total_likelihood;
+
+            // Fused proposal: when the particle sum has collapsed onto a handful of particles (or
+            // underflowed to zero), rebuild this pair's detection component where the cloud and the
+            // measurement overlap. Its likelihood replaces the collapsed sum.
+            if (fused_proposal_) {
+                const double pair_ess = total_squared > 0.0
+                    ? total_likelihood * total_likelihood / total_squared : 0.0;
+                if (pair_ess < fused_ess_min_) {
+                    FusedComponent component;
+                    double fused_likelihood = 0.0;
+                    if (build_fused_component(tracks[active_tracks_[a]], measurement, meas_caches[j],
+                                              sensor_index, sensors, fused_likelihood, component)) {
+                        likelihood_matrix(a, j) = fused_likelihood;
+                        fused_index_[a * num_meas + j] = static_cast<int>(fused_components_.size());
+                        fused_components_.push_back(std::move(component));
+                    }
+                }
+            }
 
             if (total_likelihood >= std::numeric_limits<double>::min()) {
                 const double inv_total = 1.0 / total_likelihood;

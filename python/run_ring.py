@@ -99,11 +99,19 @@ class RingConfig:
     p_detection: float = P_DETECTION
     p_survival: float = P_SURVIVAL
     p_birth: float = P_BIRTH
-    clutter_intensity: float = CLUTTER_INTENSITY
+    # Density of "new object" detections in measurement space -- what a measurement no existing
+    # track explains is weighed against. Derived from the scenario: ~1.2e-4 first detections per
+    # sensor-second (142 over 100 sensors x 12,088 s in the 2-orbit reference run), spread over one
+    # sensor's measurement space: 20 km of range x 30 km/s of closing speed x 4 pi sr x ~4 (rad/s)^2
+    # of angular rate ~ 3e10. 1.2e-4 / 3e10 ~ 4e-15.
+    clutter_intensity: float = 4e-15
     prune_threshold: float = PRUNE_THRESHOLD
     k_best: int = K_BEST
-    truth_sigmas: list = field(default_factory=lambda: TRUTH_SIGMAS.tolist())
-    filter_sigma_scale: float = 3.0       # likelihood and birth sigmas = scale * truth sigmas
+    # True sensor noise: range [m], range rate [m/s], two LOS angles [rad], two LOS rates [rad/s].
+    # The angular terms are matched to range and range rate at ~15 km (10 m and 1 m/s cross-range);
+    # --tight-angles restores the 1 urad / 0.1 urad/s placeholder from simulation_common.
+    truth_sigmas: list = field(default_factory=lambda: [10.0, 1.0, 6.7e-4, 6.7e-4, 6.7e-5, 6.7e-5])
+    filter_sigma_scale: float = 1.0       # likelihood and birth sigmas = scale * truth sigmas
     # Extra per-component multipliers on top of filter_sigma_scale, same order as the sigmas.
     filter_sigma_extra: list = field(default_factory=lambda: [1.0] * 6)
     # Position (m) and velocity (m/s) standard deviations accumulated over noise_reference_dt.
@@ -114,6 +122,8 @@ class RingConfig:
     regularization: bool = True
     regularization_bandwidth_scale: float = 1.0
     regularization_ess_threshold: float = 0.5
+    fused_proposal: bool = True
+    fused_ess_min: float = 20.0
 
     @property
     def filter_sigmas(self) -> np.ndarray:
@@ -172,9 +182,18 @@ def config_from_args(argv=None) -> RingConfig:
                         help="per-component multipliers on top of --sigma-scale")
     parser.add_argument("--no-regularization", action="store_false", dest="regularization",
                         default=None, help="turn the kernel-jitter step off")
+    parser.add_argument("--no-fused", action="store_false", dest="fused_proposal", default=None,
+                        help="turn the fused proposal off (ordinary particle update only)")
+    parser.add_argument("--kappa", type=float, dest="clutter_intensity",
+                        help="density of new-object detections in measurement space")
+    parser.add_argument("--tight-angles", action="store_true", default=False,
+                        help="use simulation_common's 1 urad / 0.1 urad/s angular noise")
     parser.add_argument("--csv", dest="csv_path")
     parser.add_argument("--output", dest="output_dir")
     args = parser.parse_args(argv)
+    tight = vars(args).pop("tight_angles")
+    if tight:
+        config.truth_sigmas = TRUTH_SIGMAS.tolist()
     for key, value in vars(args).items():
         if value is not None:
             setattr(config, key, value)
@@ -252,6 +271,7 @@ def build_filter(config: RingConfig, seeds: dict):
     tracker.set_lazy_propagation(True, config.max_pending)
     tracker.set_regularization(config.regularization, config.regularization_bandwidth_scale,
                                config.regularization_ess_threshold)
+    tracker.set_fused_proposal(config.fused_proposal, config.fused_ess_min)
     tracker.set_record_diagnostics(True)
     return tracker
 
@@ -290,13 +310,18 @@ class Pass:
     credited_alive_at_start: bool
     detections: int = 0
     birth: bool = False
+    taken_by_own: bool = False      # some detection in the pass was taken by a track born from this object
 
     @property
     def outcome(self) -> str:
         if self.first_pass:
             return "first detection"
-        if not self.birth:
+        if self.taken_by_own and not self.birth:
             return "re-acquired"
+        if self.taken_by_own:
+            return "re-acquired, extra birth"
+        if not self.birth:
+            return "taken by another track"
         return "duplicate birth" if self.credited_alive_at_start else "lost, re-born"
 
 
@@ -309,7 +334,9 @@ def label_keys(summary) -> np.ndarray:
 # =============================================================================
 
 
-def run(config: RingConfig, verbose: bool = True) -> dict:
+def run(config: RingConfig, verbose: bool = True, before_update=None) -> dict:
+    """Run the scenario. ``before_update``, if given, is called after predict() and before
+    update() at every step, with keyword arguments describing that step (diagnostics only)."""
     seeds = derive_seeds(config.seed)
     timers = Timers()
     wall_start = time.perf_counter()
@@ -345,7 +372,9 @@ def run(config: RingConfig, verbose: bool = True) -> dict:
     credited: dict[int, int] = {}   # object -> label key of the track last born from it
     births = []                     # (time, label key, attributed object or -1)
     known_labels: set[int] = set()
-    posterior_records = []          # (time, ESS / N, detection mass, regularized)
+    posterior_records = []          # (time, ESS / N, detection mass, regularized, fused components, fallbacks)
+    track_origin: dict[int, int] = {}   # label key -> object whose detection the track was born from
+    association_events = []        # (time, object detected, origin object of the track that took it, marginal, fused)
 
     # Sampled metrics.
     samples = {name: [] for name in (
@@ -430,6 +459,11 @@ def run(config: RingConfig, verbose: bool = True) -> dict:
         if step > 0:
             tracker.predict(config.dt)
         timers.add("predict", time.perf_counter() - tick)
+        if before_update is not None:
+            before_update(now=now, config=config, tracker=tracker, sensors=sensors, truth=truth,
+                          sensor_states=sensor_states, measurements=measurements,
+                          measured_objects=measured_objects, passes=passes, open_pass=open_pass,
+                          credited=credited)
         tick = time.perf_counter()
         tracker.update(measurements, sensors)
         timers.add("update", time.perf_counter() - tick)
@@ -437,7 +471,21 @@ def run(config: RingConfig, verbose: bool = True) -> dict:
         if len(records["time"]):
             posterior_records.append(np.column_stack([
                 records["time"], records["ess"] / np.maximum(records["num_particles"], 1),
-                records["detection_mass"], records["regularized"].astype(np.float64)]))
+                records["detection_mass"], records["regularized"].astype(np.float64),
+                records["fused_components"].astype(np.float64),
+                records["fallback_components"].astype(np.float64)]))
+            # Which existing track took each detection (marginal >= 0.5), and was it the right one?
+            keys_taken = (records["birth_time"].astype(np.int64) * 1_000_000
+                          + records["index"].astype(np.int64))
+            for key, j, coefficient, fused in zip(keys_taken.tolist(), records["best_measurement"].tolist(),
+                                                  records["best_coefficient"].tolist(),
+                                                  records["fused_components"].tolist()):
+                if j >= 0 and coefficient >= 0.5 and j < len(measured_objects):
+                    o = measured_objects[j]
+                    association_events.append((now, o, track_origin.get(int(key), -1), coefficient,
+                                               float(fused > 0)))
+                    if o in open_pass and track_origin.get(int(key), -1) == o:
+                        passes[open_pass[o]].taken_by_own = True
 
         # --- births, attributed to the nearest object measured this step ---
         if measured_objects:
@@ -453,6 +501,7 @@ def run(config: RingConfig, verbose: bool = True) -> dict:
                     o = measured_objects[int(np.argmin(gaps))]
                     births.append((now, int(keys[i]), o))
                     credited[o] = int(keys[i])
+                    track_origin[int(keys[i])] = o
                     if o in open_pass:
                         passes[open_pass[o]].birth = True
             known_labels.update(keys.tolist())
@@ -538,13 +587,14 @@ def run(config: RingConfig, verbose: bool = True) -> dict:
         "detection_events": np.asarray(detection_events, dtype=np.float64).reshape(-1, 3),
         "births": np.asarray(births, dtype=np.float64).reshape(-1, 3),
         "passes": np.asarray([(p.object_index, p.start_time, p.first_pass, p.detections, p.birth,
-                               p.credited_alive_at_start) for p in passes],
-                             dtype=np.float64).reshape(-1, 6),
+                               p.credited_alive_at_start, p.taken_by_own) for p in passes],
+                             dtype=np.float64).reshape(-1, 7),
         "pass_outcomes": outcomes,
         "object_rows": np.asarray(object_rows, dtype=np.float64).reshape(-1, 6),
         "track_rows": np.asarray(track_rows, dtype=np.float64).reshape(-1, 4),
         "posterior_records": (np.vstack(posterior_records) if posterior_records
-                              else np.zeros((0, 4))),
+                              else np.zeros((0, 6))),
+        "association_events": np.asarray(association_events, dtype=np.float64).reshape(-1, 5),
         "timers": timers.totals,
         "wall_seconds": wall,
         "overlap_events": overlap_events,
@@ -561,7 +611,8 @@ def run(config: RingConfig, verbose: bool = True) -> dict:
 
 
 ARRAY_KEYS = ("object_ids", "detections_per_sensor", "detections_per_object", "detection_events",
-              "births", "passes", "object_rows", "track_rows", "posterior_records", "time", "gospa", "localisation",
+              "births", "passes", "object_rows", "track_rows", "posterior_records",
+              "association_events", "time", "gospa", "localisation",
               "missed", "false_positive", "num_assigned", "num_truths", "num_estimates",
               "num_tracks", "existence_sum", "num_lagging")
 
@@ -569,7 +620,11 @@ ARRAY_KEYS = ("object_ids", "detections_per_sensor", "detections_per_object", "d
 def run_summary(log: dict) -> dict:
     tracking = np.divide(log["num_assigned"], log["num_truths"],
                          out=np.zeros_like(log["num_assigned"]), where=log["num_truths"] > 0)
-    records = np.asarray(log["posterior_records"]).reshape(-1, 4)
+    records = np.asarray(log["posterior_records"])
+    records = records.reshape(-1, records.shape[1] if records.ndim == 2 and records.shape[1] else 6)
+    events = np.asarray(log.get("association_events", np.zeros((0, 5)))).reshape(-1, 5)
+    own = events[events[:, 1] == events[:, 2]]
+    steals = events[(events[:, 2] >= 0) & (events[:, 1] != events[:, 2])]
     detection = records[records[:, 2] >= 0.5]
     miss = records[records[:, 2] < 0.5]
     nees = np.asarray(log["object_rows"]).reshape(-1, 6)[:, 5]
@@ -578,6 +633,11 @@ def run_summary(log: dict) -> dict:
         "median_ess_fraction_detection_updates": float(np.median(detection[:, 1])) if len(detection) else None,
         "median_ess_fraction_miss_updates": float(np.median(miss[:, 1])) if len(miss) else None,
         "fraction_of_updates_regularized": float(records[:, 3].mean()) if len(records) else 0.0,
+        "updates_with_fused_component": int(np.sum(records[:, 4] > 0)) if records.shape[1] > 4 else 0,
+        "fused_fallbacks": int(np.sum(records[:, 5])) if records.shape[1] > 5 else 0,
+        "detections_taken_by_own_track": int(len(own)),
+        "detections_taken_by_other_object_track": int(len(steals)),
+        "detections_taken_with_fused_component": int(np.sum(events[:, 4] > 0)) if len(events) else 0,
         "median_nees": float(np.median(nees)) if len(nees) else None,
         "nees_inside_95pct_band": float(np.mean((nees >= 0.2158) & (nees <= 9.3484))) if len(nees) else None,
         "wall_seconds": round(log["wall_seconds"], 2),

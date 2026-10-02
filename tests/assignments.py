@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 
+import itertools
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
@@ -220,6 +221,39 @@ def test_murty_algorithm_specific():
     assert_test(hyps[0].associations == hyps_single[0].associations,
                "First k-best assignment should match single best assignment")
 
+def test_negative_costs_with_exact_zero():
+    """Regression: the Munkres core assumes non-negative costs.
+
+    Its reduction step only subtracts a positive minimum and its first step stars exact zeros, so a
+    row like [-62, 0] used to come back assigned to the 0. The LMB cost matrix has both: detections
+    with r P_D L / kappa > 1 cost < 0, and a track no sensor can see has a miss cost of exactly 0.
+    The wrapper now shifts the matrix to be non-negative first; the optimum cannot change.
+    """
+    print("\n=== Testing negative costs alongside an exact zero ===")
+    cases = [
+        (np.array([[-62.0, 0.0]]), [0], -62.0),
+        (np.array([[0.0, -5.0]]), [1], -5.0),
+        (np.array([[-62.0, 0.0, 1e9], [1e9, 1e9, 0.0]]), [0, 2], -62.0),
+        (np.array([[-3.0, 0.0], [0.0, -4.0]]), [0, 1], -7.0),
+    ]
+    for matrix, expected, cost in cases:
+        best = lmb_engine.solve_assignment(matrix, 1)[0]
+        assert_test(list(best.associations) == expected,
+                    f"best assignment of {matrix.tolist()} must be {expected}, got {list(best.associations)}")
+        assert_test(abs(best.weight - cost) < 1e-9, f"best cost must be {cost}, got {best.weight}")
+    # Against brute force on random matrices with negative entries and planted zeros.
+    rng = np.random.default_rng(7)
+    for _ in range(50):
+        n = int(rng.integers(1, 5))
+        m = n + int(rng.integers(0, 3))
+        matrix = rng.normal(0.0, 30.0, size=(n, m))
+        matrix[rng.random((n, m)) < 0.3] = 0.0
+        best = lmb_engine.solve_assignment(matrix, 1)[0]
+        brute = min(sum(matrix[i, perm[i]] for i in range(n))
+                    for perm in itertools.permutations(range(m), n))
+        assert_test(abs(best.weight - brute) < 1e-9, f"random case: {best.weight} vs brute force {brute}")
+
+
 def test_large_matrix_performance():
     """Test performance and correctness on larger matrices"""
     print("\n=== Large Matrix Performance Tests ===")
@@ -250,6 +284,7 @@ def run_all_tests():
     test_cost_verification()
     test_missed_detection_scenarios()
     test_murty_algorithm_specific()
+    test_negative_costs_with_exact_zero()
     test_large_matrix_performance()
     
     print(f"\n=== Test Summary ===")

@@ -338,7 +338,8 @@ def plot_run_summary(log, out: Path) -> list[Path]:
     a.set_title(f"Detections per sensor ({int(per_sensor.sum())} total, "
                 f"{int(np.sum(per_sensor > 0))} of {len(per_sensor)} sensors saw something)", loc="left")
 
-    order = ["first detection", "re-acquired", "duplicate birth", "lost, re-born"]
+    order = ["first detection", "re-acquired", "re-acquired, extra birth", "taken by another track",
+             "duplicate birth", "lost, re-born"]
     names = [name for name in order if name in outcomes] + [n for n in outcomes if n not in order]
     values = [outcomes[n] for n in names]
     b.barh(names, values, height=0.3, color=SERIES[0])
@@ -362,7 +363,8 @@ def plot_run_summary(log, out: Path) -> list[Path]:
 
 
 def plot_ess(log, out: Path) -> list[Path]:
-    records = np.asarray(log.get("posterior_records", np.zeros((0, 4)))).reshape(-1, 4)
+    records = np.asarray(log.get("posterior_records", np.zeros((0, 6))))
+    records = records.reshape(-1, records.shape[1] if records.ndim == 2 and records.shape[1] else 6)
     fig, ax = plt.subplots(figsize=(8.5, 4.4))
     edges = np.logspace(-4, 0, 41)
     detection = records[records[:, 2] >= 0.5, 1]
@@ -387,7 +389,8 @@ def plot_ess(log, out: Path) -> list[Path]:
     ax.legend(loc="upper left")
     paths = [_save(fig, out / "ess.png")]
     paths.append(_write_csv(out / "posterior_updates.csv",
-                            ["time_s", "ess_fraction", "detection_mass", "regularized"], records.tolist()))
+                            ["time_s", "ess_fraction", "detection_mass", "regularized", "fused_components",
+                             "fallbacks"][:records.shape[1]], records.tolist()))
     return paths
 
 

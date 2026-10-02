@@ -520,6 +520,46 @@ near-full-state measurement at close range does to a 1000-particle cloud.
 `tracker.set_record_diagnostics(True)` / `tracker.take_diagnostics()` expose the ESS and detection
 mass of every posterior, which is how to see that happening.
 
+### Fused proposal (re-acquisition)
+
+`tracker.set_fused_proposal(True, ess_min=20, neighbours=0, fallback_ess_min=20)`, off by default.
+
+**The problem it fixes.** The ordinary update scores a track's particles against a measurement and
+averages the scores. That only works if some particle lands within a few noise widths of the
+measurement in every one of the six channels. When a track comes back past a sensor after an orbit,
+its cloud is a long thin needle in position-velocity space (tens of km long, but thinner than the
+measurement in some velocity directions -- the flow stretches it along the orbit and, with little
+process noise, squeezes it elsewhere to keep its volume). No particle lands near the measurement,
+every score rounds to exactly zero, and the returning object is born as a new track.
+
+**What it does.** For each (track, measurement) pair the ordinary update runs first. If its
+effective sample size is below `ess_min` (it has collapsed or underflowed), the pair's detection
+component is rebuilt where the needle and the measurement overlap:
+
+1. express the measurement as a Gaussian in state space (its Jacobian, by central differences);
+2. fit a kernel density to the track's particles nearest the measured state (`neighbours`, 0 = max(30,
+   5% of the cloud), used to set the kernel width; the kernel sum runs over every particle that can
+   reach the measurement's footprint);
+3. sample from the Gaussian product of the two, widened 1.5x, and weight each draw by
+   kernel density x exact likelihood / proposal density.
+
+The association likelihood becomes the average of those weights instead of a sum that underflows. A
+cloud whose bounding sphere reaches the sensor with no particle inside is scored the same way. If the
+fused weights collapse too (ESS below `fallback_ess_min`), the component falls back to the Gaussian
+product with a closed-form likelihood -- an approximation kept as a last resort.
+
+Measured on the ring (100 sensors, 1000 objects, 1000 particles): repeat passes re-acquired went from
+0/17 to 17/17 (2 orbits) and 77/77 (5 orbits); births equal objects detected; no detection taken by
+another object's track across kappa from 4e-19 to 4e-3. `tests/test_fused_proposal.py` checks it
+against the ordinary update where both are valid, and against a closed-form answer on a needle where
+the ordinary sum is exactly zero.
+
+**Assignment solver fix.** The Munkres core assumed non-negative costs (its reduction only subtracts a
+positive minimum, and its first step stars exact zeros), so a row like `[-62, 0]` came back assigned to
+the 0. The wrapper in `src/assignment.cpp` now shifts the matrix to be non-negative first; the optimal
+assignment cannot change. Detection costs are routinely negative, and a track no sensor can see has a
+miss cost of exactly 0.
+
 ## Ring scenario: many sensors, sampled debris
 
 ```bash
@@ -530,14 +570,21 @@ python python/evaluation_plots.py python/results/ring_seed20260930/ring_log.npz 
 
 `N` range-only sensors on a circular equatorial 800 km orbit (20 km range) against objects sampled
 per run from `python/data/eci_800km-altitude_20km-range_randomized_phase.csv`, on a 1 s clock with
-lazy propagation. Truth, sensors and detection are propagated in NumPy with the engine's RK4 model.
-Filter tuning is imported from `simulation_common` and is **not** tuned for this geometry; retune
-in the `RingConfig` block of `python/run_ring.py`. Outputs go to `python/results/ring_seed<seed>/`
-(gitignored): `ring_log.npz`, `summary.json`, and eight figures with CSV twins — GOSPA and its
-decomposition, cardinality, per-object track error, error against time since last detection, track
-lifecycles, tracking fraction, position NEES against the χ²(3) band, and a run summary (detections
-per sensor, pass outcomes, wall time per phase). Everything is scored against objects detected at
-least once.
+lazy propagation, regularization and the fused proposal. Defaults: sensor noise 10 m, 1 m/s,
+6.7e-4 rad, 6.7e-5 rad/s (angles matched to range at ~15 km; `--tight-angles` for the 1 urad
+placeholder), filter at 1x truth, kappa 4e-15 (derived in `RingConfig`). Truth, sensors and
+detection are propagated in NumPy with the engine's RK4 model. Tuning lives in the `RingConfig` block
+of `python/run_ring.py`; useful flags: `--sigma-scale`, `--truth-sigmas`, `--kappa`, `--no-fused`,
+`--no-regularization`. The truth has no process noise, so the filter's process noise only keeps
+particles diverse; with `--tight-angles` it dominates the cloud's growth between passes and makes
+the filter underconfident (NEES ~0.3) unless reduced ~100x.
+
+Outputs go to `python/results/ring_seed<seed>/` (gitignored): `ring_log.npz`, `summary.json`, and
+nine figures with CSV twins — GOSPA and its decomposition, cardinality, per-object track error, error
+against time since last detection, track lifecycles, tracking fraction, position NEES against the
+χ²(3) band, a run summary (detections per sensor, pass outcomes, wall time per phase), and ESS per
+update. Everything is scored against objects detected at least once. `summary.json` also counts
+detections taken by the object's own track versus another object's track.
 
 ## Project layout
 
@@ -605,6 +652,7 @@ rk4-lmbf/
 │   ├── test_clutter_scaling.py # kappa enters the detection cost exactly once
 │   ├── test_lazy_propagation.py           # time-consistent noise, lazy == eager
 │   ├── test_regularization.py  # kernel jitter keeps posterior moments, restores diversity
+│   ├── test_fused_proposal.py  # re-acquisition: fused proposal vs ordinary update and exact answers
 │   ├── test_adaptive_birth_model.py
 │   ├── test_bindings_api.py
 │   ├── test_end_to_end.py

@@ -333,6 +333,21 @@ public:
     }
 
     /**
+     * @brief Whether sensor `index` could see any point of a cloud with this bounding sphere.
+     *
+     * Range-only necessary condition: |c - s| - R <= max_range (with the same rounding slack as
+     * coverage()). Always true with an unbounded range.
+     */
+    bool sphere_reaches(size_t index, const CloudBound& bound) const {
+        require_index(index);
+        if (!std::isfinite(fov_.max_range)) {
+            return true;
+        }
+        const double distance = (bound.center_position - sensors_[index].state.head<3>()).norm();
+        return distance - bound.position_radius <= fov_.max_range + 1.0 + 1e-9 * distance;
+    }
+
+    /**
      * @brief Whether any sensor could see a point that is within `margin` of `position`.
      *
      * A range-only necessary condition (it ignores pointing and min_range), used by lazy

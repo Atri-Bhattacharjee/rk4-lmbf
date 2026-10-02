@@ -30,6 +30,7 @@ python tests/test_clutter_scaling.py
 # Time-consistent process noise and lazy propagation (seconds).
 python tests/test_lazy_propagation.py
 python tests/test_regularization.py
+python tests/test_fused_proposal.py
 python tests/test_validation_dimensions.py
 python tests/test_sensor_likelihood.py
 python tests/test_adaptive_birth_model.py

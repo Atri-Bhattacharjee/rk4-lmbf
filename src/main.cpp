@@ -768,6 +768,21 @@ PYBIND11_MODULE(lmb_engine, m) {
              "d = 6 (Musso, Oudjane & Le Gland). Restores the diversity resampling destroys.")
         .def_property_readonly("regularization", &SMC_LMB_Tracker::regularization,
              "Whether the regularization step is on")
+        .def("set_fused_proposal", &SMC_LMB_Tracker::set_fused_proposal,
+             pybind11::arg("enabled"), pybind11::arg("ess_min") = 20.0, pybind11::arg("neighbours") = 0,
+             pybind11::arg("fallback_ess_min") = 20.0,
+             "Turn the fused proposal on or off.\n\n"
+             "When the ordinary particle update for a (track, measurement) pair collapses (effective\n"
+             "sample size below ess_min), that pair's detection component is drawn from the overlap of\n"
+             "the track's cloud near the measured state (kernel density of its `neighbours` nearest\n"
+             "particles; 0 = max(30, 5% of the cloud)) and the measurement as a Gaussian in state\n"
+             "space, importance-weighted with the exact likelihood. Its association likelihood replaces\n"
+             "the particle sum, which underflows to zero in that regime. Clouds that reach a sensor's\n"
+             "volume with no particle inside it are scored the same way. If the fused weights collapse\n"
+             "too (ESS below fallback_ess_min), the component falls back to uniform draws from the\n"
+             "Gaussian product with a closed-form likelihood (an approximation, kept as a last resort).")
+        .def_property_readonly("fused_proposal", &SMC_LMB_Tracker::fused_proposal,
+             "Whether the fused proposal is on")
         .def("set_record_diagnostics", &SMC_LMB_Tracker::set_record_diagnostics, pybind11::arg("enabled"),
              "Record one entry per track per update: ESS, detection mass, whether it was regularized")
         .def("take_diagnostics",
@@ -778,6 +793,9 @@ PYBIND11_MODULE(lmb_engine, m) {
                  pybind11::array_t<uint64_t> birth_time(count);
                  pybind11::array_t<int64_t> index(count), num_particles(count);
                  pybind11::array_t<bool> regularized(count);
+                 pybind11::array_t<int64_t> fused_components(count), fallback_components(count),
+                     best_measurement(count);
+                 pybind11::array_t<double> fused_ess(count), best_coefficient(count);
                  for (pybind11::ssize_t i = 0; i < count; ++i) {
                      const auto& r = records[static_cast<size_t>(i)];
                      time.mutable_at(i) = r.time;
@@ -787,6 +805,11 @@ PYBIND11_MODULE(lmb_engine, m) {
                      index.mutable_at(i) = static_cast<int64_t>(r.index);
                      num_particles.mutable_at(i) = static_cast<int64_t>(r.num_particles);
                      regularized.mutable_at(i) = r.regularized;
+                     fused_components.mutable_at(i) = r.fused_components;
+                     fallback_components.mutable_at(i) = r.fallback_components;
+                     fused_ess.mutable_at(i) = r.fused_ess;
+                     best_measurement.mutable_at(i) = r.best_measurement;
+                     best_coefficient.mutable_at(i) = r.best_coefficient;
                  }
                  pybind11::dict out;
                  out["time"] = time;
@@ -796,6 +819,11 @@ PYBIND11_MODULE(lmb_engine, m) {
                  out["num_particles"] = num_particles;
                  out["detection_mass"] = detection_mass;
                  out["regularized"] = regularized;
+                 out["fused_components"] = fused_components;
+                 out["fallback_components"] = fallback_components;
+                 out["fused_ess"] = fused_ess;
+                 out["best_measurement"] = best_measurement;
+                 out["best_coefficient"] = best_coefficient;
                  return out;
              },
              "Posterior records collected since the last call (then cleared), as NumPy arrays")
