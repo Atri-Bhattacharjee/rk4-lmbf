@@ -11,6 +11,7 @@
  */
 
 #include "datatypes.h"
+#include <cstdint>
 #include <optional>
 #include <vector>
 
@@ -55,6 +56,26 @@ public:
     virtual std::optional<double> noise_displacement_bound(double interval) const {
         (void)interval;
         return std::nullopt;
+    }
+
+    /**
+     * @brief Whether propagate_cloud_keyed is implemented. SMC_LMB_Tracker's fast mode needs it.
+     */
+    virtual bool supports_keyed_propagation() const { return false; }
+
+    /**
+     * @brief Propagate a whole cloud in place, drawing process noise from keyed streams.
+     *
+     * Particle p's noise is a pure function of (stream_key, p): it never depends on how many other
+     * calls happened before. The deterministic (gravity) part must match propagate() exactly.
+     */
+    virtual void propagate_cloud_keyed(std::vector<Particle>& particles, double dt, double current_time,
+                                       double noise_scale, uint64_t stream_key) const {
+        (void)particles;
+        (void)dt;
+        (void)current_time;
+        (void)noise_scale;
+        (void)stream_key;
     }
 };
 

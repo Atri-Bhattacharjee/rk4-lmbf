@@ -11,7 +11,11 @@
 
 #include <vector>
 #include <memory>
+#include <utility>
+#include <string>
+#include <tuple>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <random>
 #include "datatypes.h"
@@ -73,6 +77,34 @@ private:
     size_t num_sensors_ = 0;                            //!< Sensors in the array driving the current update
     bool sensor_array_ = false;                         //!< Whether the current update has a sensor array at all
 
+    // Fast mode (off by default; see set_fast_mode).
+    bool fast_mode_ = false;
+    uint64_t stream_seed_ = 0;                          //!< Root of every keyed stream in fast mode
+
+    //! Key of the noise stream for one substep of one track (fast mode).
+    uint64_t substep_key(const Track& track, double step_start, double dt) const;
+
+    // Particle gate (off by default; see set_particle_gate).
+    bool particle_gate_ = false;
+    bool gate_audit_ = false;
+    bool gate_sleep_ = true;
+    // Sleep bookkeeping for the particle gate (see validate_sleeps).
+    std::vector<Eigen::Vector3d> sleep_sensor_positions_;
+    double sleep_sensor_time_ = std::numeric_limits<double>::quiet_NaN();
+    double sleep_sensor_range_ = std::numeric_limits<double>::quiet_NaN();
+    double sleep_speed_bound_ = 0.0;     //!< Bound on every sensor's speed that current sleeps assume
+    double sleep_noise_cap_ = 0.0;       //!< Noise displacement bound over max_pending_, annealing-scaled
+    double sleep_noise_cap_unscaled_ = 0.0;  //!< ... at unit scale, as the sphere test uses it
+    mutable uint64_t gate_audit_checks_ = 0;
+    mutable uint64_t gate_audit_violations_ = 0;
+    uint64_t sleep_audit_checks_ = 0;
+    uint64_t sleep_audit_violations_ = 0;
+    std::string sleep_audit_first_;
+    //! Audit one "not observable" decision (see set_gate_audit).
+    void audit_gate_decision(const Track& track, const sensor::SensorArray& sensors, double now) const;
+    std::vector<size_t> refresh_work_;                //!< Lagging, awake tracks to test this update
+    std::vector<size_t> gate_candidates_;             //!< Sensors the sphere test flagged (scratch)
+
     // Lazy propagation (off by default; see set_lazy_propagation).
     bool lazy_propagation_ = false;
     double max_pending_ = 60.0;                         //!< Longest a track may lag the clock, and the longest substep [s]
@@ -117,9 +149,74 @@ public:
         double best_coefficient = 0.0;  //!< That marginal
     };
 
+    /**
+     * @brief Wall-clock totals and work counts, accumulated while profiling is on.
+     *
+     * Read-only instrumentation: nothing in the filter reads it, and collecting it draws no random
+     * number and changes no track, so a profiled run is bit-for-bit the unprofiled one. Timers wrap
+     * whole loops (not single tracks), so their own cost is a few clock reads per call.
+     */
+    struct Profile {
+        // Seconds.
+        double predict = 0.0;               //!< Whole predict()
+        double predict_propagate = 0.0;     //!< ... of which cloud propagation
+        double update = 0.0;                //!< Whole update()
+        double refresh = 0.0;               //!< Lazy refresh: observability checks + propagation
+        double refresh_propagate = 0.0;     //!< ... of which propagation
+        double refresh_check = 0.0;         //!< ... of which observability tests
+        double synchronize = 0.0;           //!< Explicit synchronize() calls
+        double coverage = 0.0;              //!< compute_coverage
+        double likelihood = 0.0;            //!< Per-pair particle sums, fused builds excluded
+        double fused = 0.0;                 //!< Fused-proposal builds
+        double assignment = 0.0;            //!< Cost matrix + ranked assignment + hypothesis weights
+        double posterior = 0.0;             //!< apply_posterior (marginals, mixture, resampling, jitter)
+        double birth = 0.0;                 //!< Birth of new tracks
+        // Counts.
+        uint64_t predict_calls = 0;
+        uint64_t update_calls = 0;
+        uint64_t updates_with_measurements = 0;
+        uint64_t predict_particle_steps = 0;     //!< Particles x substeps propagated by predict()
+        uint64_t refresh_particle_steps = 0;     //!< ... by the lazy refresh in update()
+        uint64_t synchronize_particle_steps = 0; //!< ... by synchronize()
+        uint64_t refresh_checks = 0;             //!< Observability tests of lagging tracks
+        uint64_t refresh_slept = 0;              //!< Lagging tracks skipped because they were asleep
+        uint64_t sleep_resets = 0;               //!< Times every sleep was cleared (sensor jump, ...)
+        //! "Not observable" answers by the sleep they earned: none, < 1 s, 1-5 s, 5-20 s, >= 20 s.
+        uint64_t sleep_histogram[5] = {0, 0, 0, 0, 0};
+        uint64_t tracks_refreshed = 0;           //!< Tracks the refresh brought to the clock
+        uint64_t refreshed_tracks_covered = 0;   //!< ... with some particle inside a sensor volume
+        //! Refreshed tracks bucketed by the smallest (particle-to-sensor distance - max_range) after
+        //! propagation: inside (<= 0), within 5 km, 5-50 km, beyond 50 km.
+        uint64_t refresh_gap_inside = 0;
+        uint64_t refresh_gap_under_5km = 0;
+        uint64_t refresh_gap_5_to_50km = 0;
+        uint64_t refresh_gap_over_50km = 0;
+        uint64_t active_tracks = 0;              //!< Summed over updates
+        uint64_t likelihood_evaluations = 0;     //!< Particle likelihoods in the per-pair sums
+        uint64_t fused_builds = 0;
+        uint64_t fused_kernel_evaluations = 0;   //!< Draws x kernels in the fused prior density
+        uint64_t posterior_updates = 0;          //!< apply_posterior calls that resampled
+        uint64_t regularizations = 0;
+        uint64_t births = 0;
+    };
+
+    void set_profiling(bool enabled) { profiling_ = enabled; }
+    bool profiling() const { return profiling_; }
+    const Profile& profile() const { return profile_; }
+    void reset_profile() { profile_ = Profile{}; }
+
 private:
     bool record_diagnostics_ = false;
     std::vector<PosteriorRecord> diagnostics_;
+
+    bool profiling_ = false;
+    Profile profile_;
+    //! Per filter track: brought to the clock by this update's lazy refresh (profiling only).
+    std::vector<char> refreshed_scratch_;
+
+    //! Profiling only: bucket a freshly refreshed track by how close its particles came to a sensor
+    //! (0 inside, 1 within 5 km, 2 within 50 km, 3 beyond, -1 nothing to measure).
+    int refresh_gap_bucket(const Track& track, const sensor::SensorArray& sensors) const;
 
     //! Liu-West kernel jitter of a freshly resampled cloud, about the weighted posterior mean and
     //! covariance of the cloud it was drawn from.
@@ -188,12 +285,26 @@ private:
     double noise_scale_at(const Track& track, double time) const;
 
     //! Propagate one track from its propagated_time to `target_time` in equal substeps no longer
-    //! than max_pending_, then refresh its cached cloud bound.
-    void propagate_track_to(Track& track, double target_time);
+    //! than max_pending_, then refresh its cached cloud bound. Returns particles x substeps.
+    uint64_t propagate_track_to(Track& track, double target_time);
 
     //! Whether any particle of a lagging track could be inside a sensor volume at `now`. Conservative:
     //! a false positive only costs an early propagation.
-    bool may_be_observable(Track& track, const sensor::SensorArray& sensors, double now) const;
+    bool may_be_observable(Track& track, const sensor::SensorArray& sensors, double now,
+                           std::vector<size_t>& candidates, double& sleep_for) const;
+
+    //! Particle gate: whether any particle of a lagging track could be within reach of one of
+    //! `candidates` after tau seconds. Conservative in the same sense as may_be_observable.
+    bool particles_may_be_observable(const Track& track, const sensor::SensorArray& sensors,
+                                     double tau, double noise, const std::vector<size_t>& candidates,
+                                     double& sleep_for, const Eigen::Vector3d& cloud_predicted,
+                                     double nearest_other) const;
+
+    //! Particle gate: before a refresh, check that every sensor moved no faster than the speed bound
+    //! the current sleeps assume (and that the clock, the sensor count and the range are unchanged);
+    //! otherwise wake every track. Sets sleep_speed_bound_ and sleep_noise_cap_ for this update.
+    void validate_sleeps(const sensor::SensorArray& sensors, double now);
+
 
     //! Lazy mode: bring every lagging track that may be observable up to the clock.
     void refresh_observable_tracks(const sensor::SensorArray& sensors);
@@ -352,6 +463,54 @@ public:
      * at the current time is wanted, and read Track::propagated_time() to tell.
      */
     void set_lazy_propagation(bool enabled, double max_pending = 60.0);
+
+    /**
+     * @brief Turn the particle gate of lazy propagation on or off.
+     *
+     * Lazy propagation decides whether a lagging cloud might be visible from one bounding sphere.
+     * For a long curved cloud the sphere is far larger than the cloud, so the whole cloud gets
+     * stepped every second while no particle is anywhere near a sensor (measured: 97% of such
+     * refreshes on the 10-orbit ring run had no particle within 5 km of a sensor's reach). With the
+     * gate on, a sphere "maybe" is re-tested particle by particle, with the same Taylor bound and no
+     * cloud spread, against only the sensors the sphere flagged; the cloud is propagated only if some
+     * particle could be in reach. Sensors that reported a measurement keep the sphere test, so the
+     * fused proposal still sees every cloud near a detection.
+     *
+     * It changes when clouds are propagated, never what an update learns: a cloud left lagging has
+     * no particle inside any sensor volume, exactly as with the sphere test. The substep partition,
+     * and with it the noise draws, differ, so results are statistically, not bitwise, the same. Off
+     * (the default), the filter is bit-for-bit unchanged.
+     */
+    void set_particle_gate(bool enabled) { particle_gate_ = enabled; }
+    bool particle_gate() const { return particle_gate_; }
+
+    /**
+     * @brief Audit the particle gate (validation only; slow).
+     *
+     * Every time the gate leaves a cloud lagging, a noise-free copy of the cloud is propagated to the
+     * clock (drawing no random number, so the run itself is unchanged) and tested against every
+     * sensor. Any particle inside a volume is a violation: the gate would have dropped evidence.
+     * Returns (decisions audited, violations).
+     */
+    void set_gate_audit(bool enabled) { gate_audit_ = enabled; }
+
+    /**
+     * @brief Sleep between gate tests (on by default with the gate; for testing).
+     *
+     * After the gate answers "not observable", the cloud is not tested again until the same test is
+     * guaranteed to answer "not observable" no longer: the margin is taken at its largest over the
+     * remaining lag, the cloud and every sensor move at bounded speed (sensors are held to the bound
+     * every update, and a violation wakes every track), and steps with a reported measurement test
+     * everything. Skipping only answers already known therefore leaves results bit-for-bit unchanged.
+     */
+    void set_gate_sleep(bool enabled) { gate_sleep_ = enabled; }
+    std::pair<uint64_t, uint64_t> gate_audit_counts() const {
+        return {gate_audit_checks_, gate_audit_violations_};
+    }
+    //! (sleeping skips audited, skips whose test would have said "maybe", first such case).
+    std::tuple<uint64_t, uint64_t, std::string> sleep_audit() const {
+        return {sleep_audit_checks_, sleep_audit_violations_, sleep_audit_first_};
+    }
     bool lazy_propagation() const { return lazy_propagation_; }
     double max_pending() const { return max_pending_; }
 
@@ -392,6 +551,23 @@ public:
     void set_fused_proposal(bool enabled, double ess_min = 20.0, size_t neighbours = 0,
                             double fallback_ess_min = 20.0);
     bool fused_proposal() const { return fused_proposal_; }
+
+    /**
+     * @brief Turn fast mode on or off.
+     *
+     * Fast mode draws process noise from keyed streams (fast_random.h) through a ziggurat sampler,
+     * and propagates a cloud in one batched call instead of one virtual call per particle. The
+     * noise a particle gets is a pure function of (seed, track, substep, particle), so it does not
+     * depend on how often, or in which order, anything else was propagated. The deterministic RK4
+     * step is bit-for-bit the legacy one.
+     *
+     * The random streams differ from the legacy ones, so a fast-mode run is statistically, not
+     * bitwise, equivalent to a legacy run. Off (the default) the filter is bit-for-bit unchanged.
+     * Requires a propagator that supports keyed propagation (TwoBodyPropagator does); throws
+     * std::invalid_argument otherwise.
+     */
+    void set_fast_mode(bool enabled);
+    bool fast_mode() const { return fast_mode_; }
 
     //! Record one PosteriorRecord per track per update (off by default).
     void set_record_diagnostics(bool enabled) { record_diagnostics_ = enabled; }

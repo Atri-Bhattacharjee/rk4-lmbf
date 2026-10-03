@@ -34,6 +34,18 @@
  *   cloud faster under this one. Lazy propagation in SMC_LMB_Tracker requires this model, because
  *   it propagates the same track with different step lengths.
  */
+/**
+ * @brief One noise-free RK4 two-body step, in place: exactly the deterministic part of
+ *        TwoBodyPropagator::propagate (same derivative, same arithmetic).
+ */
+void two_body_rk4_step(StateVector& state, double dt);
+
+/**
+ * @brief two_body_rk4_step applied to `count` states in place, bit-for-bit the same per state, but
+ *        stepping several at once. State i is the six doubles at first + i * stride.
+ */
+void two_body_rk4_step_strided(double* first, size_t stride, size_t count, double dt);
+
 class TwoBodyPropagator : public IOrbitPropagator {
 public:
     explicit TwoBodyPropagator(const Eigen::MatrixXd& process_noise_covariance,
@@ -43,6 +55,12 @@ public:
     Particle propagate(const Particle& particle, double dt, double current_time, double noise_scale = 1.0) const override;
 
     std::optional<double> noise_displacement_bound(double interval) const override;
+
+    bool supports_keyed_propagation() const override { return true; }
+    //! Same RK4 step as propagate(), applied in place to every particle, with each particle's noise
+    //! drawn from fast_random::Stream(combine(stream_key, index)) through a ziggurat sampler.
+    void propagate_cloud_keyed(std::vector<Particle>& particles, double dt, double current_time,
+                               double noise_scale, uint64_t stream_key) const override;
 
     //! Reference interval of the time-consistent model, or nullopt for the per-call model.
     std::optional<double> noise_reference_dt() const { return noise_reference_dt_; }
