@@ -16,9 +16,10 @@ built with noise_reference_dt: the process noise is the covariance accumulated o
 Filter tuning lives in the "Filter configuration" block of RingConfig and is set for this
 geometry, not imported from simulation_common (which is tuned for a 400 km sensor looking at objects
 ~1000 km away). The measurement likelihood and the birth covariance are 3x the truth noise; process
-noise is small, because the truth follows the same two-body model with no perturbations, and only
-has to keep resampled particles from collapsing onto duplicates; process-noise annealing is off. A
-regularization (kernel jitter) step restores particle diversity after resampling.
+noise is very small (see RingConfig), because the truth follows the same two-body model with no
+perturbations, and only has to keep resampled particles from collapsing onto duplicates;
+process-noise annealing is off. A regularization (kernel jitter) step restores particle diversity
+after resampling.
 
 Truth, sensors and detections are propagated in NumPy with the same RK4 two-body model the engine
 uses. Metrics are sampled every metric_interval seconds against the objects detected at least once
@@ -88,6 +89,7 @@ class RingConfig:
     noise_reference_dt: float = 60.0
     existence_threshold: float = 0.5      # tracks at or above this are the state estimate
     progress_interval: float = 600.0      # simulated seconds between progress lines
+    profile: bool = True                  # engine phase timers (read-only; results unchanged)
     seed: int = 20260930
     csv_path: str = str(DEFAULT_CSV)
     output_dir: str = ""
@@ -115,8 +117,14 @@ class RingConfig:
     # Extra per-component multipliers on top of filter_sigma_scale, same order as the sigmas.
     filter_sigma_extra: list = field(default_factory=lambda: [1.0] * 6)
     # Position (m) and velocity (m/s) standard deviations accumulated over noise_reference_dt.
-    q_position_sigma: float = 2.0
-    q_velocity_sigma: float = 0.02
+    # Tuned 2026-10-02 (sweep of 1x..0.01x on two seeds, confirmed at 30 orbits): the old 2 m /
+    # 0.02 m/s made the filter forget ~0.2 m/s of velocity per orbit against a noise-free truth, so
+    # well-observed tracks drifted ~0.9 km/h and stale NEES sat at ~0.7. At 0.03x drift is ~0.13 km/h,
+    # stale NEES ~2.1 and the 30-orbit median error 2 km instead of 12. Gains flatten below 0.1x; the
+    # cost is a few more "re-acquired, extra birth" passes (6-10 vs 2-3 of ~1700). If the truth gets
+    # dynamics the filter lacks (J2, drag), raise these to cover that mismatch.
+    q_position_sigma: float = 0.06
+    q_velocity_sigma: float = 0.0006
     noise_decay_rate: float = 0.0         # process-noise annealing off
     noise_min_scale: float = 1.0
     regularization: bool = True
@@ -124,6 +132,15 @@ class RingConfig:
     regularization_ess_threshold: float = 0.5
     fused_proposal: bool = True
     fused_ess_min: float = 20.0
+    # --- Engine speed (results statistically, not bitwise, equal to the legacy engine) ---
+    particle_gate: bool = True            # re-test a lazy cloud's "maybe visible" per particle
+    fast_mode: bool = True                # keyed random streams + ziggurat + batched propagation
+    gate_audit: bool = False              # validation only (slow): check every gate decision
+    gate_sleep: bool = True               # skip gate tests whose answer is already known
+    # Truth and sensors stepped in C++ (lmb_engine.two_body_rk4_steps, the engine's own RK4), a
+    # chunk of truth_chunk steps per call, instead of NumPy every step. Off: the NumPy RK4 below.
+    fast_truth: bool = True
+    truth_chunk: int = 60
 
     @property
     def filter_sigmas(self) -> np.ndarray:
@@ -170,6 +187,12 @@ def config_from_args(argv=None) -> RingConfig:
     parser.add_argument("--orbits", type=float, dest="num_orbits")
     parser.add_argument("--particles", type=int, dest="num_particles")
     parser.add_argument("--dt", type=float)
+    parser.add_argument("--metric-interval", type=float, dest="metric_interval",
+                        help="simulated seconds between metric samples")
+    parser.add_argument("--progress-interval", type=float, dest="progress_interval",
+                        help="simulated seconds between progress lines")
+    parser.add_argument("--no-profile", action="store_false", dest="profile", default=None,
+                        help="turn the engine's phase timers off")
     parser.add_argument("--range", type=float, dest="sensor_range", help="sensor max range [m]")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--sigma-scale", type=float, dest="filter_sigma_scale",
@@ -184,6 +207,8 @@ def config_from_args(argv=None) -> RingConfig:
                         default=None, help="turn the kernel-jitter step off")
     parser.add_argument("--no-fused", action="store_false", dest="fused_proposal", default=None,
                         help="turn the fused proposal off (ordinary particle update only)")
+    parser.add_argument("--legacy-engine", action="store_true", default=False,
+                        help="particle gate and fast mode off: the bit-for-bit legacy engine")
     parser.add_argument("--kappa", type=float, dest="clutter_intensity",
                         help="density of new-object detections in measurement space")
     parser.add_argument("--tight-angles", action="store_true", default=False,
@@ -192,6 +217,10 @@ def config_from_args(argv=None) -> RingConfig:
     parser.add_argument("--output", dest="output_dir")
     args = parser.parse_args(argv)
     tight = vars(args).pop("tight_angles")
+    if vars(args).pop("legacy_engine"):
+        config.particle_gate = False
+        config.fast_mode = False
+        config.fast_truth = False
     if tight:
         config.truth_sigmas = TRUTH_SIGMAS.tolist()
     for key, value in vars(args).items():
@@ -272,7 +301,12 @@ def build_filter(config: RingConfig, seeds: dict):
     tracker.set_regularization(config.regularization, config.regularization_bandwidth_scale,
                                config.regularization_ess_threshold)
     tracker.set_fused_proposal(config.fused_proposal, config.fused_ess_min)
+    tracker.set_particle_gate(config.particle_gate)
+    tracker.set_gate_audit(config.gate_audit)
+    tracker.set_gate_sleep(config.gate_sleep)
+    tracker.set_fast_mode(config.fast_mode)
     tracker.set_record_diagnostics(True)
+    tracker.set_profiling(config.profile)
     return tracker
 
 
@@ -398,27 +432,57 @@ def run(config: RingConfig, verbose: bool = True, before_update=None) -> dict:
               f"seed {config.seed}")
         print("-" * 78)
 
+    num_objects = len(truth)
+    truth_block = None
+    near_block = None        # per step of the block: indices of objects inside the sensors' box
     for step in range(num_steps + 1):
         now = step * config.dt
 
         # --- truth and sensors ---
         tick = time.perf_counter()
         if step > 0:
-            truth = rk4(truth, config.dt)
-            sensor_states = rk4(sensor_states, config.dt)
+            if config.fast_truth:
+                k = (step - 1) % config.truth_chunk
+                if k == 0:
+                    count = min(config.truth_chunk, num_steps - step + 1)
+                    truth_block = lmb_engine.two_body_rk4_steps(
+                        np.vstack([truth, sensor_states]), config.dt, count)
+                    # The detection box test below, for every step of the block at once.
+                    reach = config.sensor_range
+                    block_lo = truth_block[:, num_objects:, :3].min(axis=1) - reach
+                    block_hi = truth_block[:, num_objects:, :3].max(axis=1) + reach
+                    positions = truth_block[:, :num_objects, :3]
+                    inside = np.all((positions >= block_lo[:, None, :])
+                                    & (positions <= block_hi[:, None, :]), axis=2)
+                    rows, cols = np.nonzero(inside)
+                    near_block = np.split(cols, np.searchsorted(rows, np.arange(1, count)))
+                truth = truth_block[k, :num_objects]
+                sensor_states = truth_block[k, num_objects:]
+            else:
+                truth = rk4(truth, config.dt)
+                sensor_states = rk4(sensor_states, config.dt)
             sensors.set_states(sensor_states)
-            sensor_lo = sensor_states[:, :3].min(axis=0)
-            sensor_hi = sensor_states[:, :3].max(axis=0)
+            if not config.fast_truth:
+                sensor_lo = sensor_states[:, :3].min(axis=0)
+                sensor_hi = sensor_states[:, :3].max(axis=0)
         timers.add("truth", time.perf_counter() - tick)
 
         # --- detection: range prefilter in NumPy, confirmed by SensorArray.sees ---
         tick = time.perf_counter()
         reach = config.sensor_range
-        near = np.all((truth[:, :3] >= sensor_lo - reach) & (truth[:, :3] <= sensor_hi + reach), axis=1)
+        if config.fast_truth and step > 0:
+            near = near_block[(step - 1) % config.truth_chunk]
+        else:
+            near = np.flatnonzero(np.all((truth[:, :3] >= sensor_lo - reach)
+                                         & (truth[:, :3] <= sensor_hi + reach), axis=1))
         measurements, measured_objects = [], []
-        for o in np.flatnonzero(near):
-            distance = np.linalg.norm(sensor_states[:, :3] - truth[o, :3], axis=1)
-            candidates = np.flatnonzero(distance <= reach)
+        # Range prefilter for every near object at once; objects stay in index order, so the
+        # detection draws below are taken in the same order as an object-by-object loop.
+        in_reach = (np.linalg.norm(sensor_states[None, :, :3] - truth[near, None, :3], axis=2) <= reach
+                    if len(near) else np.zeros((0, len(sensor_states)), dtype=bool))
+        for row in np.flatnonzero(in_reach.any(axis=1)):
+            o = near[row]
+            candidates = np.flatnonzero(in_reach[row])
             seen_by = [int(k) for k in candidates if sensors.sees(int(k), truth[o])]
             if not seen_by:
                 continue
@@ -512,15 +576,14 @@ def run(config: RingConfig, verbose: bool = True, before_update=None) -> dict:
             tick = time.perf_counter()
             lagging = int(np.sum(tracker.track_summary(with_means=False)["propagated_time"] < now))
             tracker.synchronize()
-            tracks = tracker.get_tracks()
-            summary = tracker.track_summary(with_means=True)
+            # Means, covariances and GOSPA straight from the tracker: no particle cloud is copied.
+            summary = tracker.track_summary(with_means=True, with_covariances=True)
             keys = label_keys(summary)
             existence = summary["existence"]
+            num_tracks = len(existence)
             estimate_idx = np.flatnonzero(existence >= config.existence_threshold)
             detected = np.flatnonzero(~np.isnan(first_detection))
-            estimates = [tracks[i] for i in estimate_idx]
-            truths = [truth[o] for o in detected]
-            breakdown = lmb_engine.calculate_gospa_components(estimates, truths, GOSPA_CUTOFF)
+            breakdown = tracker.gospa_components(estimate_idx.tolist(), truth[detected], GOSPA_CUTOFF)
 
             samples["time"].append(now)
             samples["gospa"].append(breakdown.total)
@@ -529,12 +592,12 @@ def run(config: RingConfig, verbose: bool = True, before_update=None) -> dict:
             samples["false_positive"].append(breakdown.false_positive)
             samples["num_assigned"].append(breakdown.num_assigned)
             samples["num_truths"].append(len(detected))
-            samples["num_estimates"].append(len(estimates))
-            samples["num_tracks"].append(len(tracks))
+            samples["num_estimates"].append(len(estimate_idx))
+            samples["num_tracks"].append(num_tracks)
             samples["existence_sum"].append(float(np.sum(existence)))
             samples["num_lagging"].append(lagging)
 
-            matched_object_of_track = np.full(len(tracks), -1, dtype=np.int64)
+            matched_object_of_track = np.full(num_tracks, -1, dtype=np.int64)
             matched_error = {}
             matched_nees = {}
             for e, j in enumerate(breakdown.associations):
@@ -545,7 +608,7 @@ def run(config: RingConfig, verbose: bool = True, before_update=None) -> dict:
                 matched_object_of_track[track_index] = o
                 error = summary["mean"][track_index, :3] - truth[o, :3]
                 matched_error[o] = float(np.linalg.norm(error))
-                covariance = np.asarray(tracks[track_index].covariance())[:3, :3]
+                covariance = summary["covariance"][track_index, :3, :3]
                 try:
                     matched_nees[o] = float(error @ np.linalg.solve(covariance, error))
                 except np.linalg.LinAlgError:
@@ -596,6 +659,9 @@ def run(config: RingConfig, verbose: bool = True, before_update=None) -> dict:
                               else np.zeros((0, 6))),
         "association_events": np.asarray(association_events, dtype=np.float64).reshape(-1, 5),
         "timers": timers.totals,
+        "engine_profile": tracker.profile() if config.profile else {},
+        "gate_audit": (list(tracker.gate_audit_counts()) + list(tracker.sleep_audit()[:2])
+                       if config.gate_audit else []),
         "wall_seconds": wall,
         "overlap_events": overlap_events,
         "gospa_params": GOSPA_PARAMS,
@@ -615,6 +681,34 @@ ARRAY_KEYS = ("object_ids", "detections_per_sensor", "detections_per_object", "d
               "association_events", "time", "gospa", "localisation",
               "missed", "false_positive", "num_assigned", "num_truths", "num_estimates",
               "num_tracks", "existence_sum", "num_lagging")
+
+
+def profile_summary(profile: dict) -> dict:
+    """Engine phase seconds, work counts, and the derived rates worth reading (None when a
+    denominator is zero)."""
+    if not profile:
+        return {}
+    seconds, counts = profile["seconds"], profile["counts"]
+
+    def ratio(num, den, scale=1.0):
+        return round(scale * num / den, 4) if den else None
+
+    refreshed = counts["tracks_refreshed"]
+    derived = {
+        "ns_per_particle_step_predict": ratio(seconds["predict_propagate"],
+                                              counts["predict_particle_steps"], 1e9),
+        "ns_per_particle_step_refresh": ratio(seconds["refresh_propagate"],
+                                              counts["refresh_particle_steps"], 1e9),
+        "refresh_share_of_update": ratio(seconds["refresh"], seconds["update"]),
+        "refresh_propagate_share_of_update": ratio(seconds["refresh_propagate"], seconds["update"]),
+        "fused_share_of_update": ratio(seconds["fused"], seconds["update"]),
+        "tracks_refreshed_per_update": ratio(refreshed, counts["update_calls"]),
+        "refreshed_fraction_covered": ratio(counts["refreshed_tracks_covered"], refreshed),
+        "refreshed_fraction_gap_over_5km": ratio(counts["refresh_gap_5_to_50km"]
+                                                 + counts["refresh_gap_over_50km"], refreshed),
+    }
+    return {"seconds": {k: round(v, 3) for k, v in seconds.items()}, "counts": dict(counts),
+            "derived": derived}
 
 
 def run_summary(log: dict) -> dict:
@@ -642,6 +736,10 @@ def run_summary(log: dict) -> dict:
         "nees_inside_95pct_band": float(np.mean((nees >= 0.2158) & (nees <= 9.3484))) if len(nees) else None,
         "wall_seconds": round(log["wall_seconds"], 2),
         "wall_seconds_by_phase": {k: round(v, 2) for k, v in log["timers"].items()},
+        "engine_profile": profile_summary(log.get("engine_profile") or {}),
+        # (gate decisions audited, with a particle in a volume, sleeping skips audited, whose test
+        # would have said "maybe")
+        "gate_audit": list(log.get("gate_audit") or []),
         "detections": int(log["detections_per_sensor"].sum()),
         "objects_detected": int(np.sum(log["detections_per_object"] > 0)),
         "sensors_with_detections": int(np.sum(log["detections_per_sensor"] > 0)),
@@ -659,8 +757,10 @@ def save(log: dict, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output_dir / "ring_log.npz",
                         meta=json.dumps({k: log[k] for k in ("config", "pass_outcomes", "timers",
-                                                             "wall_seconds", "overlap_events",
-                                                             "gospa_params", "gospa_cutoff")}),
+                                                             "engine_profile", "gate_audit",
+                                                             "wall_seconds",
+                                                             "overlap_events", "gospa_params",
+                                                             "gospa_cutoff") if k in log}),
                         **{k: log[k] for k in ARRAY_KEYS})
     summary = run_summary(log)
     (output_dir / "summary.json").write_text(json.dumps({"config": log["config"], "summary": summary},

@@ -120,6 +120,10 @@ private:
     //! track can lag the filter clock; see SMC_LMB_Tracker::set_lazy_propagation.
     double propagated_time_ = std::numeric_limits<double>::quiet_NaN();
     CloudBound cloud_bound_;               //!< Cached bounding spheres; invalidated by any cloud mutation
+    //! Lazy propagation's particle gate: the cloud provably cannot be inside any sensor volume
+    //! before this time, so the tracker need not test it. Cleared by any change to the cloud or to
+    //! its timestamp.
+    double sleep_until_ = -std::numeric_limits<double>::infinity();
 
 public:
     /**
@@ -164,12 +168,19 @@ public:
      */
     std::vector<Particle>& mutable_particles() {
         cloud_bound_.valid = false;
+        sleep_until_ = -std::numeric_limits<double>::infinity();
         return particles_;
     }
 
     //! Time the particle cloud is valid at, or NaN if no tracker has stamped it yet.
     double propagated_time() const { return propagated_time_; }
-    void set_propagated_time(double time) { propagated_time_ = time; }
+    void set_propagated_time(double time) {
+        propagated_time_ = time;
+        sleep_until_ = -std::numeric_limits<double>::infinity();
+    }
+
+    double sleep_until() const { return sleep_until_; }
+    void set_sleep_until(double time) { sleep_until_ = time; }
 
     //! Cached bounding spheres of the cloud. Check .valid; recompute with compute_cloud_bound().
     const CloudBound& cloud_bound() const { return cloud_bound_; }
@@ -193,6 +204,7 @@ public:
     void set_particles(const std::vector<Particle>& particles) {
         particles_ = particles;
         cloud_bound_.valid = false;
+        sleep_until_ = -std::numeric_limits<double>::infinity();
     }
 
     /**
@@ -203,6 +215,7 @@ public:
     void set_particles(std::vector<Particle>&& particles) {
         particles_ = std::move(particles);
         cloud_bound_.valid = false;
+        sleep_until_ = -std::numeric_limits<double>::infinity();
     }
 };
 

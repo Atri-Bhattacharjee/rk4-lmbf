@@ -14,6 +14,7 @@
 #include "models.h"
 #include "adaptive_birth_model.h"
 #include "smc_lmb_tracker.h"
+#include "fast_random.h"
 #include "in_orbit_sensor_model.h"
 #include "sensor_fov.h"
 #include "assignment.h"
@@ -217,7 +218,7 @@ std::vector<Track> get_tracks_copy(const SMC_LMB_Tracker& tracker) {
 }
 
 //! Per-track scalars (and optionally means) as NumPy arrays, without copying any particle cloud.
-pybind11::dict track_summary(const SMC_LMB_Tracker& tracker, bool with_means) {
+pybind11::dict track_summary(const SMC_LMB_Tracker& tracker, bool with_means, bool with_covariances) {
     const std::vector<Track>& tracks = tracker.get_tracks();
     const auto count = static_cast<pybind11::ssize_t>(tracks.size());
     pybind11::array_t<uint64_t> birth_time(count);
@@ -255,7 +256,45 @@ pybind11::dict track_summary(const SMC_LMB_Tracker& tracker, bool with_means) {
         }
         out["mean"] = means;
     }
+    if (with_covariances) {
+        pybind11::array_t<double> covariances(std::vector<pybind11::ssize_t>{count, 6, 6});
+        auto cov_view = covariances.mutable_unchecked<3>();
+        for (pybind11::ssize_t i = 0; i < count; ++i) {
+            const StateCovariance cov = particle_stats::covariance(tracks[static_cast<size_t>(i)]);
+            for (int r = 0; r < 6; ++r) {
+                for (int c = 0; c < 6; ++c) {
+                    cov_view(i, r, c) = cov(r, c);
+                }
+            }
+        }
+        out["covariance"] = covariances;
+    }
     return out;
+}
+
+//! GOSPA of a subset of the tracker's own tracks against truth rows, without copying any cloud.
+GospaComponents tracker_gospa_components(const SMC_LMB_Tracker& tracker,
+                                         const std::vector<int64_t>& track_indices,
+                                         const Eigen::MatrixXd& truths, double cutoff) {
+    const std::vector<Track>& tracks = tracker.get_tracks();
+    if (truths.rows() > 0 && truths.cols() != 6) {
+        throw std::invalid_argument("tracker_gospa_components: truths must be (N, 6)");
+    }
+    std::vector<StateVector> means;
+    means.reserve(track_indices.size());
+    for (int64_t index : track_indices) {
+        if (index < 0 || static_cast<size_t>(index) >= tracks.size()) {
+            throw std::out_of_range("tracker_gospa_components: track index " + std::to_string(index) +
+                                    " out of range for " + std::to_string(tracks.size()) + " track(s)");
+        }
+        means.push_back(particle_stats::weighted_mean(tracks[static_cast<size_t>(index)]));
+    }
+    std::vector<Eigen::VectorXd> truth_list;
+    truth_list.reserve(static_cast<size_t>(truths.rows()));
+    for (Eigen::Index r = 0; r < truths.rows(); ++r) {
+        truth_list.push_back(truths.row(r).transpose());
+    }
+    return calculate_gospa_components_from_means(means, truth_list, cutoff);
 }
 
 TrackLabel get_track_label_copy(const Track& track) {
@@ -827,13 +866,99 @@ PYBIND11_MODULE(lmb_engine, m) {
                  return out;
              },
              "Posterior records collected since the last call (then cleared), as NumPy arrays")
+        .def("set_particle_gate", &SMC_LMB_Tracker::set_particle_gate, pybind11::arg("enabled"),
+             "Re-test a lazy cloud's 'maybe visible' particle by particle before propagating it\n"
+             "(default off). Changes when clouds are propagated, never what an update learns;\n"
+             "statistically, not bitwise, equivalent. Off, the filter is bit-for-bit unchanged.")
+        .def_property_readonly("particle_gate", &SMC_LMB_Tracker::particle_gate,
+             "Whether the particle gate is on")
+        .def("set_gate_audit", &SMC_LMB_Tracker::set_gate_audit, pybind11::arg("enabled"),
+             "Validation only (slow): check every 'not observable' decision of the particle gate\n"
+             "against a noise-free propagation of the cloud. The run itself is unchanged.")
+        .def("set_gate_sleep", &SMC_LMB_Tracker::set_gate_sleep, pybind11::arg("enabled"),
+             "Sleep between particle-gate tests (default on with the gate). Bit-for-bit neutral;\n"
+             "the switch exists for testing.")
+        .def("sleep_audit", &SMC_LMB_Tracker::sleep_audit,
+             "(sleeping skips audited, skips whose test would have said 'maybe', first such case)")
+        .def("gate_audit_counts", &SMC_LMB_Tracker::gate_audit_counts,
+             "(decisions audited, violations) since construction")
+        .def("set_fast_mode", &SMC_LMB_Tracker::set_fast_mode, pybind11::arg("enabled"),
+             "Turn fast mode on or off (default off): keyed random streams, a ziggurat normal\n"
+             "sampler and batched propagation. The deterministic RK4 step is the legacy one; the noise\n"
+             "streams differ, so a run is statistically, not bitwise, equivalent to a legacy run.\n"
+             "Off, the filter is bit-for-bit unchanged. Raises ValueError for a propagator without\n"
+             "keyed propagation.")
+        .def_property_readonly("fast_mode", &SMC_LMB_Tracker::fast_mode, "Whether fast mode is on")
+        .def("set_profiling", &SMC_LMB_Tracker::set_profiling, pybind11::arg("enabled"),
+             "Accumulate wall-clock phase totals and work counts (off by default). Read-only\n"
+             "instrumentation: a profiled run is bit-for-bit the unprofiled one.")
+        .def_property_readonly("profiling", &SMC_LMB_Tracker::profiling, "Whether profiling is on")
+        .def("reset_profile", &SMC_LMB_Tracker::reset_profile, "Zero every profile total")
+        .def("profile",
+             [](const SMC_LMB_Tracker& self) {
+                 const SMC_LMB_Tracker::Profile& p = self.profile();
+                 pybind11::dict seconds;
+                 seconds["predict"] = p.predict;
+                 seconds["predict_propagate"] = p.predict_propagate;
+                 seconds["update"] = p.update;
+                 seconds["refresh"] = p.refresh;
+                 seconds["refresh_propagate"] = p.refresh_propagate;
+                 seconds["refresh_check"] = p.refresh_check;
+                 seconds["synchronize"] = p.synchronize;
+                 seconds["coverage"] = p.coverage;
+                 seconds["likelihood"] = p.likelihood;
+                 seconds["fused"] = p.fused;
+                 seconds["assignment"] = p.assignment;
+                 seconds["posterior"] = p.posterior;
+                 seconds["birth"] = p.birth;
+                 pybind11::dict counts;
+                 counts["predict_calls"] = p.predict_calls;
+                 counts["update_calls"] = p.update_calls;
+                 counts["updates_with_measurements"] = p.updates_with_measurements;
+                 counts["predict_particle_steps"] = p.predict_particle_steps;
+                 counts["refresh_particle_steps"] = p.refresh_particle_steps;
+                 counts["synchronize_particle_steps"] = p.synchronize_particle_steps;
+                 counts["refresh_checks"] = p.refresh_checks;
+                 counts["refresh_slept"] = p.refresh_slept;
+                 counts["sleep_resets"] = p.sleep_resets;
+                 counts["sleep_none"] = p.sleep_histogram[0];
+                 counts["sleep_under_1s"] = p.sleep_histogram[1];
+                 counts["sleep_1_to_5s"] = p.sleep_histogram[2];
+                 counts["sleep_5_to_20s"] = p.sleep_histogram[3];
+                 counts["sleep_over_20s"] = p.sleep_histogram[4];
+                 counts["tracks_refreshed"] = p.tracks_refreshed;
+                 counts["refreshed_tracks_covered"] = p.refreshed_tracks_covered;
+                 counts["refresh_gap_inside"] = p.refresh_gap_inside;
+                 counts["refresh_gap_under_5km"] = p.refresh_gap_under_5km;
+                 counts["refresh_gap_5_to_50km"] = p.refresh_gap_5_to_50km;
+                 counts["refresh_gap_over_50km"] = p.refresh_gap_over_50km;
+                 counts["active_tracks"] = p.active_tracks;
+                 counts["likelihood_evaluations"] = p.likelihood_evaluations;
+                 counts["fused_builds"] = p.fused_builds;
+                 counts["fused_kernel_evaluations"] = p.fused_kernel_evaluations;
+                 counts["posterior_updates"] = p.posterior_updates;
+                 counts["regularizations"] = p.regularizations;
+                 counts["births"] = p.births;
+                 pybind11::dict out;
+                 out["seconds"] = seconds;
+                 out["counts"] = counts;
+                 return out;
+             },
+             "Profile totals since the last reset_profile(): {'seconds': {...}, 'counts': {...}}")
         .def("synchronize", &SMC_LMB_Tracker::synchronize,
              "Propagate every track that lags the clock up to it. A no-op when nothing lags.")
         .def("timestamp", &SMC_LMB_Tracker::timestamp, "The filter clock [s]")
         .def("track_summary", &track_summary, pybind11::arg("with_means") = true,
+             pybind11::arg("with_covariances") = false,
              "Per-track arrays without copying particle clouds: birth_time, index, existence,\n"
-             "propagated_time, particle_count, and (with_means) the (N, 6) weighted mean states.\n"
+             "propagated_time, particle_count, (with_means) the (N, 6) weighted mean states and\n"
+             "(with_covariances) the (N, 6, 6) covariances, as Track.covariance() computes them.\n"
              "Means of lagging tracks are at their propagated_time, not at the clock.")
+        .def("gospa_components", &tracker_gospa_components, pybind11::arg("track_indices"),
+             pybind11::arg("truths"), pybind11::arg("cutoff") = kGospaDefaultCutoff,
+             "calculate_gospa_components over the tracks at track_indices (in that order) against\n"
+             "an (N, 6) truth array, without copying any particle cloud. Associations index into\n"
+             "track_indices. Same arithmetic as calculate_gospa_components.")
         .def("set_tracks", &SMC_LMB_Tracker::set_tracks, "Sets the initial list of tracks for the filter")
         .def("compute_association_likelihood", &SMC_LMB_Tracker::compute_association_likelihood, "Compute the association likelihood for a track and measurement");
     
@@ -842,6 +967,57 @@ PYBIND11_MODULE(lmb_engine, m) {
         .def(pybind11::init<>())
         .def_readwrite("associations", &Hypothesis::associations)
         .def_readwrite("weight", &Hypothesis::weight);
+
+    m.def("two_body_rk4_steps",
+          [](const Eigen::MatrixXd& states, double dt, int num_steps) {
+              if (states.cols() != 6) {
+                  throw std::invalid_argument("two_body_rk4_steps: states must be (N, 6), got (" +
+                                              std::to_string(states.rows()) + ", " +
+                                              std::to_string(states.cols()) + ")");
+              }
+              if (!std::isfinite(dt)) {
+                  throw std::invalid_argument("two_body_rk4_steps: dt must be finite");
+              }
+              if (num_steps < 0) {
+                  throw std::invalid_argument("two_body_rk4_steps: num_steps must be >= 0");
+              }
+              if (!states.allFinite()) {
+                  throw std::invalid_argument("two_body_rk4_steps: states must be finite");
+              }
+              const auto rows = static_cast<pybind11::ssize_t>(states.rows());
+              pybind11::array_t<double> out(std::vector<pybind11::ssize_t>{num_steps, rows, 6});
+              double* data = out.mutable_data();
+              const size_t row_doubles = static_cast<size_t>(rows) * 6;
+              // Row-major working copy, stepped in place; each step is then copied out whole.
+              std::vector<double> current(row_doubles);
+              for (pybind11::ssize_t i = 0; i < rows; ++i) {
+                  for (int c = 0; c < 6; ++c) {
+                      current[static_cast<size_t>(i) * 6 + static_cast<size_t>(c)] =
+                          states(static_cast<Eigen::Index>(i), c);
+                  }
+              }
+              for (int k = 0; k < num_steps; ++k) {
+                  two_body_rk4_step_strided(current.data(), 6, static_cast<size_t>(rows), dt);
+                  std::copy(current.begin(), current.end(), data + static_cast<size_t>(k) * row_doubles);
+              }
+              return out;
+          },
+          pybind11::arg("states"), pybind11::arg("dt"), pybind11::arg("num_steps"),
+          "Noise-free RK4 two-body steps of an (N, 6) array of ECI states: returns (num_steps, N, 6),\n"
+          "the states after 1..num_steps steps of dt. Exactly the deterministic part of\n"
+          "TwoBodyPropagator.propagate, so a truth stepped with it moves like the filter's model.");
+
+    m.def("_fast_normals",
+          [](uint64_t key, size_t count) {
+              fast_random::Stream stream(key);
+              std::vector<double> out(count);
+              for (double& value : out) {
+                  value = stream.normal();
+              }
+              return to_numpy(out);
+          },
+          pybind11::arg("key"), pybind11::arg("count"),
+          "Test hook: `count` standard normals from the fast-mode keyed stream `key`.");
 
     // Bind the solve_assignment function
     m.def("solve_assignment", &solve_assignment, pybind11::arg("cost_matrix"), pybind11::arg("k_best"),

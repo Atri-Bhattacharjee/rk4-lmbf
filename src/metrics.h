@@ -73,6 +73,15 @@ GospaComponents calculate_gospa_components(const std::vector<Track>& tracks,
                                            double cutoff = kGospaDefaultCutoff);
 
 /**
+ * @brief The same GOSPA, from the tracks' position means directly (each a 6-state; only the first
+ *        three components are read). calculate_gospa_components reduces each track with
+ *        particle_stats::weighted_mean and then runs exactly this.
+ */
+GospaComponents calculate_gospa_components_from_means(const std::vector<StateVector>& track_means,
+                                                      const std::vector<Eigen::VectorXd>& ground_truths,
+                                                      double cutoff = kGospaDefaultCutoff);
+
+/**
  * @brief Scalar GOSPA in metres. Exactly calculate_gospa_components(...).total.
  */
 double calculate_gospa_distance(const std::vector<Track>& tracks,

@@ -368,6 +368,56 @@ public:
         return false;
     }
 
+    /**
+     * @brief sensors_within_reach, plus the smallest squared distance from `position` to a sensor
+     *        that is NOT within reach (infinity when every sensor is, or there are none).
+     */
+    void sensors_within_reach(const Eigen::Vector3d& position, double margin, std::vector<size_t>& out,
+                              double& nearest_other_sq) const {
+        out.clear();
+        nearest_other_sq = std::numeric_limits<double>::infinity();
+        if (!std::isfinite(fov_.max_range) || !std::isfinite(margin)) {
+            for (size_t s = 0; s < sensors_.size(); ++s) {
+                out.push_back(s);
+            }
+            return;
+        }
+        const double reach = fov_.max_range + margin;
+        const double reach_sq = reach * reach;
+        for (size_t s = 0; s < sensors_.size(); ++s) {
+            const double d2 = (position - sensors_[s].state.head<3>()).squaredNorm();
+            if (!(d2 > reach_sq)) {   // negated so a NaN distance counts as within reach
+                out.push_back(s);
+            } else {
+                nearest_other_sq = std::min(nearest_other_sq, d2);
+            }
+        }
+    }
+
+    /**
+     * @brief Indices of every sensor that could see a point within `margin` of `position`.
+     *
+     * The same range-only test as any_sensor_within_reach, collected instead of short-circuited.
+     * With an unbounded range or margin every sensor is returned.
+     */
+    void sensors_within_reach(const Eigen::Vector3d& position, double margin, std::vector<size_t>& out) const {
+        out.clear();
+        if (!std::isfinite(fov_.max_range) || !std::isfinite(margin)) {
+            for (size_t s = 0; s < sensors_.size(); ++s) {
+                out.push_back(s);
+            }
+            return;
+        }
+        const double reach = fov_.max_range + margin;
+        const double reach_sq = reach * reach;
+        for (size_t s = 0; s < sensors_.size(); ++s) {
+            // Negated so a NaN distance counts as within reach (conservative).
+            if (!((position - sensors_[s].state.head<3>()).squaredNorm() > reach_sq)) {
+                out.push_back(s);
+            }
+        }
+    }
+
 private:
     std::vector<Sensor> sensors_;
     std::unordered_map<std::string, size_t> index_;

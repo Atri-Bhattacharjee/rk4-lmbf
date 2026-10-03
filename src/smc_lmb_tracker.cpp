@@ -1,11 +1,14 @@
 #include "smc_lmb_tracker.h"
 #include "assignment.h"
+#include "fast_random.h"
 #include "in_orbit_sensor_model.h"
 #include "validation.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -15,6 +18,8 @@ namespace {
 
 constexpr double kMu = 3.986004418e14;               //!< Earth's gravitational parameter [m^3/s^2]
 constexpr double kMinRadius = 6.371e6 + 100.0e3;    //!< The propagator's gravity floor [m]
+//! Largest gravitational acceleration anywhere at or above the floor [m/s^2].
+constexpr double kMaxGravity = kMu / (kMinRadius * kMinRadius);
 
 //! Large cost for impossible assignments (unobservable pairs, other tracks' miss columns).
 constexpr double INF_COST = 1e9;
@@ -28,6 +33,25 @@ constexpr double kEtaFloor = std::numeric_limits<double>::min();
 double factor_cost(double eta) {
     return -std::log(std::max(eta, kEtaFloor));
 }
+
+//! Adds the scope's wall-clock duration to *sink; a null sink (profiling off) reads no clock.
+class ScopedTimer {
+public:
+    explicit ScopedTimer(double* sink)
+        : sink_(sink), start_(sink != nullptr ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{}) {}
+    ~ScopedTimer() {
+        if (sink_ != nullptr) {
+            *sink_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+        }
+    }
+    ScopedTimer(const ScopedTimer&) = delete;
+    ScopedTimer& operator=(const ScopedTimer&) = delete;
+
+private:
+    double* sink_;
+    std::chrono::steady_clock::time_point start_;
+};
 
 }  // namespace
 
@@ -65,6 +89,39 @@ SMC_LMB_Tracker::SMC_LMB_Tracker(std::shared_ptr<IOrbitPropagator> propagator,
     validation::require_models(propagator_, sensor_model_, birth_model_);
     validation::require_k_best(k_best_);
     validation::require_clutter_intensity(clutter_intensity_);
+    stream_seed_ = fast_random::mix64((seed.has_value() ? *seed : std::random_device{}()) ^
+                                      0xA54FF53A5F1D36F1ULL);
+}
+
+void SMC_LMB_Tracker::set_fast_mode(bool enabled) {
+    if (enabled) {
+        ensure_models_configured();
+        if (!propagator_->supports_keyed_propagation()) {
+            throw std::invalid_argument(
+                "set_fast_mode: the propagator does not support keyed propagation "
+                "(TwoBodyPropagator does)");
+        }
+    }
+    fast_mode_ = enabled;
+}
+
+uint64_t SMC_LMB_Tracker::substep_key(const Track& track, double step_start, double dt) const {
+    using fast_random::bits_of;
+    using fast_random::combine;
+    uint64_t key = combine(stream_seed_, 0x50524F50ULL);   // "PROP"
+    key = combine(key, track.label().birth_time);
+    key = combine(key, track.label().index);
+    key = combine(key, bits_of(step_start));
+    key = combine(key, bits_of(dt));
+    // Labels need not be unique (two births in one integer second share birth_time and can share
+    // an index), so the cloud itself goes into the key too: two different clouds never share noise.
+    const std::vector<Particle>& particles = track.particles();
+    if (!particles.empty()) {
+        for (int k = 0; k < 6; ++k) {
+            key = combine(key, bits_of(particles.front().state_vector(k)));
+        }
+    }
+    return key;
 }
 
 double SMC_LMB_Tracker::noise_scale_at(const Track& track, double time) const {
@@ -77,8 +134,20 @@ double SMC_LMB_Tracker::noise_scale_at(const Track& track, double time) const {
     return noise_scale;
 }
 
+namespace {
+
+double seconds_since(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
+}  // namespace
+
 void SMC_LMB_Tracker::predict(double dt) {
     ensure_models_configured();
+    const ScopedTimer total_timer(profiling_ ? &profile_.predict : nullptr);
+    if (profiling_) {
+        ++profile_.predict_calls;
+    }
     // Projects the filter state forward in time by operating in-place.
     const double previous_time = current_state_.timestamp();
     const double new_time = current_state_.timestamp() + dt;
@@ -96,13 +165,21 @@ void SMC_LMB_Tracker::predict(double dt) {
                 track.set_propagated_time(previous_time);
             }
             if (new_time - track.propagated_time() >= max_pending_ - 1e-9) {
-                propagate_track_to(track, new_time);
+                const ScopedTimer timer(profiling_ ? &profile_.predict_propagate : nullptr);
+                const uint64_t steps = propagate_track_to(track, new_time);
+                if (profiling_) {
+                    profile_.predict_particle_steps += steps;
+                }
             }
         }
         return;
     }
 
+    const ScopedTimer propagate_timer(profiling_ ? &profile_.predict_propagate : nullptr);
     for (Track& track : tracks) {
+        if (profiling_) {
+            profile_.predict_particle_steps += track.particles().size();
+        }
         // Update existence probability in-place.
         track.set_existence_probability(track.existence_probability() * survival_probability_);
 
@@ -114,8 +191,13 @@ void SMC_LMB_Tracker::predict(double dt) {
         // does not reallocate, so external aliases of the storage remain address-stable; values
         // change, as they would under any in-place rewrite.
         std::vector<Particle>& particles = track.mutable_particles();
-        for (Particle& particle : particles) {
-            particle = propagator_->propagate(particle, dt, previous_time, noise_scale);
+        if (fast_mode_) {
+            propagator_->propagate_cloud_keyed(particles, dt, previous_time, noise_scale,
+                                               substep_key(track, previous_time, dt));
+        } else {
+            for (Particle& particle : particles) {
+                particle = propagator_->propagate(particle, dt, previous_time, noise_scale);
+            }
         }
         track.set_propagated_time(new_time);
     }
@@ -465,8 +547,11 @@ bool SMC_LMB_Tracker::build_fused_component(const Track& track, const Measuremen
     // 5. Draw, weight with prior density x exact likelihood x visibility / proposal density.
     std::vector<StateVector> draws(n);
     std::vector<double> log_weights(n, -std::numeric_limits<double>::infinity());
-    std::vector<double> scratch;
     if (proposal_has_density) {
+        std::vector<double> scratch;
+        if (profiling_) {
+            profile_.fused_kernel_evaluations += static_cast<uint64_t>(n) * num_kernels;
+        }
         for (size_t m = 0; m < n; ++m) {
             StateVector eps;
             for (int k = 0; k < 6; ++k) {
@@ -555,11 +640,11 @@ void SMC_LMB_Tracker::stamp_unstamped_tracks() {
     }
 }
 
-void SMC_LMB_Tracker::propagate_track_to(Track& track, double target_time) {
+uint64_t SMC_LMB_Tracker::propagate_track_to(Track& track, double target_time) {
     const double start = track.propagated_time();
     const double span = target_time - start;
     if (span == 0.0) {
-        return;
+        return 0;
     }
     const int substeps = std::max(1, static_cast<int>(std::ceil(std::abs(span) / max_pending_ - 1e-9)));
     const double step = span / static_cast<double>(substeps);
@@ -570,15 +655,23 @@ void SMC_LMB_Tracker::propagate_track_to(Track& track, double target_time) {
         const double step_end = (k + 1 == substeps) ? target_time : start + static_cast<double>(k + 1) * step;
         const double noise_scale = noise_scale_at(track, step_end);
         const double dt = step_end - step_start;
+        if (fast_mode_) {
+            propagator_->propagate_cloud_keyed(particles, dt, step_start, noise_scale,
+                                               substep_key(track, step_start, dt));
+            continue;
+        }
         for (Particle& particle : particles) {
             particle = propagator_->propagate(particle, dt, step_start, noise_scale);
         }
     }
     track.set_propagated_time(target_time);
     track.set_cloud_bound(compute_cloud_bound(track.particles()));
+    return static_cast<uint64_t>(substeps) * static_cast<uint64_t>(particles.size());
 }
 
-bool SMC_LMB_Tracker::may_be_observable(Track& track, const sensor::SensorArray& sensors, double now) const {
+bool SMC_LMB_Tracker::may_be_observable(Track& track, const sensor::SensorArray& sensors, double now,
+                                        std::vector<size_t>& candidates, double& sleep_for) const {
+    sleep_for = 0.0;
     const double tau = now - track.propagated_time();
     if (!(tau > 0.0)) {
         return true;
@@ -618,31 +711,398 @@ bool SMC_LMB_Tracker::may_be_observable(Track& track, const sensor::SensorArray&
     const double spread = (bound.position_radius + bound.velocity_radius * tau) *
                           (1.0 + 2.0 * kMu * inv_radius_cubed * tau * tau);
     const double margin = 1.5 * (centre_error + spread + *noise) + 1000.0;
-    return sensors.any_sensor_within_reach(predicted, margin);
+    if (!particle_gate_) {
+        return sensors.any_sensor_within_reach(predicted, margin);
+    }
+
+    // Particle gate. The sphere above is loose for a long curved cloud (its centre is off the arc,
+    // its radius is half the arc), so it says "maybe" far more often than any particle is near a
+    // sensor. Narrow it to the sensors the sphere flagged and test each particle against those.
+    double nearest_other_sq = std::numeric_limits<double>::infinity();
+    sensors.sensors_within_reach(predicted, margin, candidates, nearest_other_sq);
+
+    // Sleep, chosen so that this same test is guaranteed to say "no" for every sensor it rules out
+    // now, at every later time until the next forced propagation (tau <= max_pending_): the margin is
+    // taken at its largest (every term grows with tau), the predicted centre moves at most
+    // (|v| + a_max T) per second, and every sensor at most sleep_speed_bound_ (validate_sleeps holds
+    // the sensors to it). Skipping only answers that are already known therefore changes nothing.
+    const double max_range = sensors.fov().max_range;
+    double sleep_others = 0.0;
+    const double tau_cap = max_pending_;
+    const double radius_min_cap = std::max(radius - bound.position_radius - speed * tau_cap, kMinRadius);
+    const double inv_radius_cubed_cap = 1.0 / (radius_min_cap * radius_min_cap * radius_min_cap);
+    const double centre_error_cap = 4.0 * kMu * speed * inv_radius_cubed_cap * tau_cap * tau_cap * tau_cap / 6.0;
+    const double spread_cap = (bound.position_radius + bound.velocity_radius * tau_cap) *
+                              (1.0 + 2.0 * kMu * inv_radius_cubed_cap * tau_cap * tau_cap);
+    const double margin_cap = 1.5 * (centre_error_cap + spread_cap + sleep_noise_cap_unscaled_) + 1000.0;
+    const double centre_speed = velocity.norm() + kMaxGravity * tau_cap;
+    if (std::isfinite(max_range) && tau <= tau_cap) {
+        const double gap = std::sqrt(nearest_other_sq) - max_range - margin_cap;
+        sleep_others = gap / (centre_speed + sleep_speed_bound_);   // +inf with no other sensor
+    }
+    if (candidates.empty()) {
+        sleep_for = sleep_others;
+        return false;
+    }
+    // A sensor that reported a measurement this update keeps the sphere test: a cloud near it can
+    // claim that measurement through the fused proposal even with no particle inside its volume,
+    // and that pair is only scored if the cloud is current.
+    for (size_t sensor_index : candidates) {
+        if (std::find(meas_sensor_.begin(), meas_sensor_.end(), static_cast<int>(sensor_index)) !=
+            meas_sensor_.end()) {
+            return true;
+        }
+    }
+    double sleep_particles = 0.0;
+    const bool maybe = particles_may_be_observable(track, sensors, tau, *noise, candidates, sleep_particles,
+                                                   predicted, std::sqrt(nearest_other_sq));
+    if (!maybe) {
+        // The particle bound covers every sensor (flagged ones per particle, the others through the
+        // cloud's predicted centre), so it alone keeps this test's answer "no".
+        sleep_for = sleep_particles;
+        if (gate_audit_) {
+            audit_gate_decision(track, sensors, now);
+        }
+    }
+    return maybe;
 }
+
+void SMC_LMB_Tracker::validate_sleeps(const sensor::SensorArray& sensors, double now) {
+    const size_t count = sensors.size();
+    const double max_range = sensors.fov().max_range;
+    double max_speed = 0.0;
+    for (const sensor::Sensor& sensor : sensors.sensors()) {
+        max_speed = std::max(max_speed, sensor.state.tail<3>().norm());
+    }
+    bool consistent = sleep_sensor_positions_.size() == count && now >= sleep_sensor_time_ &&
+                      max_range == sleep_sensor_range_ && std::isfinite(max_speed);
+    if (consistent) {
+        // Every sensor must have moved no further than the speed bound the sleeps were computed
+        // with allows. Displacements chain (triangle inequality), so checking each update interval
+        // covers every sleep in progress.
+        const double allowed = sleep_speed_bound_ * (now - sleep_sensor_time_) + 1.0;
+        for (size_t k = 0; k < count && consistent; ++k) {
+            const double moved = (sensors.sensors()[k].state.head<3>() - sleep_sensor_positions_[k]).norm();
+            consistent = moved <= allowed;   // false for NaN as well
+        }
+        consistent = consistent && max_speed <= sleep_speed_bound_;
+    }
+    if (!consistent) {
+        for (Track& track : current_state_.tracks()) {
+            track.set_sleep_until(-std::numeric_limits<double>::infinity());
+        }
+        // Headroom so ordinary orbital speed changes do not wake everything every step.
+        sleep_speed_bound_ = 1.25 * max_speed + 100.0;
+        sleep_sensor_range_ = max_range;
+        if (profiling_) {
+            ++profile_.sleep_resets;
+        }
+    }
+    sleep_sensor_positions_.resize(count);
+    for (size_t k = 0; k < count; ++k) {
+        sleep_sensor_positions_[k] = sensors.sensors()[k].state.head<3>();
+    }
+    sleep_sensor_time_ = now;
+    const std::optional<double> cap = propagator_->noise_displacement_bound(max_pending_);
+    sleep_noise_cap_ = cap.has_value() ? *cap * std::sqrt(std::max(1.0, noise_min_scale_))
+                                       : std::numeric_limits<double>::infinity();
+    sleep_noise_cap_unscaled_ = cap.has_value() ? *cap : std::numeric_limits<double>::infinity();
+}
+
+bool SMC_LMB_Tracker::particles_may_be_observable(const Track& track, const sensor::SensorArray& sensors,
+                                                  double tau, double noise,
+                                                  const std::vector<size_t>& candidates,
+                                                  double& sleep_for,
+                                                  const Eigen::Vector3d& cloud_predicted,
+                                                  double nearest_other) const {
+    // Per particle, the same second-order Taylor step as the sphere test with no cloud spread:
+    //   predicted = x + v tau + a(x) tau^2 / 2,   |error| <= |jerk|_max tau^3 / 6 + noise,
+    // with |jerk| <= 4 mu |v| / r^3 along the path. Along a particle's path over tau, its speed is
+    // at most |v| + a_max tau (a_max = mu / r_floor^2 bounds gravity anywhere above the floor) and
+    // its radius at least |x| - speed tau. Bounding per particle, not per cloud, matters: a needle
+    // hundreds of km long has a sphere whose "lowest point" dips under the gravity floor even though
+    // every particle stays near its own orbit radius.
+    sleep_for = 0.0;
+    const std::vector<Particle>& particles = track.particles();
+    if (particles.empty()) {
+        sleep_for = std::numeric_limits<double>::infinity();
+        return false;   // nothing to see
+    }
+    const double max_range = sensors.fov().max_range;
+    // Annealed noise can exceed the unit-scale bound when noise_min_scale > 1.
+    const double noise_bound = noise * std::sqrt(std::max(1.0, noise_min_scale_));
+    if (!std::isfinite(max_range) || !std::isfinite(noise_bound) || !std::isfinite(tau)) {
+        // An unbounded sensor or noise bound leaves nothing to test against: stay conservative.
+        return true;
+    }
+    const double fixed_margin = 1.5 * noise_bound + 1000.0;
+    const double tau_cubed_sixth = tau * tau * tau / 6.0;
+    const double half_tau_sq = 0.5 * tau * tau;
+
+    // For the sleep (see may_be_observable): this test's largest margin over any later tau up to
+    // max_pending_, the fastest a predicted particle can move, the closest a predicted particle
+    // comes to a candidate, and how far any predicted particle sits from the cloud's predicted
+    // centre (which bounds its distance to every sensor the sphere ruled out).
+    const double tau_cap = max_pending_;
+    const double tau_cap_cubed_sixth = tau_cap * tau_cap * tau_cap / 6.0;
+    double nearest_sq = std::numeric_limits<double>::infinity();
+    double worst_margin_cap = 0.0;
+    double worst_speed_cap = 0.0;
+    double worst_offset_sq = 0.0;
+    bool can_sleep = tau <= tau_cap;
+    for (const Particle& particle : particles) {
+        const Eigen::Vector3d position = particle.state_vector.head<3>();
+        const Eigen::Vector3d velocity = particle.state_vector.tail<3>();
+        const double r = position.norm();
+        const double v = velocity.norm();
+        const double speed = v + kMaxGravity * tau;
+        const double r_low = r - speed * tau;
+        if (!(r_low > kMinRadius)) {
+            // The path could dip under the gravity floor, where the acceleration model changes
+            // form (or the state is not finite): treat as possibly visible.
+            return true;
+        }
+        const double taylor_error = 4.0 * kMu * speed / (r_low * r_low * r_low) * tau_cubed_sixth;
+        const double reach = max_range + 1.5 * taylor_error + fixed_margin;
+        const double reach_sq = reach * reach;
+        // r > kMinRadius here, so this is exactly the propagator's acceleration.
+        const Eigen::Vector3d acceleration = -kMu * position / (r * r * r);
+        const Eigen::Vector3d predicted = position + velocity * tau + acceleration * half_tau_sq;
+        for (size_t sensor_index : candidates) {
+            const double d2 = (predicted - sensors.sensors()[sensor_index].state.head<3>()).squaredNorm();
+            if (!(d2 > reach_sq)) {   // negated: a NaN state counts as possibly visible
+                return true;
+            }
+            nearest_sq = std::min(nearest_sq, d2);
+        }
+        // The same quantities at tau_cap. If this particle's path could reach the floor by then,
+        // the test would answer "maybe" outright before then: no sleep.
+        const double speed_cap = v + kMaxGravity * tau_cap;
+        const double r_low_cap = r - speed_cap * tau_cap;
+        if (!(r_low_cap > kMinRadius)) {
+            can_sleep = false;
+        } else {
+            const double error_cap = 4.0 * kMu * speed_cap / (r_low_cap * r_low_cap * r_low_cap) * tau_cap_cubed_sixth;
+            worst_margin_cap = std::max(worst_margin_cap, 1.5 * error_cap);
+        }
+        worst_speed_cap = std::max(worst_speed_cap, speed_cap);
+        worst_offset_sq = std::max(worst_offset_sq, (predicted - cloud_predicted).squaredNorm());
+    }
+    if (can_sleep) {
+        const double margin_cap = max_range + worst_margin_cap + 1.5 * sleep_noise_cap_ + 1000.0;
+        const double closing = worst_speed_cap + sleep_speed_bound_;
+        // Sensors the sphere flagged now: per-particle distances. Sensors it ruled out: at least
+        // their distance to the cloud's predicted centre minus the farthest particle's offset.
+        const double gap_candidates = std::sqrt(nearest_sq) - margin_cap;
+        const double gap_others = nearest_other - std::sqrt(worst_offset_sq) - margin_cap;
+        sleep_for = std::min(gap_candidates, gap_others) / closing;
+    }
+    return false;
+}
+
+void SMC_LMB_Tracker::audit_gate_decision(const Track& track, const sensor::SensorArray& sensors,
+                                          double now) const {
+    // Noise-free RK4 in substeps of at most max_pending_, the deterministic part of what
+    // propagate_track_to would do. noise_scale = 0 draws no random number.
+    const double start = track.propagated_time();
+    const double span = now - start;
+    const int substeps = std::max(1, static_cast<int>(std::ceil(std::abs(span) / max_pending_ - 1e-9)));
+    const double step = span / static_cast<double>(substeps);
+    bool violation = false;
+    for (const Particle& original : track.particles()) {
+        Particle particle = original;
+        for (int k = 0; k < substeps; ++k) {
+            particle = propagator_->propagate(particle, step, start + k * step, 0.0);
+        }
+        if (sensors.visible_sensor(particle.state_vector.head<3>()) >= 0) {
+            violation = true;
+            break;
+        }
+    }
+    ++gate_audit_checks_;
+    if (violation) {
+        ++gate_audit_violations_;
+    }
+}
+
 
 void SMC_LMB_Tracker::refresh_observable_tracks(const sensor::SensorArray& sensors) {
     const double now = current_state_.timestamp();
-    for (Track& track : current_state_.tracks()) {
+    const ScopedTimer timer(profiling_ ? &profile_.refresh : nullptr);
+    std::vector<Track>& tracks = current_state_.tracks();
+    const size_t count = tracks.size();
+    // Per-track results, folded into the profile in track order after the loop.
+    std::vector<char> checked(profiling_ ? count : 0, 0);
+    std::vector<uint64_t> steps(profiling_ ? count : 0, 0);
+    std::vector<double> seconds(profiling_ ? count : 0, 0.0);
+    std::vector<signed char> bucket(profiling_ ? count : 0, -1);
+    std::vector<double> check_seconds(profiling_ ? count : 0, 0.0);
+    std::vector<char> slept(profiling_ ? count : 0, 0);
+    std::vector<double> slept_for(profiling_ ? count : 0, 0.0);
+    if (profiling_) {
+        refreshed_scratch_.assign(count, 0);
+    }
+    if (particle_gate_) {
+        validate_sleeps(sensors, now);
+    }
+    // A sleep guarantees the test's answer only for sensors that report nothing: a cloud near a
+    // sensor that reported a measurement is refreshed on weaker grounds (its sphere reaches that
+    // sensor, so the fused proposal can score it), so on such steps every lagging track is tested.
+    const bool honour_sleep = particle_gate_ && gate_sleep_ && meas_sensor_.empty();
+    // First pass: stamp new tracks, pass over current ones and sleepers. What is left -- usually a
+    // few clouds near the ring -- is tested below.
+    std::vector<size_t>& work = refresh_work_;
+    work.clear();
+    for (size_t i = 0; i < count; ++i) {
+        Track& track = tracks[i];
         if (std::isnan(track.propagated_time())) {
             track.set_propagated_time(now);
             continue;
         }
-        if (track.propagated_time() < now && may_be_observable(track, sensors, now)) {
-            propagate_track_to(track, now);
+        if (!(track.propagated_time() < now)) {
+            continue;
+        }
+        if (honour_sleep && now < track.sleep_until()) {
+            // The test is known to answer "not observable" until then (see may_be_observable).
+            if (profiling_) {
+                slept[i] = 1;
+            }
+            if (gate_audit_) {
+                audit_gate_decision(track, sensors, now);
+                // The sleep must only ever skip tests that would have answered "no".
+                std::vector<size_t> scratch;
+                double unused = 0.0;
+                ++sleep_audit_checks_;
+                if (may_be_observable(track, sensors, now, scratch, unused)) {
+                    ++sleep_audit_violations_;
+                    if (sleep_audit_first_.empty()) {
+                        sleep_audit_first_ = "t=" + std::to_string(now) + " label=" +
+                            std::to_string(track.label().birth_time) + "/" + std::to_string(track.label().index) +
+                            " propagated=" + std::to_string(track.propagated_time()) +
+                            " sleep_until=" + std::to_string(track.sleep_until());
+                    }
+                }
+            }
+            continue;
+        }
+        work.push_back(i);
+    }
+    std::vector<size_t>& candidates = gate_candidates_;
+    for (size_t i : work) {
+        Track& track = tracks[i];
+        const auto check_start = profiling_ ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
+        double sleep_for = 0.0;
+        const bool maybe = may_be_observable(track, sensors, now, candidates, sleep_for);
+        if (profiling_) {
+            checked[i] = 1;
+            check_seconds[i] = seconds_since(check_start);
+        }
+        if (!maybe) {
+            // Never past the next forced propagation, which re-derives everything; NaN, zero and
+            // negative bounds mean no sleep.
+            const double sleep = std::min(sleep_for, max_pending_);
+            if (particle_gate_ && gate_sleep_ && sleep > 0.0) {
+                track.set_sleep_until(now + sleep);
+                if (profiling_) {
+                    slept_for[i] = sleep;
+                }
+            }
+            continue;
+        }
+        const auto start = profiling_ ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+        const uint64_t done = propagate_track_to(track, now);
+        if (profiling_) {
+            steps[i] = done;
+            seconds[i] = seconds_since(start);
+            refreshed_scratch_[i] = 1;
+            bucket[i] = static_cast<signed char>(refresh_gap_bucket(track, sensors));
+        }
+    }
+    if (!profiling_) {
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        profile_.refresh_checks += checked[i];
+        profile_.refresh_slept += slept[i];
+        if (checked[i] && !refreshed_scratch_[i]) {
+            const double amount = slept_for[i];
+            ++profile_.sleep_histogram[amount <= 0.0 ? 0 : amount < 1.0 ? 1 : amount < 5.0 ? 2 : amount < 20.0 ? 3 : 4];
+        }
+        profile_.refresh_check += check_seconds[i];
+        if (!refreshed_scratch_[i]) {
+            continue;
+        }
+        ++profile_.tracks_refreshed;
+        profile_.refresh_particle_steps += steps[i];
+        profile_.refresh_propagate += seconds[i];
+        switch (bucket[i]) {
+            case 0: ++profile_.refresh_gap_inside; break;
+            case 1: ++profile_.refresh_gap_under_5km; break;
+            case 2: ++profile_.refresh_gap_5_to_50km; break;
+            case 3: ++profile_.refresh_gap_over_50km; break;
+            default: break;
         }
     }
 }
 
+int SMC_LMB_Tracker::refresh_gap_bucket(const Track& track, const sensor::SensorArray& sensors) const {
+    constexpr double kNearGap = 5.0e3;
+    constexpr double kFarGap = 50.0e3;
+    const std::vector<Particle>& particles = track.particles();
+    const double max_range = sensors.fov().max_range;
+    if (particles.empty() || sensors.size() == 0) {
+        return -1;
+    }
+    if (!std::isfinite(max_range)) {
+        return 0;   // unbounded sensors see everything; never form inf - inf
+    }
+    const CloudBound bound = track.current_cloud_bound();
+    std::vector<Eigen::Vector3d> candidates;
+    for (const sensor::Sensor& sensor : sensors.sensors()) {
+        const double sphere_gap =
+            (bound.center_position - sensor.state.head<3>()).norm() - bound.position_radius - max_range;
+        if (sphere_gap <= kFarGap) {
+            candidates.push_back(sensor.state.head<3>());
+        }
+    }
+    if (candidates.empty()) {
+        return 3;
+    }
+    double best = std::numeric_limits<double>::infinity();
+    for (const Particle& particle : particles) {
+        const Eigen::Vector3d position = particle.state_vector.head<3>();
+        for (const Eigen::Vector3d& sensor_position : candidates) {
+            best = std::min(best, (position - sensor_position).squaredNorm());
+        }
+    }
+    const double gap = std::sqrt(best) - max_range;
+    if (!(gap > 0.0)) {
+        return 0;
+    }
+    return gap < kNearGap ? 1 : (gap < kFarGap ? 2 : 3);
+}
+
 void SMC_LMB_Tracker::synchronize() {
     ensure_models_configured();
+    const ScopedTimer timer(profiling_ ? &profile_.synchronize : nullptr);
     const double now = current_state_.timestamp();
-    for (Track& track : current_state_.tracks()) {
+    std::vector<Track>& tracks = current_state_.tracks();
+    std::vector<uint64_t> steps(profiling_ ? tracks.size() : 0, 0);
+    for (size_t i = 0; i < tracks.size(); ++i) {
+        Track& track = tracks[i];
         if (std::isnan(track.propagated_time())) {
             track.set_propagated_time(now);
         } else if (track.propagated_time() != now) {
-            propagate_track_to(track, now);
+            const uint64_t done = propagate_track_to(track, now);
+            if (profiling_) {
+                steps[i] = done;
+            }
         }
+    }
+    for (uint64_t done : steps) {
+        profile_.synchronize_particle_steps += done;
     }
 }
 
@@ -682,6 +1142,7 @@ void SMC_LMB_Tracker::resolve_measurement_sensors(const std::vector<Measurement>
 }
 
 void SMC_LMB_Tracker::compute_coverage(const sensor::SensorArray* sensors) {
+    const ScopedTimer timer(profiling_ ? &profile_.coverage : nullptr);
     const std::vector<Track>& tracks = current_state_.tracks();
     const double now = current_state_.timestamp();
     const size_t num_tracks = tracks.size();
@@ -738,6 +1199,10 @@ void SMC_LMB_Tracker::compute_coverage(const sensor::SensorArray* sensors) {
                     reach_flags_.resize(row);
                 }
             }
+            if (profiling_ && union_fraction > 0.0 && i < refreshed_scratch_.size() &&
+                refreshed_scratch_[i]) {
+                ++profile_.refreshed_tracks_covered;
+            }
             if (!(union_fraction > 0.0) && !reaches_any) {
                 continue;
             }
@@ -752,6 +1217,9 @@ void SMC_LMB_Tracker::compute_coverage(const sensor::SensorArray* sensors) {
             weight_sum += particle.weight;
         }
         active_tracks_.push_back(i);
+        if (profiling_) {
+            ++profile_.active_tracks;
+        }
         coverage_union_.push_back(union_fraction);
         track_inv_weight_sum_.push_back(weight_sum > 0.0 ? 1.0 / weight_sum : 0.0);
         track_particle_offsets_.push_back(track_particle_offsets_.back() + track.particles().size());
@@ -906,6 +1374,10 @@ void SMC_LMB_Tracker::apply_posterior(size_t a, size_t num_meas,
     if (regularize_now) {
         regularize(resampled_particles, *source, mixture_weights_);
     }
+    if (profiling_) {
+        ++profile_.posterior_updates;
+        profile_.regularizations += regularize_now ? 1 : 0;
+    }
     if (record_diagnostics_) {
         PosteriorRecord record;
         record.time = current_state_.timestamp();
@@ -935,6 +1407,12 @@ void SMC_LMB_Tracker::apply_posterior(size_t a, size_t num_meas,
 void SMC_LMB_Tracker::update_impl(const std::vector<Measurement>& measurements,
                                   const sensor::SensorArray* sensors) {
     ensure_models_configured();
+    const ScopedTimer total_timer(profiling_ ? &profile_.update : nullptr);
+    if (profiling_) {
+        ++profile_.update_calls;
+        profile_.updates_with_measurements += measurements.empty() ? 0 : 1;
+        refreshed_scratch_.clear();
+    }
 
     for (const auto& measurement : measurements) {
         validation::require_measurement(measurement);
@@ -965,7 +1443,11 @@ void SMC_LMB_Tracker::update_impl(const std::vector<Measurement>& measurements,
         if (unused.empty() || !birth_model_) {
             return;
         }
+        const ScopedTimer birth_timer(profiling_ ? &profile_.birth : nullptr);
         std::vector<Track> born_tracks = birth_model_->generate_new_tracks(unused, now);
+        if (profiling_) {
+            profile_.births += born_tracks.size();
+        }
         for (auto& new_track : born_tracks) {
             new_track.set_propagated_time(now);
             new_track.set_cloud_bound(compute_cloud_bound(new_track.particles()));
@@ -993,6 +1475,7 @@ void SMC_LMB_Tracker::update_impl(const std::vector<Measurement>& measurements,
         // only hypothesis is "not detected", with marginal 1.
         const std::vector<double> no_coefficients;
         const std::vector<char> no_used;
+        const ScopedTimer posterior_timer(profiling_ ? &profile_.posterior : nullptr);
         for (size_t a = 0; a < num_active; ++a) {
             apply_posterior(a, 0, no_coefficients, no_used, 1.0, true, 1);
         }
@@ -1030,6 +1513,12 @@ void SMC_LMB_Tracker::update_impl(const std::vector<Measurement>& measurements,
         fused_index_.assign(num_active * num_meas, -1);
     }
 
+    // The likelihood timer covers the whole loop; the fused builds inside it are timed separately
+    // and taken back out afterwards.
+    const double fused_before = profile_.fused;
+    double likelihood_loop = 0.0;
+    {
+    const ScopedTimer likelihood_timer(profiling_ ? &likelihood_loop : nullptr);
     for (size_t a = 0; a < num_active; ++a) {
         const auto& current_particles = tracks[active_tracks_[a]].particles();
         const size_t num_particles = current_particles.size();
@@ -1053,6 +1542,9 @@ void SMC_LMB_Tracker::update_impl(const std::vector<Measurement>& measurements,
                     continue;
                 }
                 ++visible_count;
+                if (profiling_) {
+                    ++profile_.likelihood_evaluations;
+                }
                 const auto& current_particle = current_particles[p];
                 const double particle_likelihood = sensor_model_->calculate_likelihood(
                     current_particle, measurement, meas_caches[j]);
@@ -1075,8 +1567,16 @@ void SMC_LMB_Tracker::update_impl(const std::vector<Measurement>& measurements,
                 if (pair_ess < fused_ess_min_) {
                     FusedComponent component;
                     double fused_likelihood = 0.0;
-                    if (build_fused_component(tracks[active_tracks_[a]], measurement, meas_caches[j],
-                                              sensor_index, sensors, fused_likelihood, component)) {
+                    bool built = false;
+                    {
+                        const ScopedTimer fused_timer(profiling_ ? &profile_.fused : nullptr);
+                        if (profiling_) {
+                            ++profile_.fused_builds;
+                        }
+                        built = build_fused_component(tracks[active_tracks_[a]], measurement, meas_caches[j],
+                                                      sensor_index, sensors, fused_likelihood, component);
+                    }
+                    if (built) {
                         likelihood_matrix(a, j) = fused_likelihood;
                         fused_index_[a * num_meas + j] = static_cast<int>(fused_components_.size());
                         fused_components_.push_back(std::move(component));
@@ -1100,6 +1600,12 @@ void SMC_LMB_Tracker::update_impl(const std::vector<Measurement>& measurements,
             }
         }
     }
+    }
+    if (profiling_) {
+        profile_.likelihood += likelihood_loop - (profile_.fused - fused_before);
+    }
+    std::optional<ScopedTimer> assignment_timer;
+    assignment_timer.emplace(profiling_ ? &profile_.assignment : nullptr);
 
     // Step 3: augmented cost matrix, N_active x (M + N_active), with the hypothesis factors of the
     // LMB update (Reuter et al. 2014, existence folded into the ranked assignment):
@@ -1143,6 +1649,7 @@ void SMC_LMB_Tracker::update_impl(const std::vector<Measurement>& measurements,
         return;
     }
     for (double lw : log_weights) norm_weights.push_back(std::exp(lw - max_logw) / sum_exp);
+    assignment_timer.reset();
 
     // Step 5: marginals, posterior existence, mixture and resampling.
     //
@@ -1150,6 +1657,8 @@ void SMC_LMB_Tracker::update_impl(const std::vector<Measurement>& measurements,
     // assigns track a to measurement j contributes the same normalised per-particle vector, and
     // every miss column the same miss density, so at most num_meas + 1 per-particle passes are
     // needed however large k_best_ is.
+    std::optional<ScopedTimer> posterior_timer;
+    posterior_timer.emplace(profiling_ ? &profile_.posterior : nullptr);
     for (size_t a = 0; a < num_active; ++a) {
         assoc_coefficients_.assign(num_meas, 0.0);
         assoc_used_.assign(num_meas, 0);
@@ -1179,6 +1688,7 @@ void SMC_LMB_Tracker::update_impl(const std::vector<Measurement>& measurements,
         apply_posterior(a, num_meas, assoc_coefficients_, assoc_used_, miss_coefficient, miss_used,
                         contributing_hypotheses);
     }
+    posterior_timer.reset();
 
     // Step 6 reads the best hypothesis, which is indexed by active position; resolve it before
     // pruning reshuffles the track vector.
@@ -1232,5 +1742,9 @@ const std::vector<Track>& SMC_LMB_Tracker::get_tracks() const {
 
 void SMC_LMB_Tracker::set_tracks(const std::vector<Track>& tracks) {
     current_state_.set_tracks(tracks);
+    // A sleep is only valid against the sensor history this tracker validated it with.
+    for (Track& track : current_state_.tracks()) {
+        track.set_sleep_until(-std::numeric_limits<double>::infinity());
+    }
     stamp_unstamped_tracks();
 }

@@ -295,6 +295,85 @@ def check_parameters(chk: Checker) -> None:
                   "5-element ground truth", "state vector must have size 6")
 
 
+def hungarian(cost: np.ndarray) -> np.ndarray:
+    """Minimum-cost assignment of every row of an (n, m) matrix, n <= m (the e-maxx potential
+    method, O(n^2 m)). Returns the column of each row. An independent reference for the engine's
+    solver: nothing is shared with src/munkres.h."""
+    n, m = cost.shape
+    u = np.zeros(n + 1)
+    v = np.zeros(m + 1)
+    p = np.zeros(m + 1, dtype=np.int64)
+    way = np.zeros(m + 1, dtype=np.int64)
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = np.full(m + 1, np.inf)
+        used = np.zeros(m + 1, dtype=bool)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            free = ~used[1:]
+            cur = cost[i0 - 1] - u[i0] - v[1:]
+            better = free & (cur < minv[1:])
+            minv[1:][better] = cur[better]
+            way[1:][better] = j0
+            candidates = np.where(free, minv[1:], np.inf)
+            j1 = int(np.argmin(candidates)) + 1
+            delta = candidates[j1 - 1]
+            u[p[used]] += delta
+            v[used] -= delta
+            minv[~used] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+    assignment = np.full(n, -1, dtype=np.int64)
+    for j in range(1, m + 1):
+        if p[j] != 0:
+            assignment[p[j] - 1] = j - 1
+    return assignment
+
+
+def check_clustered_large(chk: Checker) -> int:
+    """Above 4096 pairs src/metrics.cpp solves each connected component of the d < c graph on its
+    own. Hold it to an independent full assignment on instances that size, with clumpy geometry so
+    components have several members and compete for truths."""
+    rng = np.random.default_rng(20261002)
+    cases = 0
+    for _ in range(12):
+        m = int(rng.integers(66, 140))
+        n = int(rng.integers(66, 140))
+        centres = rng.normal(0.0, 4.0 * C, (12, 3))
+        truths = centres[rng.integers(12, size=n)] + rng.normal(0.0, 0.6 * C, (n, 3))
+        anchors = truths[rng.integers(n, size=m)]
+        tracks = anchors + rng.normal(0.0, 0.7 * C, (m, 3))
+        got = lmb.calculate_gospa_components([make_track(*t) for t in tracks],
+                                             [make_truth(*t) for t in truths], C)
+        d2 = ((tracks[:, None, :] - truths[None, :, :]) ** 2).sum(axis=2)
+        clipped = np.minimum(d2, C * C)
+        if m <= n:
+            pairs = list(enumerate(hungarian(clipped)))
+        else:
+            pairs = [(int(i), j) for j, i in enumerate(hungarian(clipped.T))]
+        kept = [(i, j) for i, j in pairs if d2[i, j] < C * C]
+        localisation = float(sum(d2[i, j] for i, j in kept))
+        expected = math.sqrt(localisation + HALF_CP * (m - len(kept)) + HALF_CP * (n - len(kept)))
+        chk.close(got.total, expected, f"clustered GOSPA {m}x{n} against the full assignment")
+        chk.ok(got.num_assigned == len(kept), f"clustered GOSPA {m}x{n}: {got.num_assigned} assigned, "
+                                              f"reference {len(kept)}")
+        assoc = [j for j in got.associations if j >= 0]
+        chk.ok(len(assoc) == len(set(assoc)), "clustered GOSPA: associations must be an injection")
+        chk.ok(all(d2[i, j] < C * C for i, j in enumerate(got.associations) if j >= 0),
+               "clustered GOSPA: an association beyond the cutoff")
+        cases += 1
+    return cases
+
+
 def main() -> int:
     chk = Checker()
     check_build_is_current(chk)
@@ -305,9 +384,11 @@ def main() -> int:
     compared = check_against_brute_force(chk, instances)
     check_identities(chk, instances)
     check_parameters(chk)
+    clustered = check_clustered_large(chk)
 
     print(f"  brute-force agreement on {len(instances)} random instances "
-          f"({compared} with a forced assignment count)")
+          f"({compared} with a forced assignment count); {clustered} large clustered instances "
+          f"against an independent full assignment")
     print(f"PASS: test_gospa_metric ({chk.count} assertions)")
     return 0
 

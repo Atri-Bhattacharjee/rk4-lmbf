@@ -22,7 +22,8 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
-      }
+      },
+      "binaryDir": "${sourceDir}/build/release"
     },
     {
       "name": "debug",
@@ -31,7 +32,8 @@
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug"
-      }
+      },
+      "binaryDir": "${sourceDir}/build/debug"
     },
     {
       "name": "asan",
