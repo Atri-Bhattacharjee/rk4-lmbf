@@ -16,9 +16,10 @@ built with noise_reference_dt: the process noise is the covariance accumulated o
 Filter tuning lives in the "Filter configuration" block of RingConfig and is set for this
 geometry, not imported from simulation_common (which is tuned for a 400 km sensor looking at objects
 ~1000 km away). The measurement likelihood and the birth covariance are 3x the truth noise; process
-noise is small, because the truth follows the same two-body model with no perturbations, and only
-has to keep resampled particles from collapsing onto duplicates; process-noise annealing is off. A
-regularization (kernel jitter) step restores particle diversity after resampling.
+noise is very small (see RingConfig), because the truth follows the same two-body model with no
+perturbations, and only has to keep resampled particles from collapsing onto duplicates;
+process-noise annealing is off. A regularization (kernel jitter) step restores particle diversity
+after resampling.
 
 Truth, sensors and detections are propagated in NumPy with the same RK4 two-body model the engine
 uses. Metrics are sampled every metric_interval seconds against the objects detected at least once
@@ -116,8 +117,14 @@ class RingConfig:
     # Extra per-component multipliers on top of filter_sigma_scale, same order as the sigmas.
     filter_sigma_extra: list = field(default_factory=lambda: [1.0] * 6)
     # Position (m) and velocity (m/s) standard deviations accumulated over noise_reference_dt.
-    q_position_sigma: float = 2.0
-    q_velocity_sigma: float = 0.02
+    # Tuned 2026-10-02 (sweep of 1x..0.01x on two seeds, confirmed at 30 orbits): the old 2 m /
+    # 0.02 m/s made the filter forget ~0.2 m/s of velocity per orbit against a noise-free truth, so
+    # well-observed tracks drifted ~0.9 km/h and stale NEES sat at ~0.7. At 0.03x drift is ~0.13 km/h,
+    # stale NEES ~2.1 and the 30-orbit median error 2 km instead of 12. Gains flatten below 0.1x; the
+    # cost is a few more "re-acquired, extra birth" passes (6-10 vs 2-3 of ~1700). If the truth gets
+    # dynamics the filter lacks (J2, drag), raise these to cover that mismatch.
+    q_position_sigma: float = 0.06
+    q_velocity_sigma: float = 0.0006
     noise_decay_rate: float = 0.0         # process-noise annealing off
     noise_min_scale: float = 1.0
     regularization: bool = True
