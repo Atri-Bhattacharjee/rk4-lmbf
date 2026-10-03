@@ -274,6 +274,9 @@ python tests/test_los_geometry.py          # sphere geometry primitives vs indep
 python tests/test_validation_dimensions.py # input validation and error messages
 python tests/test_sensor_likelihood.py     # likelihood vs NumPy reference, rotation invariance, chi-square
 python tests/test_sensor_fov.py            # visibility predicate vs an atan2 reference, pointing, coverage
+python tests/test_search_env.py            # filter-free search environment vs a brute-force detection loop
+python tests/test_search_sgd.py            # tuned search schedules: formula vs environment, gradient check
+python tests/test_tasking.py               # pointed-sensor taskers with the filter in the loop
 python tests/test_fov_detection_probability.py  # FOV-scaled P_D vs an independent existence-update reference
 python tests/test_adaptive_birth_model.py  # birth covariance recovery and spread statistics
 python tests/test_bindings_api.py          # Python API surface
@@ -398,6 +401,7 @@ every particle, so the two cannot drift apart.
 | `point_at(i, position)` | Aim at an ECI position (3-vector or 6-D state), keeping the roll. |
 | `set_state(i, s)` / `set_states(S, 6)` | Move the sensors. |
 | `set_boresights((S, 3))` | Re-point every sensor in one call. |
+| `set_pointings((S, 3), (S, 3))` | `set_pointing` for every sensor in one call: boresights and ups. Every row is checked before any sensor moves. |
 | `set_pointed(i, bool)` | Turn the angular test on or off for one sensor. |
 
 A near-antipodal flip leaves nothing to transport and falls back to the deterministic
@@ -586,6 +590,198 @@ against time since last detection, track lifecycles, tracking fraction, position
 update. Everything is scored against objects detected at least once. `summary.json` also counts
 detections taken by the object's own track versus another object's track.
 
+## Search environment: tasking without the filter
+
+```bash
+python python/search_baselines.py              # oracle and random pointing: 30 orbits, 45/20/10/5 deg, 5 seeds
+python python/search_baselines.py --orbits 2 --fov 45 --seeds 1 --detection sample
+python python/search_baselines.py --custody    # also: what holding known objects costs the oracle
+```
+
+`python/search_env.py` is the ring scenario with the filter taken out, for the half of sensor
+tasking that does not need it: finding objects nobody has seen yet. Whether a sensor finds a new
+object depends only on where it pointed and where the object was, and the truth is noise-free
+two-body motion that ignores the sensors. So everything that can ever be detected is fixed before
+any policy acts, and is computed once as a **pass table**: every stretch of time an object spends
+inside a sensor's 20 km bubble, as positions in that sensor's local frame (radial, along-track,
+cross-track). An object only comes near the equatorial ring at one of its node crossings, so the
+table is built from the closed-form two-body solution in a short window around each crossing.
+
+```python
+config = SearchConfig(num_orbits=30)                               # run_ring's geometry and objects
+table = build_pass_table(make_scenario(config).states, config)     # 0.8 s for 1000 objects
+env = SearchEnv(table, fov_half_angle_deg=20.0)
+result = env.run(policy)       # policy(env) -> one direction bin per sensor, held for a 10 s slot
+```
+
+- **Pointing.** A field of view is the engine's pyramid with equal half-angles, aimed at one of a
+  fixed set of direction bins that leave no direction uncovered: 6 at 45° (a cube's faces), 54 at
+  20°, 216 at 10°, 726 at 5°. Re-pointing is instantaneous.
+- **Detection.** `"sample"` is `run_ring`'s rule: the object is in the field of view at a step.
+  `"streak"` (default) asks whether the path it flew during the step crossed the field of view. A
+  pass lasts about three seconds and the line of sight swings through ~100°, so one-second point
+  samples turn a narrow field of view into a lottery.
+- **State.** `env.seen` marks the objects found so far, and `env.step(bins)` returns the ones found
+  for the first time. `env.bubble_contents()` is the truth (every object in every bubble this
+  slot) and is for the oracle and for building training labels, not for a policy's input.
+- **Custody** (`custody=True`) gives a sensor with an already-seen object in its bubble to that
+  object for the slot. It exists to measure what custody costs search.
+- **Scenarios.** `split="all"`, `rotate=False` is `run_ring`'s sampling for the same seed.
+  `split="train"|"test"` splits the catalogue by orbit family (26% of its rows share their orbit
+  with another row), and `rotate=True` turns every object about the Earth's axis by a random
+  angle, so every seed is a new scenario.
+
+A 30-orbit pointing schedule is scored in under a millisecond once the table exists, and stepping
+through its 18,131 slots takes 50 ms, against 147 s for the same run with the filter.
+
+Baselines, 100 sensors, 1000 objects, 30 orbits, streak detection, mean of 5 seeds
+(`python/search_baselines.py`). The bound is the number of objects that ever enter a bubble; the
+oracle knows where every unseen object is; random draws a new bin for every sensor every slot.
+
+| Half-angle | Bins | Bound | Oracle | Random | Random / bound |
+|-----------:|-----:|------:|-------:|-------:|---------------:|
+| 45° | 6   | 697.4 | 697.4 | 499.4 | 71.6% |
+| 20° | 54  | 697.4 | 697.4 | 277.0 | 39.7% |
+| 10° | 216 | 697.4 | 697.4 | 147.3 | 21.1% |
+| 5°  | 726 | 697.4 | 697.4 | 74.0  | 10.6% |
+
+The oracle reaches the bound because two objects almost never need one sensor at once (twice in
+the 3,167 occupied sensor-slots of seed 20260930); custody takes 0.14% of sensor-slots and costs
+it nothing.
+
+`tests/test_search_env.py` checks the table against a brute-force detection loop (the engine's RK4
+and `run_ring`'s range test), including the 434 detections of 142 objects of the default 2-orbit
+ring run, and the field of view against `SensorArray.sees`.
+
+### Search schedules by gradient ascent
+
+```bash
+python python/search_sgd.py                          # 45/20/10/5 deg, streak and 1 Hz snapshots
+python python/search_sgd.py --dt 0.25 --detection sample     # schedules for a 4 Hz filter run
+```
+
+Searching does not depend on what has been detected here: the objects are drawn independently
+with uniformly spread node longitudes, so one object's track says nothing about where another is,
+and a look empties the part of the sky it covers whether or not it found anything. The best search
+is therefore a pointing schedule that can be worked out before the run, and
+`python/search_sgd.py` tunes one directly on the number of objects found.
+
+A policy is a set of odds over the direction bins; every slot, every sensor draws its pointing
+from them. With independent draws an object is found unless every one of its visits (a stretch in
+one sensor's bubble during one slot) is missed:
+
+```
+P(found) = 1 - prod over its visits of (1 - odds . bins_that_catch_that_visit)
+```
+
+That is exact for the search environment and smooth in the odds, so its gradient is written out by
+hand and ascended with Adam on minibatches of objects, from uniform odds (the random baseline).
+There is no reward sampling: every object in a batch contributes its exact share. Training objects
+come from the training orbit families with random node longitudes (50 scenarios, 35,000 findable
+objects); scores are schedules sampled from the odds and played through `SearchEnv` on 10 scenarios
+from the held-out families.
+
+Share of findable objects found, 30 orbits, test scenarios:
+
+| Detection | Half-angle | Random | Best fixed bin | Tuned odds | Oracle |
+|-----------|-----------:|-------:|---------------:|-----------:|-------:|
+| streak        | 45° | 71.2% | 65.4% | 73.9% | 100% |
+| streak        | 20° | 39.4% | 41.7% | 51.0% | 100% |
+| streak        | 10° | 20.4% | 25.4% | 27.7% | 100% |
+| streak        | 5°  | 10.1% | 16.2% | 16.4% | 100% |
+| 4 Hz snapshot | 45° | 69.1% | 62.9% | 72.3% | 100% |
+| 4 Hz snapshot | 20° | 36.4% | 40.3% | 47.4% | 100% |
+| 4 Hz snapshot | 10° | 16.8% | 22.7% | 22.6% | 100% |
+| 4 Hz snapshot | 5°  | 6.7%  | 12.1% | 12.6% | 100% |
+| 1 Hz snapshot | 45° | 61.4% | 52.4% | 65.9% | 100% |
+| 1 Hz snapshot | 20° | 26.0% | 29.2% | 32.8% | 100% |
+| 1 Hz snapshot | 10° | 8.0%  | 11.4% | 12.0% | 100% |
+| 1 Hz snapshot | 5°  | 2.1%  | 5.1%  | 5.5%  | 100% |
+
+The tuned odds settle on two to five bins: at 20° about half the looks go straight up and half
+forward and down. Separate odds for each orbit of the run (the second rung) gain nothing over one
+set of odds. What a schedule can gain over random pointing is modest, 1.04x at 45° rising to 1.6x
+at 5° under streak detection, and everything above it needs knowledge of where the unseen objects
+are. `tests/test_search_sgd.py` checks the formula against sampled schedules in the environment and
+the gradient against finite differences.
+
+## Tasking: pointed sensors in the full filter
+
+```bash
+python python/search_sgd.py --detection sample   # once: the tuned schedules run_tasked.py loads
+python python/run_tasked.py                      # 6 policies x 45/20/10/5 deg x 3 seeds, 30 orbits
+python python/run_tasked.py --policy oracle --fov 45 --seeds 1
+python python/evaluation_plots.py --tasked python/results/tasked      # redraw the two figures
+```
+
+`RingConfig.fov_half_angle_deg` gives every ring sensor a field of view, and `run_ring.run(config,
+tasker=...)` lets a tasker aim them: `tasker.point(...)` is called at every step before anything is
+detected, so the detections and the filter's update (which empties only the part of a cloud a
+sensor actually looked at) both see the pointing it set. `python/tasking.py` has three:
+
+- **`OracleTasker`** looks straight at whatever is in each bubble. It is the most a pointed sensor
+  can do, and the bring-up check: at ±45° it reproduces the all-seeing 30-orbit run, the same 6,768
+  detections of 697 objects, with a final tracking fraction of 0.795 against 0.783.
+- **`ScheduleTasker`** is search only: each sensor holds a direction bin for a 10 s slot, from a
+  schedule drawn before the run (random, or the odds tuned by `search_sgd.py`). The filter then
+  makes exactly the detections `SearchEnv(detection="sample")` gives for the same schedule;
+  `tests/test_tasking.py` checks that event for event.
+- **`CustodyTasker`** adds custody of known tracks to a search tasker. It takes 256 particles of
+  each confirmed track's cloud (`tracker.sample_particles`, which copies only what it returns),
+  carries them forward in closed form, and finds the steps at which they land in a sensor's bubble
+  over the next 1.25 orbits. At such a step that sensor leaves search and aims where the most
+  predicted cloud is. A track is re-predicted in the step the filter births or updates it, so a
+  sensor that finds a new object follows it for the rest of its pass.
+
+A track seen on one pass returns as a cloud tens of kilometres long, of which a few percent crosses
+any one bubble, so custody acts on any predicted particle and needs enough particles to resolve a
+few percent: on a 10-orbit run at ±45°, known objects were re-detected on 65% of their return
+passes with 64 particles and a 5% threshold, and on 98% with 256 particles and no threshold.
+
+Every policy is scored against the same objects, the ones that enter a bubble at some point in the
+run (`run(..., scored_objects=...)`), not the ones it happened to find. 30 orbits, 100 sensors, 1000
+objects, one snapshot per second, mean of 3 seeds:
+
+| Half-angle | Policy | Objects found | Tracked at the end | Known objects re-detected |
+|-----------:|--------|--------------:|-------------------:|--------------------------:|
+| any | all-seeing sensors      | 100% | 79% | 100% |
+| any | oracle pointing         | 100% | 79-80% | 100% |
+| 45° | tuned schedule + custody | 64% | 44% | 97% |
+| 45° | tuned schedule only      | 64% | 19% | 29% |
+| 45° | random + custody         | 62% | 42% | 95% |
+| 45° | random only              | 62% | 20% | 32% |
+| 20° | tuned schedule + custody | 32% | 19% | 90% |
+| 20° | tuned schedule only      | 32% | 4%  | 16% |
+| 20° | random + custody         | 29% | 17% | 85% |
+| 20° | random only              | 29% | 5%  | 12% |
+| 10° | tuned schedule + custody | 13% | 7%  | 78% |
+| 10° | tuned schedule only      | 13% | 1%  | 4%  |
+| 10° | random + custody         | 9%  | 5%  | 75% |
+| 10° | random only              | 9%  | 1%  | 4%  |
+| 5°  | tuned schedule + custody | 5%  | 3%  | 58% |
+| 5°  | tuned schedule only      | 5%  | 0%  | 3%  |
+| 5°  | random + custody         | 2%  | 1%  | 41% |
+| 5°  | random only              | 2%  | 0%  | 0%  |
+
+"Tracked" is the share with an estimate within the GOSPA cutoff at the end of the run; "re-detected"
+is the share of passes by an already-found object that produced a detection. Custody takes at most
+0.13% of sensor-steps. It is what turns found objects into tracked ones (it also raises the
+detections on the pass that finds an object from 1.0-1.6 to 2.1-2.6, by following it); the search
+schedule sets how many are found, and no schedule gets near the oracle, which knows where the
+unseen objects are.
+
+One snapshot per second is hard on narrow fields of view: a pass lasts about three seconds and the
+line of sight swings tens of degrees between snapshots. `--dt 0.25` runs the same comparison at 4 Hz
+(train the schedules with `search_sgd.py --dt 0.25 --detection sample` first). On one seed that
+raises the tuned schedule with custody from 32% found and 19% tracked to 47% and 31% at ±20°, and
+from 12% and 7% to 24% and 13% at ±10°; the all-seeing run tracks 83% instead of 78%. The runs
+took about twice as long without custody and four to five times as long with it, since custody
+re-predicts a track at every step it is updated. The lazy-propagation gate audit shows no violation
+with pointed sensors at either rate. Two things to know before leaning on 4 Hz: track labels are
+built from the whole second of birth plus the index of the measurement, so two objects first seen
+in the same second at different sub-steps could share a label (none did in a 10-orbit check), and
+the 4 Hz all-seeing run ended with 21 more tracks than objects, against 7 to 9 at 1 Hz.
+
 ## Project layout
 
 ```
@@ -632,7 +828,12 @@ rk4-lmbf/
 │   ├── 2026_ieee_aerospace.py  # paper config (K_BEST=100)
 │   ├── run_multisensor.py      # multi-sensor pointed FOV demo
 │   ├── run_ring.py             # N-sensor equatorial ring vs sampled debris (lazy propagation)
-│   ├── evaluation_plots.py     # figures + CSV tables for a ring run
+│   ├── evaluation_plots.py     # figures + CSV tables for a ring run and for a policy comparison
+│   ├── search_env.py           # filter-free search environment: pass table, direction bins, episodes
+│   ├── search_baselines.py     # oracle and random pointing on the search environment
+│   ├── search_sgd.py           # search schedules tuned by gradient ascent on expected detections
+│   ├── tasking.py              # taskers for the pointed ring: oracle, schedule, custody
+│   ├── run_tasked.py           # pointing policies compared in the full filter
 │   ├── data/                   # debris catalogue samples (ECI states)
 │   └── lmb_engine/             # built extension output (.so / .pyd)
 │       ├── Release/            # recommended built extension
@@ -653,6 +854,9 @@ rk4-lmbf/
 │   ├── test_lazy_propagation.py           # time-consistent noise, lazy == eager
 │   ├── test_regularization.py  # kernel jitter keeps posterior moments, restores diversity
 │   ├── test_fused_proposal.py  # re-acquisition: fused proposal vs ordinary update and exact answers
+│   ├── test_search_env.py      # search environment vs brute-force detection and SensorArray.sees
+│   ├── test_search_sgd.py      # expected-detections formula vs the environment, gradient vs differences
+│   ├── test_tasking.py         # taskers with the filter in the loop: detections, custody, gate audit
 │   ├── test_adaptive_birth_model.py
 │   ├── test_bindings_api.py
 │   ├── test_end_to_end.py

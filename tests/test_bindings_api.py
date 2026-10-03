@@ -224,11 +224,82 @@ def check_sensor_array_surface(chk: Checker) -> None:
            "index_of must resolve known ids and return -1 otherwise")
 
 
+def check_tasking_bindings(chk: Checker) -> None:
+    """The two calls a tasker makes every step: point every sensor at once, and read a few
+    particles of chosen tracks without copying every cloud."""
+    rng = np.random.default_rng(20261003)
+
+    # set_pointings is set_pointing for every row.
+    def fresh():
+        array = lmb.SensorArray(lmb.SensorFovConfig(max_range=2.0e4, half_width=0.2, half_height=0.2))
+        for k in range(3):
+            array.add(f"s{k}", np.zeros(6), np.array([1.0, 0.0, 0.0]))
+        return array
+
+    boresights = rng.normal(size=(3, 3))
+    ups = rng.normal(size=(3, 3))
+    batch, single = fresh(), fresh()
+    batch.set_pointings(boresights, ups)
+    for k in range(3):
+        single.set_pointing(k, boresights[k], ups[k])
+    for k in range(3):
+        chk.ok(np.array_equal(batch.boresight(k), single.boresight(k)) and np.array_equal(batch.up(k), single.up(k))
+               and np.array_equal(batch.width_axis(k), single.width_axis(k)),
+               f"set_pointings differs from set_pointing for sensor {k}")
+    expect_raises(chk, ValueError, lambda: batch.set_pointings(boresights[:2], ups[:2]),
+                  "set_pointings with two rows for three sensors", "expected a (3, 3)")
+    # A bad last row must leave the first sensors where they were.
+    before = [np.array(batch.boresight(k)) for k in range(3)]
+    parallel = ups.copy()
+    parallel[2] = 2.0 * boresights[2]
+    expect_raises(chk, ValueError, lambda: batch.set_pointings(boresights[::-1].copy(), parallel[::-1].copy()),
+                  "set_pointings with an up parallel to its boresight", "parallel")
+    chk.ok(all(np.array_equal(batch.boresight(k), before[k]) for k in range(3)),
+           "a rejected set_pointings moved a sensor")
+
+    # sample_particles: evenly through the weights, at the track's own time, without drawing.
+    def track(index: int, states: np.ndarray, weights: np.ndarray):
+        particles = []
+        for state, weight in zip(states, weights):
+            particle = lmb.Particle()
+            particle.state_vector = state
+            particle.weight = float(weight)
+            particles.append(particle)
+        label = lmb.TrackLabel()
+        label.birth_time = 0
+        label.index = index
+        return lmb.Track(label, 0.9, particles)
+
+    states = rng.normal(size=(2, 8, 6))
+    weights = np.array([[1.0] * 8, [0.0, 0.0, 5.0, 0.0, 1.0, 1.0, 1.0, 0.0]])
+    tracker = lmb.SMC_LMB_Tracker(lmb.TwoBodyPropagator(np.eye(6) * 1e-18, seed=1),
+                                  lmb.InOrbitSensorModel(100.0, 1.0, 1e-6, 1e-6, 1e-8, 1e-8),
+                                  lmb.AdaptiveBirthModel(10, 0.5, np.eye(6), seed=2),
+                                  0.999, 1, 1e-3, 1e-15, 0.99, seed=3)
+    tracker.set_tracks([track(k, states[k], weights[k]) for k in range(2)])
+    sample = tracker.sample_particles([1, 0], 4)
+    chk.ok(sample["states"].shape == (2, 4, 6) and sample["propagated_time"].shape == (2,),
+           "sample_particles shapes")
+    # Uniform weights, 4 of 8: cumulative weight passes (k + 0.5) / 4 at particles 0, 2, 4, 6.
+    chk.ok(np.array_equal(sample["states"][1], states[0][[0, 2, 4, 6]]),
+           "uniform cloud is not sampled evenly")
+    # Weights 0 0 5 0 1 1 1 0 (total 8): targets 1, 3, 5, 7 fall on particles 2, 2, 2, 5.
+    chk.ok(np.array_equal(sample["states"][0], states[1][[2, 2, 2, 5]]),
+           "weighted cloud is not sampled through its cumulative weight")
+    again = tracker.sample_particles([1, 0], 4)
+    chk.ok(np.array_equal(again["states"], sample["states"]), "sample_particles is not repeatable")
+    chk.ok(tracker.sample_particles([], 4)["states"].shape == (0, 4, 6), "no tracks asked for")
+    expect_raises(chk, IndexError, lambda: tracker.sample_particles([2], 4), "track index past the end",
+                  "out of range")
+    expect_raises(chk, ValueError, lambda: tracker.sample_particles([0], 0), "zero particles", "must be positive")
+
+
 def main() -> None:
     chk = Checker()
     steps = [
         ("names", lambda: check_names(chk)),
         ("sensor array surface", lambda: check_sensor_array_surface(chk)),
+        ("tasking bindings", lambda: check_tasking_bindings(chk)),
         ("sensor ctor", lambda: check_sensor_ctor(chk)),
         ("birth ctor", lambda: check_birth_ctor(chk)),
         ("measurement API", lambda: check_measurement_roundtrip(chk)),

@@ -26,6 +26,10 @@ uses. Metrics are sampled every metric_interval seconds against the objects dete
 (a never-seen object is not a filter failure), and python/evaluation_plots.py turns the log into
 figures.
 
+The sensors can also be given a field of view (RingConfig.fov_half_angle_deg) and aimed every step
+by a tasker handed to run(); python/tasking.py has the taskers and python/run_tasked.py compares
+them. The command line below always runs the range-only sensors.
+
     python python/run_ring.py                       # defaults: 100 sensors, 1000 objects, 2 orbits
     python python/run_ring.py --particles 1000 --orbits 2 --seed 7
     LMB_RING_PARTICLES=500 python python/run_ring.py
@@ -80,6 +84,10 @@ class RingConfig:
     num_sensors: int = 100
     sensor_altitude: float = 800.0e3
     sensor_range: float = 20.0e3
+    # Field-of-view half-angle of every sensor [deg], half-width and half-height alike. None: the
+    # sensors see everything within range. Set: they are pointed, and something has to aim them at
+    # every step -- the ``tasker`` argument of run() (python/tasking.py).
+    fov_half_angle_deg: float | None = None
     num_objects: int = 1000
     num_orbits: float = 2.0
     dt: float = 1.0
@@ -311,9 +319,17 @@ def build_filter(config: RingConfig, seeds: dict):
 
 
 def build_sensor_array(config: RingConfig, states: np.ndarray):
-    sensors = lmb_engine.SensorArray(lmb_engine.SensorFovConfig(max_range=config.sensor_range))
+    if config.fov_half_angle_deg is None:
+        sensors = lmb_engine.SensorArray(lmb_engine.SensorFovConfig(max_range=config.sensor_range))
+        for k in range(len(states)):
+            sensors.add_unpointed(f"ring_{k:03d}", states[k])
+        return sensors
+    half_angle = np.deg2rad(config.fov_half_angle_deg)
+    sensors = lmb_engine.SensorArray(lmb_engine.SensorFovConfig(
+        max_range=config.sensor_range, half_width=half_angle, half_height=half_angle))
     for k in range(len(states)):
-        sensors.add_unpointed(f"ring_{k:03d}", states[k])
+        # Radially outward until the tasker's first call, which comes before the first detection.
+        sensors.add(f"ring_{k:03d}", states[k], states[k, :3])
     return sensors
 
 
@@ -368,9 +384,23 @@ def label_keys(summary) -> np.ndarray:
 # =============================================================================
 
 
-def run(config: RingConfig, verbose: bool = True, before_update=None) -> dict:
+def run(config: RingConfig, verbose: bool = True, before_update=None, tasker=None,
+        scored_objects=None) -> dict:
     """Run the scenario. ``before_update``, if given, is called after predict() and before
-    update() at every step, with keyword arguments describing that step (diagnostics only)."""
+    update() at every step, with keyword arguments describing that step (diagnostics only).
+
+    ``tasker`` aims pointed sensors (config.fov_half_angle_deg). ``tasker.point(...)`` is called at
+    every step once truth and sensors are at that step and before anything is detected, so the
+    detections and the filter's update both see the pointing it sets. ``tasker.after_update(...)``,
+    if it has one, is called after the filter's update with that update's diagnostics.
+
+    ``scored_objects``: indices of the objects the metrics are scored against. Default: the objects
+    detected so far, which suits one run but depends on where the sensors looked; pass a fixed set
+    to compare pointing policies."""
+    if config.fov_half_angle_deg is not None and tasker is None:
+        raise ValueError("pointed sensors (fov_half_angle_deg) need a tasker to aim them")
+    if scored_objects is not None:
+        scored_objects = np.asarray(scored_objects, dtype=np.int64)
     seeds = derive_seeds(config.seed)
     timers = Timers()
     wall_start = time.perf_counter()
@@ -467,6 +497,12 @@ def run(config: RingConfig, verbose: bool = True, before_update=None) -> dict:
                 sensor_hi = sensor_states[:, :3].max(axis=0)
         timers.add("truth", time.perf_counter() - tick)
 
+        if tasker is not None:
+            tick = time.perf_counter()
+            tasker.point(now=now, step=step, config=config, tracker=tracker, sensors=sensors,
+                         truth=truth, sensor_states=sensor_states)
+            timers.add("tasking", time.perf_counter() - tick)
+
         # --- detection: range prefilter in NumPy, confirmed by SensorArray.sees ---
         tick = time.perf_counter()
         reach = config.sensor_range
@@ -532,6 +568,11 @@ def run(config: RingConfig, verbose: bool = True, before_update=None) -> dict:
         tracker.update(measurements, sensors)
         timers.add("update", time.perf_counter() - tick)
         records = tracker.take_diagnostics()
+        if tasker is not None and hasattr(tasker, "after_update"):
+            tick = time.perf_counter()
+            tasker.after_update(now=now, step=step, config=config, tracker=tracker, records=records,
+                                measurements=measurements, measured_objects=measured_objects)
+            timers.add("tasking", time.perf_counter() - tick)
         if len(records["time"]):
             posterior_records.append(np.column_stack([
                 records["time"], records["ess"] / np.maximum(records["num_particles"], 1),
@@ -582,7 +623,8 @@ def run(config: RingConfig, verbose: bool = True, before_update=None) -> dict:
             existence = summary["existence"]
             num_tracks = len(existence)
             estimate_idx = np.flatnonzero(existence >= config.existence_threshold)
-            detected = np.flatnonzero(~np.isnan(first_detection))
+            detected = (scored_objects if scored_objects is not None
+                        else np.flatnonzero(~np.isnan(first_detection)))
             breakdown = tracker.gospa_components(estimate_idx.tolist(), truth[detected], GOSPA_CUTOFF)
 
             samples["time"].append(now)
@@ -666,6 +708,8 @@ def run(config: RingConfig, verbose: bool = True, before_update=None) -> dict:
         "overlap_events": overlap_events,
         "gospa_params": GOSPA_PARAMS,
         "gospa_cutoff": GOSPA_CUTOFF,
+        # What the metrics were scored against: the objects detected so far, or a given set.
+        "scoring": "detected" if scored_objects is None else "given",
     }
     log.update({name: np.asarray(values, dtype=np.float64) for name, values in samples.items()})
     return log
@@ -760,7 +804,7 @@ def save(log: dict, output_dir: Path) -> Path:
                                                              "engine_profile", "gate_audit",
                                                              "wall_seconds",
                                                              "overlap_events", "gospa_params",
-                                                             "gospa_cutoff") if k in log}),
+                                                             "gospa_cutoff", "scoring") if k in log}),
                         **{k: log[k] for k in ARRAY_KEYS})
     summary = run_summary(log)
     (output_dir / "summary.json").write_text(json.dumps({"config": log["config"], "summary": summary},

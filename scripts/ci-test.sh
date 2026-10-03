@@ -23,6 +23,15 @@ python tests/test_local_residual_cached_basis.py
 # than as a mystery in the golden stage.
 python tests/test_sensor_fov.py
 python tests/test_fov_detection_probability.py
+# The filter-free search environment: its pass table against a brute-force detection loop and
+# its field of view against SensorArray.sees (seconds).
+python tests/test_search_env.py
+# Search schedules tuned by gradient ascent: the expected-detections formula against the
+# environment, its gradient against finite differences (under a minute).
+python tests/test_search_sgd.py
+# Taskers aiming the pointed ring, with the filter in the loop: detections against the search
+# environment, the custody rule, and the gate audit with pointed sensors (under a minute).
+python tests/test_tasking.py
 # The update's algebra against an exhaustive enumeration of the joint hypotheses, and the kappa
 # crossover. The golden fixtures saturate existence at 1.0 and cannot see either (seconds).
 python tests/test_existence_enumeration.py

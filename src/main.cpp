@@ -272,6 +272,62 @@ pybind11::dict track_summary(const SMC_LMB_Tracker& tracker, bool with_means, bo
     return out;
 }
 
+//! `count` particle states from each requested track, taken evenly through its weights (the k-th
+//! is the particle at cumulative weight (k + 0.5) / count), without copying any whole cloud.
+//! Deterministic: no random number is drawn, so reading a cloud cannot perturb the filter.
+pybind11::dict sample_particles(const SMC_LMB_Tracker& tracker, const std::vector<int64_t>& track_indices,
+                                int count) {
+    if (count <= 0) {
+        throw std::invalid_argument("sample_particles: count must be positive, got " + std::to_string(count));
+    }
+    const std::vector<Track>& tracks = tracker.get_tracks();
+    const auto rows = static_cast<pybind11::ssize_t>(track_indices.size());
+    pybind11::array_t<double> states(std::vector<pybind11::ssize_t>{rows, count, 6});
+    pybind11::array_t<double> propagated_time(rows);
+    auto states_view = states.mutable_unchecked<3>();
+    auto time_view = propagated_time.mutable_unchecked<1>();
+    for (pybind11::ssize_t r = 0; r < rows; ++r) {
+        const int64_t index = track_indices[static_cast<size_t>(r)];
+        if (index < 0 || static_cast<size_t>(index) >= tracks.size()) {
+            throw std::out_of_range("sample_particles: track index " + std::to_string(index) +
+                                    " out of range for " + std::to_string(tracks.size()) + " track(s)");
+        }
+        const Track& track = tracks[static_cast<size_t>(index)];
+        const std::vector<Particle>& particles = track.particles();
+        if (particles.empty()) {
+            throw std::invalid_argument("sample_particles: track " + std::to_string(index) +
+                                        " has no particles");
+        }
+        time_view(r) = track.propagated_time();
+        double total = 0.0;
+        for (const Particle& particle : particles) {
+            total += particle.weight;
+        }
+        const size_t num_particles = particles.size();
+        size_t p = 0;
+        double cumulative = particles[0].weight;
+        for (int k = 0; k < count; ++k) {
+            if (total > 0.0) {
+                const double target = (static_cast<double>(k) + 0.5) * total / static_cast<double>(count);
+                while (cumulative < target && p + 1 < num_particles) {
+                    ++p;
+                    cumulative += particles[p].weight;
+                }
+            } else {
+                // No usable weights: spread evenly over the cloud by index.
+                p = (static_cast<size_t>(k) * num_particles) / static_cast<size_t>(count);
+            }
+            for (int c = 0; c < 6; ++c) {
+                states_view(r, k, c) = particles[p].state_vector(c);
+            }
+        }
+    }
+    pybind11::dict out;
+    out["states"] = states;
+    out["propagated_time"] = propagated_time;
+    return out;
+}
+
 //! GOSPA of a subset of the tracker's own tracks against truth rows, without copying any cloud.
 GospaComponents tracker_gospa_components(const SMC_LMB_Tracker& tracker,
                                          const std::vector<int64_t>& track_indices,
@@ -711,6 +767,29 @@ PYBIND11_MODULE(lmb_engine, m) {
              pybind11::arg("index"), pybind11::arg("boresight"), pybind11::arg("up"),
              "Re-point one sensor with an explicit roll. `up` is orthogonalised against the\n"
              "boresight and must not be parallel to it.")
+        .def("set_pointings",
+             [](sensor::SensorArray& self, const Eigen::MatrixXd& boresights, const Eigen::MatrixXd& ups) {
+                 require_row_count(boresights, self.size(), 3, "boresights");
+                 require_row_count(ups, self.size(), 3, "ups");
+                 // Every row is checked before any sensor moves, so a rejected call changes nothing.
+                 for (size_t i = 0; i < self.size(); ++i) {
+                     const Eigen::Vector3d b = sensor::normalized_direction(
+                         Eigen::Vector3d(boresights.row(static_cast<Eigen::Index>(i)).transpose()), "boresight");
+                     const Eigen::Vector3d u = sensor::normalized_direction(
+                         Eigen::Vector3d(ups.row(static_cast<Eigen::Index>(i)).transpose()), "up");
+                     if (!((u - u.dot(b) * b).norm() > sensor::kDirectionEpsilon)) {
+                         throw std::invalid_argument("up: must not be parallel to boresight");
+                     }
+                 }
+                 for (size_t i = 0; i < self.size(); ++i) {
+                     self.set_pointing(i, Eigen::Vector3d(boresights.row(static_cast<Eigen::Index>(i)).transpose()),
+                                       Eigen::Vector3d(ups.row(static_cast<Eigen::Index>(i)).transpose()));
+                 }
+             },
+             pybind11::arg("boresights"), pybind11::arg("ups"),
+             "Re-point every sensor with an explicit roll, from two (S, 3) arrays of ECI directions:\n"
+             "set_pointing for each row. All rows are validated first, so a rejected call leaves\n"
+             "the array as it was.")
         .def("point_at",
              [](sensor::SensorArray& self, size_t i, const Eigen::VectorXd& target_position) {
                  self.point_at(i, require_position_fixed(target_position, "target_position"));
@@ -954,6 +1033,11 @@ PYBIND11_MODULE(lmb_engine, m) {
              "propagated_time, particle_count, (with_means) the (N, 6) weighted mean states and\n"
              "(with_covariances) the (N, 6, 6) covariances, as Track.covariance() computes them.\n"
              "Means of lagging tracks are at their propagated_time, not at the clock.")
+        .def("sample_particles", &sample_particles, pybind11::arg("track_indices"), pybind11::arg("count"),
+             "States of `count` particles from each track in track_indices, taken evenly through\n"
+             "the track's weights, as {'states': (T, count, 6), 'propagated_time': (T,)}. The states\n"
+             "are at each track's propagated_time, which may lag the clock. Copies only what it\n"
+             "returns and draws no random number.")
         .def("gospa_components", &tracker_gospa_components, pybind11::arg("track_indices"),
              pybind11::arg("truths"), pybind11::arg("cutoff") = kGospaDefaultCutoff,
              "calculate_gospa_components over the tracks at track_indices (in that order) against\n"

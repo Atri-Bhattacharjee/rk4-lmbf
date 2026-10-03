@@ -16,6 +16,15 @@ Figures (PNG, light surface):
   7 nees.png               position NEES of matched pairs against the chi-square(3) 95% band
   8 run_summary.png        detections per sensor, pass outcomes, wall time per phase
   9 ess.png                effective sample size of each posterior, detection vs miss-only updates
+
+Pointing-policy comparison (python/run_tasked.py), scored against the objects that could be found:
+
+    make_tasking_plots(results_dir)
+    python python/evaluation_plots.py --tasked python/results/tasked
+
+  tasking_policies.png     per field of view: objects found, objects tracked at the end, and known
+                           objects re-detected when they come back, for every policy
+  tasking_discovery.png    objects found against time, per field of view
 """
 from __future__ import annotations
 
@@ -414,11 +423,136 @@ def make_all_plots(log: dict, output_dir) -> list[Path]:
     return paths
 
 
+# =============================================================================
+# Pointing-policy comparison
+# =============================================================================
+
+# Bars top to bottom. The proposed tasker takes the accent; the others are context.
+POLICY_ORDER = ("oracle", "sgd+custody", "sgd", "random+custody", "random")
+POLICY_LABEL = {"oracle": "oracle", "sgd+custody": "tuned schedule + custody", "sgd": "tuned schedule only",
+                "random+custody": "random + custody", "random": "random only", "all-seeing": "all-seeing sensors"}
+PROPOSED = "sgd+custody"
+# Lines keep one colour per policy across panels (slots 1-3, fixed order).
+DISCOVERY_SERIES = (("sgd+custody", SERIES[0]), ("random+custody", SERIES[1]), ("oracle", SERIES[2]))
+
+
+def _load_tasking(results_dir: Path):
+    summary = json.loads((results_dir / "summary.json").read_text())
+    rows = {(row["fov_half_angle_deg"], row["policy"]): row for row in summary["summary"]}
+    angles = sorted({angle for angle, _ in rows if angle is not None}, reverse=True)
+    return summary, rows, angles
+
+
+def plot_tasking_policies(results_dir: Path, out: Path) -> list[Path]:
+    _, rows, angles = _load_tasking(results_dir)
+    reference = rows.get((None, "all-seeing"))
+    metrics = (
+        ("Objects found", "share of the objects that could be found",
+         lambda row: row["found_share"], 1.0),
+        ("Objects tracked at the end", "share with an estimate within the GOSPA cutoff",
+         lambda row: row["final_tracking_fraction"], reference["final_tracking_fraction"] if reference else None),
+        ("Known objects re-detected", "share of passes by an already-found object with a detection",
+         lambda row: row["known_pass_detection_rate"], 1.0),
+    )
+    policies = [policy for policy in POLICY_ORDER if any((angle, policy) in rows for angle in angles)]
+    fig, axes = plt.subplots(len(metrics), len(angles), figsize=(2.6 * len(angles) + 1.6, 1.9 * len(metrics) + 0.6),
+                             sharex=True, sharey=True, squeeze=False)
+    table = []
+    for r, (title, subtitle, value, mark) in enumerate(metrics):
+        for c, angle in enumerate(angles):
+            ax = axes[r, c]
+            for y, policy in enumerate(policies):
+                row = rows.get((angle, policy))
+                if row is None or not np.isfinite(value(row)):
+                    continue
+                share = float(value(row))
+                ax.barh(y, share, height=0.5, color=SERIES[0] if policy == PROPOSED else AXIS)
+                ax.text(share + 0.02, y, f"{share:.0%}", va="center", fontsize=7, zorder=3,
+                        color=INK if policy == PROPOSED else INK_SECONDARY,
+                        bbox={"facecolor": SURFACE, "edgecolor": "none", "pad": 0.6})
+                table.append((angle, policy, title, share))
+            if mark is not None:
+                ax.axvline(mark, color=MUTED, linewidth=0.6)
+                ax.text(mark, -0.75, "all-seeing ", ha="right", va="center", fontsize=6.5, color=MUTED)
+            ax.set_axisbelow(True)
+            ax.set_xlim(0.0, 1.18)
+            ax.set_ylim(len(policies) - 0.4, -1.1)
+            ax.set_xticks([0.0, 0.5, 1.0], ["0", "50%", "100%"])
+            ax.set_yticks(range(len(policies)), [POLICY_LABEL[policy] for policy in policies])
+            ax.grid(axis="y", visible=False)
+            ax.tick_params(length=0)
+            if r == 0:
+                ax.set_title(f"±{angle:g}° field of view", loc="left", fontsize=9)
+        axes[r, 0].annotate(f"{title}\n", xy=(0.0, 1.0), xycoords="axes fraction", xytext=(-118, 2 if r else 18),
+                            textcoords="offset points", fontsize=9, fontweight="bold", color=INK, va="bottom")
+        axes[r, 0].annotate(subtitle, xy=(0.0, 1.0), xycoords="axes fraction", xytext=(-118, 2 if r else 18),
+                            textcoords="offset points", fontsize=7.5, color=INK_SECONDARY, va="bottom")
+    fig.subplots_adjust(hspace=0.55, wspace=0.12)
+    paths = [_save(fig, out / "tasking_policies.png")]
+    paths.append(_write_csv(out / "tasking_policies.csv", ["fov_half_angle_deg", "policy", "metric", "share"], table))
+    return paths
+
+
+def plot_tasking_discovery(results_dir: Path, out: Path) -> list[Path]:
+    summary, rows, angles = _load_tasking(results_dir)
+    fig, axes = plt.subplots(1, len(angles), figsize=(2.9 * len(angles) + 0.6, 3.0), sharey=True, squeeze=False)
+    table = []
+    for c, angle in enumerate(angles):
+        ax = axes[0, c]
+        for policy, colour in DISCOVERY_SERIES:
+            curves = []
+            for record in summary["records"]:
+                if record["policy"] != policy or record["fov_half_angle_deg"] != angle:
+                    continue
+                path = results_dir / f"{policy}_fov{angle:g}_seed{record['seed']}.npz"
+                with np.load(path, allow_pickle=False) as data:
+                    first = np.sort(data["first_detection"][~np.isnan(data["first_detection"])])
+                    period = data["time"][-1] / record["orbits"]
+                    orbits = np.linspace(0.0, record["orbits"], 121)
+                    curves.append(np.searchsorted(first, orbits * period, side="right") / max(len(data["findable"]), 1))
+            if not curves:
+                continue
+            mean = np.mean(curves, axis=0)
+            ax.plot(orbits, mean, color=colour, linewidth=1.2, label=POLICY_LABEL[policy])
+            table += [(angle, policy, float(o), float(m)) for o, m in zip(orbits, mean)]
+            if policy == PROPOSED:
+                ax.plot(orbits[-1], mean[-1], "o", color=colour, markersize=MARKER, markeredgecolor=SURFACE,
+                        markeredgewidth=1.0)
+                ax.annotate(f"{mean[-1]:.0%}", (orbits[-1], mean[-1]), xytext=(-4, 6), textcoords="offset points",
+                            ha="right", fontsize=8, color=INK)
+        ax.set_title(f"±{angle:g}° field of view", loc="left", fontsize=9)
+        ax.set_xlabel("orbits")
+        ax.set_ylim(0.0, 1.02)
+        ax.set_yticks([0.0, 0.25, 0.5, 0.75, 1.0], ["0", "25%", "50%", "75%", "100%"])
+    axes[0, 0].set_ylabel("objects found, share of those that could be")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper left", bbox_to_anchor=(0.06, 1.06), ncol=len(labels))
+    fig.subplots_adjust(wspace=0.1)
+    paths = [_save(fig, out / "tasking_discovery.png")]
+    paths.append(_write_csv(out / "tasking_discovery.csv", ["fov_half_angle_deg", "policy", "orbits", "share_found"], table))
+    return paths
+
+
+def make_tasking_plots(results_dir, output_dir=None) -> list[Path]:
+    results_dir = Path(results_dir)
+    out = Path(output_dir) if output_dir else results_dir
+    out.mkdir(parents=True, exist_ok=True)
+    with plt.rc_context(STYLE):
+        return plot_tasking_policies(results_dir, out) + plot_tasking_discovery(results_dir, out)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Re-plot a saved ring run")
-    parser.add_argument("log", help="ring_log.npz written by run_ring.py")
+    parser = argparse.ArgumentParser(description="Re-plot a saved ring run, or a policy comparison")
+    parser.add_argument("log", nargs="?", help="ring_log.npz written by run_ring.py")
+    parser.add_argument("--tasked", help="results folder written by run_tasked.py")
     parser.add_argument("--output", help="directory for the figures (default: next to the log)")
     args = parser.parse_args()
+    if args.tasked:
+        for path in make_tasking_plots(args.tasked, args.output):
+            print(f"wrote {path}")
+        return
+    if not args.log:
+        parser.error("give a ring_log.npz, or --tasked RESULTS_DIR")
     from run_ring import load
 
     log = load(args.log)
